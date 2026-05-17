@@ -1,0 +1,29 @@
+[package]
+name = "bifrost-vpnd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "TUN-based VPN daemon riding the norn-rs mesh — mesh-only or exit-routed"
+
+[[bin]]
+name = "bifrost-vpnd"
+path = "src/main.rs"
+
+[features]
+default = ["tun"]
+# TUN integration delegates to norn-rs's tun module which is feature-gated upstream.
+tun = ["norn-rs/tun-support"]
+
+[dependencies]
+bifrost-core    = { path = "../bifrost-core" }
+norn-rs.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+toml.workspace = true
+clap.workspace = true
+hex.workspace = true
