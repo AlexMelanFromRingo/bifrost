@@ -16,6 +16,11 @@ HERE="$ROOT/tests/docker"
 PARENT=$(cd "$ROOT/.." && pwd)  # contains both norn-rs/ and bifrost/
 
 cleanup() {
+    if [ "${BIFROST_KEEP:-}" = "1" ]; then
+        echo "=== BIFROST_KEEP=1: leaving cluster up for inspection ==="
+        echo "  to tear down manually: cd $HERE && BIFROST_EXIT_PUBKEY=00 docker compose down -v"
+        return
+    fi
     echo "=== tear down ==="
     (cd "$HERE" && BIFROST_EXIT_PUBKEY=00 docker compose down --remove-orphans -v >/dev/null 2>&1 || true)
 }
@@ -64,7 +69,19 @@ sleep 8
 echo "=== probe: small GET through SOCKS5 ==="
 # --socks5-hostname asks curl to forward the literal hostname through the
 # SOCKS5 server so the exit container resolves it inside the docker network.
-HTTP_DIGEST=$(curl --max-time 15 --socks5-hostname 127.0.0.1:11080 -s http://target:8080/digest)
+# Run with set +e so a curl failure dumps the live container logs before
+# the EXIT trap tears the stack down.
+set +e
+HTTP_DIGEST=$(curl --max-time 15 --socks5-hostname 127.0.0.1:11080 -sv http://target:8080/digest 2>/tmp/bifrost-arq-curl.log)
+CURL_RC=$?
+set -e
+if [ $CURL_RC -ne 0 ]; then
+    echo "FAIL: small GET curl returned $CURL_RC"
+    echo "--- curl stderr ---"; tail -30 /tmp/bifrost-arq-curl.log
+    echo "--- client logs ---"; docker logs --tail 60 bifrost-test-client 2>&1
+    echo "--- exit logs ---";   docker logs --tail 60 bifrost-test-exit   2>&1
+    exit $CURL_RC
+fi
 echo "remote digest = $HTTP_DIGEST"
 
 echo "=== probe: 1 MB download through SOCKS5 ==="

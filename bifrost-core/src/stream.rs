@@ -1,47 +1,58 @@
-// MeshStream — bidirectional byte stream over a single norn-rs PacketConn
-// stream id. Implements AsyncRead + AsyncWrite so it slots into the same
-// `tokio::io::copy_bidirectional` plumbing as a real TcpStream.
+// MeshStream — bidirectional byte stream backed by a single MeshMux
+// stream id, with v0.2 ARQ on top of best-effort PacketConn datagrams.
 //
-// AsyncRead pulls StreamEvents from the per-stream channel installed by
-// the mux. Data events fill an internal byte buffer; Close signals EOF;
-// Reset surfaces as an Io error. OpenAck events buffer separately so the
-// SOCKS5 client can `await_open_ack()` before pumping bytes.
+// Read path: bytes arrive as Data frames into the mux's read loop, which
+// pushes them through the per-stream Reliability state and signals us
+// via `StreamEvent::WakeRead`. `poll_read` drains the Reliability's
+// in-order rx_buf into the caller's slice.
 //
-// AsyncWrite chunks the input into MTU-sized DATA frames and dispatches
-// each through MeshMux::send_frame. We hold one in-flight future at a
-// time — that bounds memory use per stream and makes back-pressure flow
-// naturally from PacketConn's own internal queues.
+// Write path: `poll_write` asks Reliability for sequence space (which
+// honours the peer's advertised window), records the frame as in-flight,
+// and dispatches a Data frame through the mux. If the window is closed,
+// `poll_write` parks on the StreamEvent channel until the mux delivers a
+// `WakeWrite` from an ACK.
+//
+// The retransmit timer lives in `MeshMux::retransmit_tick`, not here —
+// idle streams still recover from loss because the mux walks them all
+// every 50 ms.
 
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
 use crate::frame::{Frame, MAX_FRAME_OVERHEAD};
 use crate::mux::MeshMux;
+use crate::reliability::Reliability;
 use crate::{PubKey, StreamId};
 
-/// Bounded backlog of inbound events per stream. Limits memory if the
-/// reader stalls — the mux blocks on send, which propagates pressure
-/// back to the underlying PacketConn read loop.
+/// Bounded backlog of inbound events per stream. Wake notifications are
+/// coalescable, so even a depth of 16 is plenty; we keep 256 for
+/// headroom against bursty ACK floods.
 pub const INBOUND_CHAN_DEPTH: usize = 256;
 
-/// Default minimum effective payload per DATA frame, used when the
-/// PacketConn's reported MTU would underflow after subtracting framing
-/// overhead. 256 bytes is well below any real-world MTU.
+/// Default minimum effective payload per DATA frame.
 const MIN_DATA_CHUNK: usize = 256;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum StreamEvent {
-    Data(Vec<u8>),
-    Close,
-    Reset(u8),
+    /// rx_buf grew or EOF is now reachable — poll_read should retry.
+    WakeRead,
+    /// Peer ACKed something; write window may have opened.
+    WakeWrite,
+    /// Peer's Open reply (0x00 = success, anything else = SOCKS5 REP).
     OpenAck(u8),
+    /// Peer sent Close (already integrated into Reliability; this is
+    /// just a wake hint for callers waiting on `await_open_ack`).
+    PeerClose,
+    /// Peer aborted the stream (or our own retransmit budget ran out).
+    Reset(u8),
 }
 
 /// SOCKS5-style reply codes used inside Reset / OpenAck frames so the
@@ -57,25 +68,33 @@ pub mod reply {
     pub const ATYP_NOT_SUPPORTED:u8 = 0x08;
 }
 
-type WriteFut = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
+type SendFut = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
 
 pub struct MeshStream {
     mux: Arc<MeshMux>,
     peer: PubKey,
     sid: StreamId,
     rx: mpsc::Receiver<StreamEvent>,
-    /// Bytes ready to copy into the next poll_read buffer.
-    read_buf: VecDeque<u8>,
-    /// FIN seen — once the read_buf drains, poll_read returns 0 (EOF).
-    read_closed: bool,
+    reliability: Arc<Mutex<Reliability>>,
+    /// Outstanding Data-send future from poll_write.
+    write_fut: Option<SendFut>,
+    /// Close-send future for poll_shutdown.
+    close_fut: Option<SendFut>,
+    /// True after the first Close frame was queued; further poll_shutdown
+    /// calls just wait for the ACK (the mux retransmits as needed).
+    close_registered: bool,
     /// One reply code from an OpenAck frame, consumed by `await_open_ack`.
     pending_ack: Option<u8>,
-    /// Outstanding write future (frame in flight on PacketConn).
-    write_fut: Option<WriteFut>,
-    /// Mirror of write_fut for Close-on-shutdown.
-    shutdown_fut: Option<WriteFut>,
-    /// We've sent (or attempted to send) a CLOSE frame; further writes are errors.
+    /// True after poll_shutdown started (no more writes accepted).
     write_closed: bool,
+    /// True once we deliver EOF to the application.
+    read_eof: bool,
+    /// Reset code received from peer; surfaces on the next read.
+    pending_reset: Option<u8>,
+    /// One drained-but-unforwarded byte buffer used to make AsyncRead's
+    /// "copy into buf" cheap (avoids two-half-slice fiddling on every
+    /// poll_read by pulling into a contiguous Vec once).
+    scratch: VecDeque<u8>,
 }
 
 impl MeshStream {
@@ -84,38 +103,34 @@ impl MeshStream {
         peer: PubKey,
         sid: StreamId,
         rx: mpsc::Receiver<StreamEvent>,
+        reliability: Arc<Mutex<Reliability>>,
     ) -> Self {
         Self {
             mux,
             peer,
             sid,
             rx,
-            read_buf: VecDeque::new(),
-            read_closed: false,
-            pending_ack: None,
+            reliability,
             write_fut: None,
-            shutdown_fut: None,
+            close_fut: None,
+            close_registered: false,
+            pending_ack: None,
             write_closed: false,
+            read_eof: false,
+            pending_reset: None,
+            scratch: VecDeque::new(),
         }
     }
 
-    pub fn peer(&self) -> &PubKey {
-        &self.peer
-    }
+    pub fn peer(&self) -> &PubKey { &self.peer }
+    pub fn stream_id(&self) -> StreamId { self.sid }
 
-    pub fn stream_id(&self) -> StreamId {
-        self.sid
-    }
-
-    /// Maximum DATA payload bytes per frame, computed from the
-    /// PacketConn's MTU minus our framing overhead.
     fn chunk_size(&self) -> usize {
         let mtu = self.mux.conn().mtu() as usize;
         mtu.saturating_sub(MAX_FRAME_OVERHEAD).max(MIN_DATA_CHUNK)
     }
 
-    /// Wait for the next OpenAck reply. Returns the reply code (0 = success).
-    /// Errors if the stream closes or resets before the ack arrives.
+    /// Wait for the next OpenAck reply.
     pub async fn await_open_ack(&mut self) -> io::Result<u8> {
         if let Some(code) = self.pending_ack.take() {
             return Ok(code);
@@ -123,20 +138,19 @@ impl MeshStream {
         loop {
             match self.rx.recv().await {
                 Some(StreamEvent::OpenAck(code)) => return Ok(code),
-                Some(StreamEvent::Data(d)) => self.read_buf.extend(d),
-                Some(StreamEvent::Close) => {
-                    self.read_closed = true;
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "stream closed before OpenAck",
-                    ));
-                }
                 Some(StreamEvent::Reset(code)) => {
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
                         format!("stream reset (code 0x{code:02x}) before OpenAck"),
                     ));
                 }
+                Some(StreamEvent::PeerClose) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "peer closed before OpenAck",
+                    ));
+                }
+                Some(StreamEvent::WakeRead) | Some(StreamEvent::WakeWrite) => continue,
                 None => {
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
@@ -148,27 +162,20 @@ impl MeshStream {
     }
 
     /// Server-side helper: send the OpenAck reply for this stream.
-    ///
-    /// Returns an owned (`'static`) future so the caller doesn't have to
-    /// hold `&MeshStream` across the await — that would force the
-    /// stream to be `Sync`, which the inner write-future state can't be.
     pub fn send_open_ack(
         &self,
         code: u8,
-    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static {
+    ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
         let mux = self.mux.clone();
         let peer = self.peer;
         let sid = self.sid;
         async move { mux.send_frame(&peer, Frame::OpenAck { sid, code }).await }
     }
 
-    /// Send a Reset frame and stop accepting writes. The caller should
-    /// drop the stream shortly after. Same `'static` future shape as
-    /// `send_open_ack` for the same Sync-avoidance reason.
     pub fn reset(
         &mut self,
         code: u8,
-    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+    ) -> impl Future<Output = ()> + Send + 'static {
         self.write_closed = true;
         let mux = self.mux.clone();
         let peer = self.peer;
@@ -182,10 +189,39 @@ impl MeshStream {
 
 impl Drop for MeshStream {
     fn drop(&mut self) {
-        // Best-effort table cleanup. Sending a Close frame here would
-        // require an async context that Drop doesn't provide; callers
-        // that need clean half-close should call poll_shutdown.
         self.mux.drop_stream(&self.peer, self.sid);
+    }
+}
+
+/// Pull ready events from the channel without blocking and apply their
+/// side effects. Returns true if at least one event was consumed.
+fn drain_events(
+    rx: &mut mpsc::Receiver<StreamEvent>,
+    pending_ack: &mut Option<u8>,
+    pending_reset: &mut Option<u8>,
+    cx: &mut Context<'_>,
+) -> bool {
+    let mut consumed = false;
+    loop {
+        match rx.poll_recv(cx) {
+            Poll::Ready(Some(StreamEvent::WakeRead))
+            | Poll::Ready(Some(StreamEvent::WakeWrite))
+            | Poll::Ready(Some(StreamEvent::PeerClose)) => {
+                consumed = true;
+                continue;
+            }
+            Poll::Ready(Some(StreamEvent::OpenAck(code))) => {
+                *pending_ack = Some(code);
+                consumed = true;
+                continue;
+            }
+            Poll::Ready(Some(StreamEvent::Reset(code))) => {
+                *pending_reset = Some(code);
+                consumed = true;
+                continue;
+            }
+            Poll::Ready(None) | Poll::Pending => return consumed,
+        }
     }
 }
 
@@ -196,48 +232,63 @@ impl AsyncRead for MeshStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         loop {
-            // Drain buffered bytes in contiguous slices — VecDeque exposes
-            // its two halves so we can fill `buf` without per-byte copies.
-            if !self.read_buf.is_empty() {
-                let want = std::cmp::min(self.read_buf.len(), buf.remaining());
-                let (front, back) = self.read_buf.as_slices();
-                let from_front = front.len().min(want);
-                buf.put_slice(&front[..from_front]);
-                let remaining = want - from_front;
-                if remaining > 0 {
-                    buf.put_slice(&back[..remaining]);
+            if let Some(code) = self.pending_reset.take() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    format!("peer reset (code 0x{code:02x})"),
+                )));
+            }
+            // Step 1: hand over any cached scratch bytes first.
+            if !self.scratch.is_empty() {
+                let want = buf.remaining().min(self.scratch.len());
+                let (front, back) = self.scratch.as_slices();
+                let n_front = front.len().min(want);
+                buf.put_slice(&front[..n_front]);
+                let n_back = want - n_front;
+                if n_back > 0 {
+                    buf.put_slice(&back[..n_back]);
                 }
-                self.read_buf.drain(..want);
+                self.scratch.drain(..want);
                 return Poll::Ready(Ok(()));
             }
-            if self.read_closed {
-                return Poll::Ready(Ok(())); // EOF — empty fill = 0 bytes
+            if self.read_eof {
+                return Poll::Ready(Ok(())); // EOF: empty fill
             }
-            match self.rx.poll_recv(cx) {
-                Poll::Ready(Some(StreamEvent::Data(d))) => self.read_buf.extend(d),
-                Poll::Ready(Some(StreamEvent::Close)) => self.read_closed = true,
-                Poll::Ready(Some(StreamEvent::Reset(code))) => {
-                    self.read_closed = true;
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        format!("peer reset (code 0x{code:02x})"),
-                    )));
+            // Step 2: pull from Reliability's rx_buf. We compute the
+            // drain inside the lock and copy out the bytes, then push
+            // into self.scratch only after dropping the guard — Rust's
+            // borrow checker doesn't see that `self.reliability` and
+            // `self.scratch` are disjoint fields through .lock().
+            let want = buf.remaining();
+            let drained_eof: (Option<Vec<u8>>, bool) = {
+                let mut r = self.reliability.lock().expect("Reliability mutex poisoned");
+                if r.rx_buf_len() == 0 {
+                    (None, r.eof_reached())
+                } else {
+                    let mut tmp = vec![0u8; want.max(1)];
+                    let n = r.rx_drain(&mut tmp);
+                    tmp.truncate(n);
+                    (Some(tmp), false)
                 }
-                Poll::Ready(Some(StreamEvent::OpenAck(code))) => {
-                    // OpenAck arriving on a stream the caller is reading
-                    // means the caller skipped await_open_ack(). Cache it
-                    // so a later await_open_ack() still works (unusual,
-                    // but defensible).
-                    self.pending_ack = Some(code);
+            };
+            match drained_eof {
+                (Some(tmp), _) => {
+                    self.scratch.extend(tmp);
+                    continue;
                 }
-                Poll::Ready(None) => {
-                    // Mux dropped — treat as EOF rather than error so
-                    // copy_bidirectional finishes cleanly.
-                    self.read_closed = true;
+                (None, true) => {
+                    self.read_eof = true;
                     return Poll::Ready(Ok(()));
                 }
-                Poll::Pending => return Poll::Pending,
+                (None, false) => {}
             }
+            // Step 3: nothing to read right now — wait for a wake.
+            let Self { ref mut rx, ref mut pending_ack, ref mut pending_reset, .. } = *self;
+            let consumed = drain_events(rx, pending_ack, pending_reset, cx);
+            if !consumed {
+                return Poll::Pending;
+            }
+            // Spin once more — Reliability or pending_reset may have updated.
         }
     }
 }
@@ -254,9 +305,17 @@ impl AsyncWrite for MeshStream {
                 "stream half-closed for writes",
             )));
         }
-        // Finish any in-flight write before starting a new one.
-        if self.write_fut.is_some() {
-            let mut fut = self.write_fut.take().unwrap();
+        if let Some(code) = self.pending_reset.take() {
+            self.write_closed = true;
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                format!("peer reset (code 0x{code:02x})"),
+            )));
+        }
+        // Finish any in-flight send before issuing a new one. We hold
+        // exactly one outstanding Data send per stream — that bounds
+        // memory and gives the mux retransmit task room to work.
+        if let Some(mut fut) = self.write_fut.take() {
             match fut.as_mut().poll(cx) {
                 Poll::Pending => {
                     self.write_fut = Some(fut);
@@ -264,27 +323,51 @@ impl AsyncWrite for MeshStream {
                 }
                 Poll::Ready(Err(e)) => {
                     self.write_closed = true;
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())));
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        e.to_string(),
+                    )));
                 }
-                Poll::Ready(Ok(())) => { /* fall through to start a new write */ }
+                Poll::Ready(Ok(())) => {}
             }
         }
-        let chunk = std::cmp::min(buf.len(), self.chunk_size());
-        let data = buf[..chunk].to_vec();
+        // Pick a chunk that fits both the MTU and the peer's remaining window.
+        let cap = self.chunk_size();
+        let alloc = {
+            let mut r = self.reliability.lock().expect("Reliability mutex poisoned");
+            let win = r.write_window_available() as usize;
+            let len = buf.len().min(cap).min(win);
+            if len == 0 {
+                None
+            } else {
+                let seq = r.allocate_seq(len as u32).expect("window check just passed");
+                r.record_sent(seq, buf[..len].to_vec(), Instant::now());
+                Some((seq, len))
+            }
+        };
+        let (seq, chunk_len) = match alloc {
+            Some(x) => x,
+            None => {
+                // Window closed — wait for an ACK to land.
+                let Self { ref mut rx, ref mut pending_ack, ref mut pending_reset, .. } = *self;
+                let _ = drain_events(rx, pending_ack, pending_reset, cx);
+                return Poll::Pending;
+            }
+        };
+        let data = buf[..chunk_len].to_vec();
         let mux = self.mux.clone();
         let peer = self.peer;
         let sid = self.sid;
-        let fut: WriteFut = Box::pin(async move {
-            mux.send_frame(&peer, Frame::Data { sid, data }).await
+        let fut: SendFut = Box::pin(async move {
+            mux.send_frame(&peer, Frame::Data { sid, seq, data }).await
         });
         self.write_fut = Some(fut);
-        // Tell tokio we accepted `chunk` bytes; the actual transmission
-        // completes on the next poll_write / poll_flush. This is the
-        // standard "store-and-forward" AsyncWrite pattern.
+        // Try to make immediate progress on the send so callers see
+        // back-pressure now rather than on the next poll. Either way
+        // we've accepted `chunk_len` bytes into the reliability layer.
         match self.as_mut().poll_flush(cx) {
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            // Flush in progress is fine — we accepted the bytes.
-            Poll::Ready(Ok(())) | Poll::Pending => Poll::Ready(Ok(chunk)),
+            Poll::Ready(Ok(())) | Poll::Pending => Poll::Ready(Ok(chunk_len)),
         }
     }
 
@@ -307,7 +390,8 @@ impl AsyncWrite for MeshStream {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Flush in-flight DATA first so Close doesn't get reordered ahead.
+        // Drain any in-flight Data send first so Close doesn't reorder
+        // ahead of trailing application bytes.
         match self.as_mut().poll_flush(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -316,24 +400,59 @@ impl AsyncWrite for MeshStream {
         if self.write_closed {
             return Poll::Ready(Ok(()));
         }
-        if self.shutdown_fut.is_none() {
+        // First call: register the Close in reliability (so the mux's
+        // retransmit task will resend it if dropped) and kick off the
+        // first transmission.
+        if !self.close_registered && self.close_fut.is_none() {
+            let close_seq = {
+                let mut r = self.reliability.lock().expect("Reliability mutex poisoned");
+                r.mark_write_finished();
+                let seq = r.local_close_seq();
+                r.record_close_sent(seq, Instant::now());
+                seq
+            };
             let mux = self.mux.clone();
             let peer = self.peer;
             let sid = self.sid;
-            self.shutdown_fut = Some(Box::pin(async move {
-                mux.send_frame(&peer, Frame::Close { sid }).await
+            self.close_fut = Some(Box::pin(async move {
+                mux.send_frame(&peer, Frame::Close { sid, seq: close_seq }).await
             }));
+            self.close_registered = true;
         }
-        let mut fut = self.shutdown_fut.take().unwrap();
-        match fut.as_mut().poll(cx) {
-            Poll::Pending => {
-                self.shutdown_fut = Some(fut);
-                Poll::Pending
-            }
-            Poll::Ready(res) => {
-                self.write_closed = true;
-                Poll::Ready(res.map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())))
+        // Drive the initial Close send to completion.
+        if let Some(mut fut) = self.close_fut.take() {
+            match fut.as_mut().poll(cx) {
+                Poll::Pending => {
+                    self.close_fut = Some(fut);
+                    return Poll::Pending;
+                }
+                Poll::Ready(Err(e)) => {
+                    self.write_closed = true;
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())));
+                }
+                Poll::Ready(Ok(())) => {}
             }
         }
+        // Now wait for the ACK of our FIN. Mux retransmits Close every
+        // RTO; we just park until either close_pending clears or peer
+        // resets us (or retries exhaust → mux Resets).
+        if let Some(code) = self.pending_reset.take() {
+            self.write_closed = true;
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                format!("peer reset (code 0x{code:02x})"),
+            )));
+        }
+        let still_pending = {
+            let r = self.reliability.lock().expect("Reliability mutex poisoned");
+            r.close_pending()
+        };
+        if !still_pending {
+            self.write_closed = true;
+            return Poll::Ready(Ok(()));
+        }
+        let Self { ref mut rx, ref mut pending_ack, ref mut pending_reset, .. } = *self;
+        let _ = drain_events(rx, pending_ack, pending_reset, cx);
+        Poll::Pending
     }
 }

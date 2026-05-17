@@ -15,11 +15,15 @@ services:
     environment:
       BIFROST_ROLE: exit
       BIFROST_TCP_PORT: "9001"
-      RUST_LOG: "info,norn_rs=info"
+      RUST_LOG: "info,bifrost_core=debug,norn_rs=info"
       # Apply NetEm to make the test more realistic; tweak / unset to
       # benchmark on a clean link.
       NETEM_DELAY: "30ms 5ms"
       NETEM_LOSS: "1%"
+      # Static peer back to client so the norn-rs crossing-dial
+      # tiebreak (larger pub_key defers) can pick a survivor regardless
+      # of whose key was generated higher.
+      BIFROST_PEER_HOST: "client:9001"
     cap_add:
       - NET_ADMIN
     networks:
@@ -38,7 +42,7 @@ services:
       BIFROST_SOCKS5_LISTEN: "0.0.0.0:1080"
       BIFROST_EXIT_HOST: "exit:9001"
       BIFROST_EXIT_PUBKEY: "${BIFROST_EXIT_PUBKEY:?BIFROST_EXIT_PUBKEY must be set by run.sh}"
-      RUST_LOG: "info,norn_rs=info"
+      RUST_LOG: "info,bifrost_core=debug,norn_rs=info"
       NETEM_DELAY: "30ms 5ms"
       NETEM_LOSS: "1%"
     cap_add:

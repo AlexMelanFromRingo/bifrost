@@ -15,11 +15,18 @@ use std::net::SocketAddr;
 
 use crate::StreamId;
 
-pub const PROTO_VERSION: u8 = 1;
+// v1 (initial) carried only seq-less Data frames and assumed the
+// underlying PacketConn was lossless (direct-peer SOCKS5 only).
+// v2 adds per-frame `seq: u32` to Data and a new Ack frame so the
+// stream layer retransmits its own lost frames, lifting the
+// "exit must be a direct neighbour" restriction. v2 is wire-
+// incompatible with v1; decode_rejects_bad_version covers that.
+pub const PROTO_VERSION: u8 = 2;
 pub const HEADER_SIZE: usize = 6;
-/// Worst-case bytes added by the framing layer on top of payload data.
-/// Used to compute the effective MTU for stream chunking.
-pub const MAX_FRAME_OVERHEAD: usize = HEADER_SIZE;
+/// Worst-case bytes added by the framing layer on top of payload data,
+/// counting the v2 sequence number that follows the header for Data
+/// frames. Used to compute the effective MTU for stream chunking.
+pub const MAX_FRAME_OVERHEAD: usize = HEADER_SIZE + 4;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +39,8 @@ pub enum FrameKind {
     Reset   = 0x04,
     /// Response to Open: 0x00 success, anything else = SOCKS5 reply code.
     OpenAck = 0x05,
+    /// Cumulative ACK + advertised receive window (v2 reliability).
+    Ack     = 0x06,
 }
 
 impl FrameKind {
@@ -42,6 +51,7 @@ impl FrameKind {
             0x03 => Self::Close,
             0x04 => Self::Reset,
             0x05 => Self::OpenAck,
+            0x06 => Self::Ack,
             _ => return None,
         })
     }
@@ -143,10 +153,21 @@ impl OpenTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     Open { sid: StreamId, target: OpenTarget },
-    Data { sid: StreamId, data: Vec<u8> },
-    Close { sid: StreamId },
+    /// Data carries a u32 sequence number assigned by the sender; the
+    /// receiver ACKs cumulatively via the Ack frame. Seq counts bytes
+    /// (not frames) so the receiver can advance even if the sender
+    /// regrouped DATA into different chunk sizes on retransmit.
+    Data { sid: StreamId, seq: u32, data: Vec<u8> },
+    /// FIN with the byte position at which the sender stops. The
+    /// receiver delivers EOF only after expected_seq has caught up to
+    /// this value, so out-of-order Close can't truncate the stream.
+    Close { sid: StreamId, seq: u32 },
     Reset { sid: StreamId, code: u8 },
     OpenAck { sid: StreamId, code: u8 },
+    /// Cumulative ACK: `ack` is the next byte the receiver expects;
+    /// `win` is the bytes of receive buffer the receiver can still
+    /// absorb without dropping. The sender uses `win` for flow control.
+    Ack { sid: StreamId, ack: u32, win: u32 },
 }
 
 impl Frame {
@@ -154,9 +175,10 @@ impl Frame {
         match self {
             Self::Open { sid, .. }
             | Self::Data { sid, .. }
-            | Self::Close { sid }
+            | Self::Close { sid, .. }
             | Self::Reset { sid, .. }
-            | Self::OpenAck { sid, .. } => *sid,
+            | Self::OpenAck { sid, .. }
+            | Self::Ack { sid, .. } => *sid,
         }
     }
 
@@ -167,6 +189,7 @@ impl Frame {
             Self::Close { .. } => FrameKind::Close,
             Self::Reset { .. } => FrameKind::Reset,
             Self::OpenAck { .. } => FrameKind::OpenAck,
+            Self::Ack { .. } => FrameKind::Ack,
         }
     }
 
@@ -177,10 +200,17 @@ impl Frame {
         out.extend_from_slice(&self.sid().to_be_bytes());
         match self {
             Self::Open { target, .. } => target.encode_into(&mut out)?,
-            Self::Data { data, .. } => out.extend_from_slice(data),
-            Self::Close { .. } => {}
+            Self::Data { seq, data, .. } => {
+                out.extend_from_slice(&seq.to_be_bytes());
+                out.extend_from_slice(data);
+            }
+            Self::Close { seq, .. } => out.extend_from_slice(&seq.to_be_bytes()),
             Self::Reset { code, .. } => out.push(*code),
             Self::OpenAck { code, .. } => out.push(*code),
+            Self::Ack { ack, win, .. } => {
+                out.extend_from_slice(&ack.to_be_bytes());
+                out.extend_from_slice(&win.to_be_bytes());
+            }
         }
         Ok(out)
     }
@@ -199,8 +229,20 @@ impl Frame {
         let body = &buf[HEADER_SIZE..];
         Ok(match kind {
             FrameKind::Open => Self::Open { sid, target: OpenTarget::decode(body)? },
-            FrameKind::Data => Self::Data { sid, data: body.to_vec() },
-            FrameKind::Close => Self::Close { sid },
+            FrameKind::Data => {
+                if body.len() < 4 {
+                    bail!("data: seq field truncated");
+                }
+                let seq = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+                Self::Data { sid, seq, data: body[4..].to_vec() }
+            }
+            FrameKind::Close => {
+                if body.len() < 4 {
+                    bail!("close: seq field truncated");
+                }
+                let seq = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+                Self::Close { sid, seq }
+            }
             FrameKind::Reset => {
                 if body.is_empty() { bail!("reset: missing code byte"); }
                 Self::Reset { sid, code: body[0] }
@@ -208,6 +250,14 @@ impl Frame {
             FrameKind::OpenAck => {
                 if body.is_empty() { bail!("open_ack: missing code byte"); }
                 Self::OpenAck { sid, code: body[0] }
+            }
+            FrameKind::Ack => {
+                if body.len() < 8 {
+                    bail!("ack: body truncated ({} bytes)", body.len());
+                }
+                let ack = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+                let win = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+                Self::Ack { sid, ack, win }
             }
         })
     }
@@ -252,13 +302,32 @@ mod tests {
     #[test]
     fn data_close_reset_ack_roundtrip() {
         for f in [
-            Frame::Data { sid: 1, data: b"hello".to_vec() },
-            Frame::Close { sid: 2 },
+            Frame::Data { sid: 1, seq: 0, data: b"hello".to_vec() },
+            Frame::Data { sid: 1, seq: u32::MAX - 1, data: vec![] },
+            Frame::Close { sid: 2, seq: 0 },
+            Frame::Close { sid: 2, seq: u32::MAX },
             Frame::Reset { sid: 3, code: 0x42 },
             Frame::OpenAck { sid: 4, code: 0x00 },
+            Frame::Ack { sid: 5, ack: 12345, win: 64 * 1024 },
+            Frame::Ack { sid: 6, ack: 0, win: 0 },
         ] {
             assert_eq!(Frame::decode(&f.encode().unwrap()).unwrap(), f);
         }
+    }
+
+    #[test]
+    fn data_decode_rejects_short_body() {
+        // Header is fine, but the seq field needs 4 bytes — body is 2.
+        let mut bytes = vec![PROTO_VERSION, FrameKind::Data as u8, 0, 0, 0, 1];
+        bytes.extend_from_slice(&[0u8, 1]);
+        assert!(Frame::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn ack_decode_rejects_short_body() {
+        let mut bytes = vec![PROTO_VERSION, FrameKind::Ack as u8, 0, 0, 0, 1];
+        bytes.extend_from_slice(&[0u8; 4]); // only ack, missing win
+        assert!(Frame::decode(&bytes).is_err());
     }
 
     #[test]
@@ -268,7 +337,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_bad_version() {
-        let mut bytes = Frame::Close { sid: 0 }.encode().unwrap();
+        let mut bytes = Frame::Close { sid: 0, seq: 0 }.encode().unwrap();
         bytes[0] = 0xff;
         assert!(Frame::decode(&bytes).is_err());
     }

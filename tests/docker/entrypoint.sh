@@ -34,6 +34,14 @@ apply_netem() {
 
 if [ "$ROLE" = "exit" ]; then
     bifrost-socks5d genconfig --exit > "$CONFIG"
+    # If the client hostname is supplied, list it as a static peer so
+    # the exit can dial back in case the crossing-dial tiebreak
+    # (norn-rs/transport.rs: larger pub_key defers) silenced the
+    # client's outbound attempts.
+    PEERS_LINE='peers = []'
+    if [ -n "${BIFROST_PEER_HOST:-}" ]; then
+        PEERS_LINE="peers = [\"tcp://${BIFROST_PEER_HOST}\"]"
+    fi
     sed -i \
         -e "s|tcp://0.0.0.0:9001|tcp://0.0.0.0:${TCP_PORT}|" \
         -e 's|tun_name = "norn0"|tun_name = "bifrost-tun"|' \
@@ -41,6 +49,7 @@ if [ "$ROLE" = "exit" ]; then
         -e 's|mdns_enabled = true|mdns_enabled = false|' \
         -e 's|admin_socket = "/var/run/norn.sock"|admin_socket = "/tmp/norn.sock"|' \
         -e 's|peer_cache_path = "/var/lib/norn/peers.json"|peer_cache_path = ""|' \
+        -e "s|peers = \\[\\]|${PEERS_LINE}|" \
         "$CONFIG"
 elif [ "$ROLE" = "client" ]; then
     EXIT_PUB="${BIFROST_EXIT_PUBKEY:?client mode needs BIFROST_EXIT_PUBKEY}"

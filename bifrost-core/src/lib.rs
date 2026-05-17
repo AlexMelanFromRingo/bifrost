@@ -21,6 +21,7 @@
 pub mod frame;
 pub mod mux;
 pub mod policy;
+pub mod reliability;
 pub mod stream;
 
 pub use frame::{Frame, FrameKind, OpenTarget, MAX_FRAME_OVERHEAD};
