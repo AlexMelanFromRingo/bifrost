@@ -1,0 +1,78 @@
+# Bifrost docker testbed — 3 services on one bridge network.
+#
+#   exit    bifrost-socks5d in exit mode (port 9001 inside, no expose)
+#   client  bifrost-socks5d in client mode (SOCKS5 exposed on host:11080)
+#   target  python http.server serving /usr/share/dict for fixture downloads
+#
+# Bring up with `bash tests/docker/run.sh` from the bifrost workspace
+# root; run.sh handles the two-phase startup needed to inject the exit's
+# pub key into the client config before the client comes up.
+
+services:
+  exit:
+    image: bifrost:test
+    container_name: bifrost-test-exit
+    environment:
+      BIFROST_ROLE: exit
+      BIFROST_TCP_PORT: "9001"
+      RUST_LOG: "info,norn_rs=info"
+      # Apply NetEm to make the test more realistic; tweak / unset to
+      # benchmark on a clean link.
+      NETEM_DELAY: "30ms 5ms"
+      NETEM_LOSS: "1%"
+    cap_add:
+      - NET_ADMIN
+    networks:
+      bifrost-test:
+        aliases: [exit]
+
+  client:
+    image: bifrost:test
+    container_name: bifrost-test-client
+    depends_on:
+      exit:
+        condition: service_started
+    environment:
+      BIFROST_ROLE: client
+      BIFROST_TCP_PORT: "9001"
+      BIFROST_SOCKS5_LISTEN: "0.0.0.0:1080"
+      BIFROST_EXIT_HOST: "exit:9001"
+      BIFROST_EXIT_PUBKEY: "${BIFROST_EXIT_PUBKEY:?BIFROST_EXIT_PUBKEY must be set by run.sh}"
+      RUST_LOG: "info,norn_rs=info"
+      NETEM_DELAY: "30ms 5ms"
+      NETEM_LOSS: "1%"
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "11080:1080"  # host-facing SOCKS5 proxy
+    networks:
+      bifrost-test:
+        aliases: [client]
+
+  target:
+    image: python:3.12-slim
+    container_name: bifrost-test-target
+    command:
+      - python3
+      - -c
+      - |
+        import os, hashlib
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        BLOB = (b'A' * (1024*1024))  # 1 MB fixture
+        DIGEST = hashlib.sha256(BLOB).hexdigest()
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == '/digest':
+                    body = DIGEST.encode()
+                    self.send_response(200); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+                else:
+                    self.send_response(200); self.send_header('Content-Length', str(len(BLOB))); self.end_headers(); self.wfile.write(BLOB)
+            def log_message(self, *a): pass
+        HTTPServer(('0.0.0.0', 8080), H).serve_forever()
+    networks:
+      bifrost-test:
+        aliases: [target]
+
+networks:
+  bifrost-test:
+    driver: bridge

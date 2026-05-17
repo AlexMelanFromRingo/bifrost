@@ -1,0 +1,39 @@
+# Bifrost daemon test image.
+#
+# Build context MUST be the parent dir containing both norn-rs/ and
+# bifrost/, since bifrost-core depends on norn-rs via `path =
+# "../norn-rs"`. From this Dockerfile's perspective:
+#   docker build -f bifrost/tests/docker/Dockerfile.bifrost -t bifrost:test ../../
+#
+# (run.sh handles the path arithmetic.)
+
+FROM rust:1.90-slim-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+# Both projects come in side-by-side, mirroring the host layout.
+COPY norn-rs ./norn-rs
+COPY bifrost ./bifrost
+
+# Stub the bench so cargo's dep walk doesn't fail on a missing file.
+# (norn-rs's Cargo.toml mentions a bench target but the file isn't
+# included in some checkouts — recreate it idempotently.)
+RUN mkdir -p ./norn-rs/benches && \
+    [ -f ./norn-rs/benches/bench.rs ] || echo "fn main() {}" > ./norn-rs/benches/bench.rs
+
+WORKDIR /build/bifrost
+RUN cargo build --release -p bifrost-socks5d
+RUN strip target/release/bifrost-socks5d
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl python3 iproute2 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/bifrost/target/release/bifrost-socks5d /usr/local/bin/
+COPY bifrost/tests/docker/entrypoint.sh /usr/local/bin/bifrost-entrypoint
+RUN chmod +x /usr/local/bin/bifrost-entrypoint
+
+ENTRYPOINT ["bifrost-entrypoint"]
