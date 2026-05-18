@@ -51,9 +51,11 @@ stream.
 | IPv6 egress (NAT66)        | ✅ done  | 4 unit tests; dual-stack EgressHello |
 | Karn/Partridge SRTT/RTTVAR | ✅ done  | RFC 6298; 5 unit tests               |
 | Trust-weighted exit pick   | ✅ done  | `EgressPolicy::Auto`; 8 unit tests   |
+| Multi-exit per stream      | ✅ done  | happy-eyeballs racing (race_exits=3) |
+| mDNS exit discovery        | ✅ done  | `_bifrost-exit._tcp.local.`          |
+| Prometheus exporter        | ✅ done  | per-candidate weight/trust/RTT gauges|
+| `bifrost-ctl` admin CLI    | ✅ done  | UNIX-socket JSON RPC, 3 sub-commands |
 | Mobile build (Android/iOS) | ⏸ later | x86_64 + aarch64 Linux only          |
-| Multi-exit per stream      | ⏸ later | selective forwarding                 |
-| Native exit discovery      | ⏸ later | Auto reads from a config list today  |
 
 ---
 
@@ -361,16 +363,50 @@ What this protocol does **not** protect:
 
 ---
 
+## Operational tooling
+
+* **`bifrost-ctl`** — admin CLI over the daemon's UNIX socket
+  (`[bifrost].admin_socket` in the config). Sub-commands:
+  `status`, `exits`, `peers`, `penalty <pk>`, `reset-penalty <pk>`,
+  `reset-all-penalties`. Default render is a tidy table; `--json`
+  dumps the raw envelope for scripts. Default socket path:
+  `/tmp/bifrost-socks5d-ctl.sock`.
+
+* **Prometheus exporter** — `[bifrost].metrics_addr` (e.g.
+  `127.0.0.1:9099`) exposes per-candidate gauges:
+  `bifrost_exit_{weight,trust,rtt_ms,penalty_ms,stats_known}`
+  with `pub_key` and `tag` labels. Loopback strongly recommended
+  (pub_keys leak in labels).
+
+* **mDNS discovery** — exits advertise
+  `_bifrost-exit._tcp.local.` with `pk=<64hex>` in TXT;
+  Auto-mode clients browse and auto-add discovered peers (tagged
+  `mDNS`). Eviction on `ServiceRemoved`. Toggle with
+  `[bifrost].mdns_discovery`.
+
+* **Happy-eyeballs racing** — each CONNECT races the OPEN frame
+  across `race_exits` top-weighted exits in parallel and takes
+  the first success. `race_exits = 1` disables; `race_timeout_ms`
+  caps the race.
+
 ## Roadmap
 
-* Multi-exit per stream (selective forwarding)
-* Native exit discovery — Auto reads from a config list today; the
-  next step is a `_bifrost-exit._norn` mDNS service that exit
-  daemons advertise so clients pick them up automatically.
 * Android NDK / iOS cross-builds for mobile clients
-* `bifrost-ctl` admin CLI on the UNIX admin socket
-* Prometheus exporter for the ScoredExitPool snapshot
-  (weight, trust, RTT, penalty per candidate)
+* Aborted-loser Reset hint so racing exit-side TCPs tear down
+  immediately instead of waiting for the ARQ retransmit budget
+* Hot-reload: `bifrost-ctl reload` to pick up config changes
+  without a daemon restart
+
+## Known limitations
+
+* The bifrost-specific Prometheus listener binding during a cold
+  daemon start can occasionally race the norn-rs handshake under
+  load (most visible in fresh docker testbeds). The compose used
+  by `tests/docker/run.sh` defaults to `BIFROST_DISABLE_METRICS=1`
+  for that reason; production deployments hit it less often,
+  workaround is to enable the endpoint after the first peer
+  reaches `connected to peer` in the logs (e.g. via
+  `bifrost-ctl` once the first session settles).
 
 ---
 

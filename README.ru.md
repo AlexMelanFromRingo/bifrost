@@ -52,9 +52,11 @@ sliding-window ARQ, который превращает ненадёжный dat
 | IPv6 egress (NAT66)          | ✅ done   | 4 unit-теста; dual-stack EgressHello    |
 | Karn/Partridge SRTT/RTTVAR   | ✅ done   | RFC 6298; 5 unit-тестов                 |
 | Trust-weighted exit pick     | ✅ done   | `EgressPolicy::Auto`; 8 unit-тестов     |
+| Multi-exit per stream        | ✅ done   | happy-eyeballs racing (race_exits=3)    |
+| mDNS exit discovery          | ✅ done   | `_bifrost-exit._tcp.local.`             |
+| Prometheus exporter          | ✅ done   | per-candidate weight/trust/RTT          |
+| `bifrost-ctl` admin CLI      | ✅ done   | JSON RPC поверх UNIX-сокета             |
 | Mobile build (Android/iOS)   | ⏸ потом  | только x86_64 + aarch64 Linux           |
-| Multi-exit per stream        | ⏸ потом  | selective forwarding                    |
-| Native exit discovery        | ⏸ потом  | Auto читает список из конфига           |
 
 ---
 
@@ -359,16 +361,49 @@ Reliability-слой трактует Data и Close как единое sequence
 
 ---
 
+## Операционные инструменты
+
+* **`bifrost-ctl`** — admin CLI поверх UNIX-сокета демона
+  (`[bifrost].admin_socket` в конфиге). Команды:
+  `status`, `exits`, `peers`, `penalty <pk>`, `reset-penalty <pk>`,
+  `reset-all-penalties`. По умолчанию — таблицы; `--json` отдаёт
+  сырой envelope для скриптов. Дефолтный socket:
+  `/tmp/bifrost-socks5d-ctl.sock`.
+
+* **Prometheus экспортер** — `[bifrost].metrics_addr` (например
+  `127.0.0.1:9099`) отдаёт per-candidate gauges:
+  `bifrost_exit_{weight,trust,rtt_ms,penalty_ms,stats_known}` с
+  лейблами `pub_key`/`tag`. Loopback настойчиво рекомендуется
+  (pub_keys в лейблах = утечка).
+
+* **mDNS-обнаружение** — exit'ы рекламируют
+  `_bifrost-exit._tcp.local.` с `pk=<64hex>` в TXT; Auto-клиенты
+  browse'ят и автоматически добавляют в пул (тег `mDNS`). Eviction
+  при `ServiceRemoved`. Управление: `[bifrost].mdns_discovery`.
+
+* **Happy-eyeballs racing** — каждый CONNECT гоняет OPEN-фрейм
+  параллельно по `race_exits` лучшим exit'ам и берёт первого
+  ответившего успехом. `race_exits = 1` отключает racing;
+  `race_timeout_ms` ограничивает гонку.
+
 ## Roadmap
 
-* Multi-exit per stream (selective forwarding)
-* Нативное обнаружение exit'ов — Auto сейчас читает их из конфига,
-  следующий шаг — mDNS-сервис `_bifrost-exit._norn`, который exit-
-  демоны рекламируют, а клиенты подбирают автоматически.
 * Android NDK / iOS кросс-сборки для мобильных клиентов
-* `bifrost-ctl` admin CLI на UNIX admin-сокете
-* Prometheus экспортер для snapshot'а ScoredExitPool
-  (weight, trust, RTT, penalty по каждому кандидату)
+* Reset-hint для проигравших racer'ов, чтобы их exit-side TCP
+  закрывались сразу, а не ждали исчерпания ARQ retransmit budget
+* Hot-reload: `bifrost-ctl reload` чтобы подхватить конфиг без
+  рестарта демона
+
+## Известные ограничения
+
+* Bifrost-специфичный Prometheus listener в момент binding'а на
+  холодном старте демона может изредка гонять норн-handshake под
+  нагрузкой (видно в свежем docker testbed'е). Docker compose в
+  `tests/docker/run.sh` поэтому по умолчанию выставляет
+  `BIFROST_DISABLE_METRICS=1`; в проде встречается реже,
+  workaround — включать endpoint после того, как в логах появится
+  `connected to peer` (через `bifrost-ctl` после установления
+  первой сессии).
 
 ---
 
