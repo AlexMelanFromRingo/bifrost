@@ -59,12 +59,18 @@ impl FrameKind {
 
 /// The CONNECT target carried in an Open frame. Mirrors the SOCKS5 ATYP
 /// field so we can pass through hostnames without forcing DNS on the client.
+///
+/// `Egress` is a bifrost-vpnd-specific variant that says "open a tunnel
+/// for raw IP packets — please allocate me an address". The reply (an
+/// OpenAck plus a first Data frame from the exit) carries the allocated
+/// address and gateway so the client's TUN can be configured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenTarget {
     V4(std::net::Ipv4Addr, u16),
     V6(std::net::Ipv6Addr, u16),
     /// `len` ≤ 255 by SOCKS5 spec.
     Domain(String, u16),
+    Egress,
 }
 
 impl OpenTarget {
@@ -81,6 +87,7 @@ impl OpenTarget {
             Self::V4(ip, port) => format!("{ip}:{port}"),
             Self::V6(ip, port) => format!("[{ip}]:{port}"),
             Self::Domain(d, port) => format!("{d}:{port}"),
+            Self::Egress => "<egress-tunnel>".to_string(),
         }
     }
 
@@ -104,6 +111,12 @@ impl OpenTarget {
                 out.push(0x04);
                 out.extend_from_slice(&ip.octets());
                 out.extend_from_slice(&port.to_be_bytes());
+            }
+            // 0xfe is reserved outside the SOCKS5 ATYP range (1, 3, 4),
+            // so SOCKS5 clients never see it and bifrost-only callers
+            // can recognise it unambiguously.
+            Self::Egress => {
+                out.push(0xfe);
             }
         }
         Ok(())
@@ -145,6 +158,7 @@ impl OpenTarget {
                 let port = u16::from_be_bytes([buf[17], buf[18]]);
                 Ok(Self::V6(octets.into(), port))
             }
+            0xfe => Ok(Self::Egress),
             other => bail!("open target: unknown ATYP 0x{:02x}", other),
         }
     }
@@ -296,6 +310,14 @@ mod tests {
             target: OpenTarget::V6(Ipv6Addr::LOCALHOST, 22),
         };
         let back = Frame::decode(&f.encode().unwrap()).unwrap();
+        assert_eq!(f, back);
+    }
+
+    #[test]
+    fn open_egress_roundtrip() {
+        let f = Frame::Open { sid: 99, target: OpenTarget::Egress };
+        let bytes = f.encode().unwrap();
+        let back = Frame::decode(&bytes).unwrap();
         assert_eq!(f, back);
     }
 

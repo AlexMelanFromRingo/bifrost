@@ -24,16 +24,18 @@ RUN mkdir -p ./norn-rs/benches && \
     [ -f ./norn-rs/benches/bench.rs ] || echo "fn main() {}" > ./norn-rs/benches/bench.rs
 
 WORKDIR /build/bifrost
-RUN cargo build --release -p bifrost-socks5d
-RUN strip target/release/bifrost-socks5d
+RUN cargo build --release -p bifrost-socks5d -p bifrost-vpnd --features bifrost-vpnd/tun
+RUN strip target/release/bifrost-socks5d target/release/bifrost-vpnd
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl python3 iproute2 \
+    ca-certificates curl python3 iproute2 iptables \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/bifrost/target/release/bifrost-socks5d /usr/local/bin/
-COPY bifrost/tests/docker/entrypoint.sh /usr/local/bin/bifrost-entrypoint
-RUN chmod +x /usr/local/bin/bifrost-entrypoint
+COPY --from=builder /build/bifrost/target/release/bifrost-vpnd     /usr/local/bin/
+COPY bifrost/tests/docker/entrypoint.sh     /usr/local/bin/bifrost-entrypoint
+COPY bifrost/tests/docker/entrypoint-vpn.sh /usr/local/bin/bifrost-vpn-entrypoint
+RUN chmod +x /usr/local/bin/bifrost-entrypoint /usr/local/bin/bifrost-vpn-entrypoint
 
 ENTRYPOINT ["bifrost-entrypoint"]

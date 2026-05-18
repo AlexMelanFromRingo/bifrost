@@ -12,8 +12,10 @@ path = "src/main.rs"
 
 [features]
 default = ["tun"]
-# TUN integration delegates to norn-rs's tun module which is feature-gated upstream.
-tun = ["norn-rs/tun-support"]
+# `tun` pulls in tun2 + norn-rs's tun module. Egress mode also needs
+# CAP_NET_ADMIN at runtime to bring up the device and rewrite the
+# nat table — we don't try to fall back gracefully.
+tun = ["norn-rs/tun-support", "dep:tun2"]
 
 [dependencies]
 bifrost-core    = { path = "../bifrost-core" }
@@ -27,3 +29,4 @@ serde.workspace = true
 toml.workspace = true
 clap.workspace = true
 hex.workspace = true
+tun2 = { version = "3", features = ["async"], optional = true }

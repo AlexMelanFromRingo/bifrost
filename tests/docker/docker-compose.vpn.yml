@@ -1,0 +1,92 @@
+# Bifrost VPN testbed — three services on one bridge network.
+#
+#   exit    bifrost-vpnd in exit mode (TUN + iptables MASQUERADE).
+#   client  bifrost-vpnd in client mode (TUN configured from the
+#           exit's allocated address; pipes IP packets via mesh).
+#   target  Python http.server playing the role of an "internet" host.
+#           Reachable directly from the docker bridge so the exit's
+#           kernel can route to it via plain IP after MASQUERADE.
+#
+# Bring up with `bash tests/docker/run-vpn.sh`. The script handles the
+# two-phase startup (exit comes up first, scrape pub_key, then start
+# client + target with the env wired in).
+
+services:
+  exit:
+    image: bifrost:test
+    container_name: bifrost-vpn-exit
+    entrypoint: ["bifrost-vpn-entrypoint"]
+    environment:
+      BIFROST_VPN_ROLE: exit
+      BIFROST_TCP_PORT: "9001"
+      BIFROST_EGRESS_IFACE: "eth0"
+      BIFROST_POOL_BASE: "10.55.0.0"
+      BIFROST_POOL_PREFIX: "24"
+      BIFROST_PEER_HOST: "client:9001"
+      RUST_LOG: "info,bifrost_core=info,bifrost_vpnd=debug"
+      NETEM_DELAY: "30ms 5ms"
+      NETEM_LOSS: "1%"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    networks:
+      bifrost-vpn:
+        aliases: [exit]
+
+  client:
+    image: bifrost:test
+    container_name: bifrost-vpn-client
+    entrypoint: ["bifrost-vpn-entrypoint"]
+    depends_on:
+      exit:
+        condition: service_started
+    environment:
+      BIFROST_VPN_ROLE: client
+      BIFROST_TCP_PORT: "9001"
+      BIFROST_EXIT_HOST: "exit:9001"
+      BIFROST_EXIT_PUBKEY: "${BIFROST_EXIT_PUBKEY:?BIFROST_EXIT_PUBKEY must be set by run-vpn.sh}"
+      BIFROST_INSTALL_DEFAULT_ROUTE: "0"
+      RUST_LOG: "info,bifrost_core=info,bifrost_vpnd=debug"
+      NETEM_DELAY: "30ms 5ms"
+      NETEM_LOSS: "1%"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    networks:
+      bifrost-vpn:
+        aliases: [client]
+
+  target:
+    image: python:3.12-slim
+    container_name: bifrost-vpn-target
+    command:
+      - python3
+      - -c
+      - |
+        import os, hashlib
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        BLOB = (b'V' * (256*1024))
+        DIGEST = hashlib.sha256(BLOB).hexdigest()
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == '/digest':
+                    body = DIGEST.encode()
+                    self.send_response(200); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+                elif self.path == '/whoami':
+                    cli = self.client_address[0].encode()
+                    self.send_response(200); self.send_header('Content-Length', str(len(cli))); self.end_headers(); self.wfile.write(cli)
+                else:
+                    self.send_response(200); self.send_header('Content-Length', str(len(BLOB))); self.end_headers(); self.wfile.write(BLOB)
+            def log_message(self, *a): pass
+        HTTPServer(('0.0.0.0', 8080), H).serve_forever()
+    networks:
+      bifrost-vpn:
+        aliases: [target]
+
+networks:
+  bifrost-vpn:
+    driver: bridge

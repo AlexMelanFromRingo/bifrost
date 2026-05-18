@@ -26,8 +26,12 @@ use crate::stream::{MeshStream, StreamEvent, INBOUND_CHAN_DEPTH};
 use crate::{PubKey, StreamId};
 
 /// Max retries while waiting for the ChaCha20-Poly1305 session handshake
-/// to complete on the first packet to a fresh peer.
-const SESSION_WAIT_RETRIES: usize = 50;
+/// to complete on the first packet to a fresh peer. Covers cold-start
+/// ordering: a local node may boot before its peer is dialable, and
+/// norn-rs's own connect-backoff keeps the TCP from settling instantly.
+/// 30 s of patience here is dominated upstream by the caller's own
+/// timeout (SOCKS5: 15 s; VPN client: 15 s on open).
+const SESSION_WAIT_RETRIES: usize = 300;
 const SESSION_WAIT_INTERVAL: Duration = Duration::from_millis(100);
 /// How often the retransmit task scans all live streams. 50 ms gives
 /// sub-second response to losses without thrashing on idle muxes.

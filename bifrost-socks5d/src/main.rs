@@ -194,6 +194,14 @@ async fn handle_exit_stream(acc: AcceptedStream) {
         hex::encode(&acc.from[..8]),
         target.display()
     );
+    // bifrost-socks5d only handles SOCKS5 CONNECT targets; egress
+    // tunnels belong to bifrost-vpnd. Reject cleanly so the client
+    // (which may be SOCKS5 only) doesn't hang waiting for an answer.
+    if matches!(target, OpenTarget::Egress) {
+        warn!("exit: refusing Egress target — this daemon is SOCKS5-only");
+        let _ = mesh.send_open_ack(reply::CMD_NOT_SUPPORTED).await;
+        return;
+    }
     let target_str = open_target_to_connect_str(&target);
     let tcp = tokio::time::timeout(Duration::from_secs(15), TcpStream::connect(&target_str)).await;
     let mut tcp = match tcp {
@@ -224,6 +232,9 @@ fn open_target_to_connect_str(t: &OpenTarget) -> String {
         OpenTarget::V4(ip, port) => format!("{ip}:{port}"),
         OpenTarget::V6(ip, port) => format!("[{ip}]:{port}"),
         OpenTarget::Domain(host, port) => format!("{host}:{port}"),
+        // Egress is rejected at the call site before we reach here,
+        // but keep the arm so the compiler can prove exhaustiveness.
+        OpenTarget::Egress => String::from("<egress>"),
     }
 }
 
