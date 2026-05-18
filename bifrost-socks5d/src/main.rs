@@ -14,7 +14,7 @@ mod config;
 mod metrics;
 mod socks5;
 
-use admin::AdminState;
+use admin::{AdminState, RaceConfig};
 use anyhow::{Context, Result};
 use bifrost_core::{
     discovery,
@@ -81,8 +81,8 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     let (mux, accept_rx) = MeshMux::new(conn);
 
     match cfg.mode {
-        Mode::Client => run_client(cfg, mux, started_at).await,
-        Mode::Exit => run_exit(cfg, mux, accept_rx, started_at).await,
+        Mode::Client => run_client(cfg, config_path, mux, started_at).await,
+        Mode::Exit => run_exit(cfg, config_path, mux, accept_rx, started_at).await,
     }
 }
 
@@ -140,7 +140,12 @@ impl ExitPicker {
     }
 }
 
-async fn run_client(cfg: DaemonConfig, mux: Arc<MeshMux>, started_at: Instant) -> Result<()> {
+async fn run_client(
+    cfg: DaemonConfig,
+    config_path: std::path::PathBuf,
+    mux: Arc<MeshMux>,
+    started_at: Instant,
+) -> Result<()> {
     let policy = cfg
         .egress
         .as_ref()
@@ -192,9 +197,13 @@ async fn run_client(cfg: DaemonConfig, mux: Arc<MeshMux>, started_at: Instant) -
     };
     let picker = Arc::new(picker);
 
-    // Spin up the bifrost admin socket if configured. Works in both
-    // Auto (with pool) and Exit (rotator only — penalty/exits ops will
-    // return a "no pool" error but status/peers still work).
+    // RaceConfig is shared between the accept loop (reader) and the
+    // admin Reload handler (writer). Atomics so neither side blocks.
+    let race_cfg = Arc::new(RaceConfig::new(
+        cfg.bifrost.race_exits,
+        cfg.bifrost.race_timeout_ms,
+    ));
+
     spawn_admin_if_configured(
         &cfg,
         AdminState {
@@ -205,6 +214,8 @@ async fn run_client(cfg: DaemonConfig, mux: Arc<MeshMux>, started_at: Instant) -
             },
             mode: Mode::Client,
             started_at,
+            config_path: config_path.clone(),
+            race_cfg: race_cfg.clone(),
         },
     );
 
@@ -224,8 +235,10 @@ async fn run_client(cfg: DaemonConfig, mux: Arc<MeshMux>, started_at: Instant) -
         };
         let mux = mux.clone();
         let picker = picker.clone();
-        let race_exits = cfg.bifrost.race_exits;
-        let race_timeout = Duration::from_millis(cfg.bifrost.race_timeout_ms);
+        // Read knobs at accept time so a Reload between accepts is
+        // picked up by every subsequent CONNECT without restart.
+        let race_exits = race_cfg.race_exits();
+        let race_timeout = race_cfg.race_timeout();
         tokio::spawn(async move {
             if let Err(e) = handle_socks5(sock, mux, picker, race_exits, race_timeout).await {
                 tracing::debug!("socks5 from {peer}: {e}");
@@ -454,11 +467,20 @@ enum RacerOutcome {
 
 async fn run_exit(
     cfg: DaemonConfig,
+    config_path: std::path::PathBuf,
     mux: Arc<MeshMux>,
     mut accept_rx: tokio::sync::mpsc::Receiver<AcceptedStream>,
     started_at: Instant,
 ) -> Result<()> {
     info!("exit mode: waiting for SOCKS5 CONNECTs over the mesh");
+    // Exit mode has no per-CONNECT race knobs to manage, but RaceConfig
+    // is still wired so a future Reload at least produces consistent
+    // "no-op" responses (and so AdminState carries the same shape in
+    // both modes).
+    let race_cfg = Arc::new(RaceConfig::new(
+        cfg.bifrost.race_exits,
+        cfg.bifrost.race_timeout_ms,
+    ));
     spawn_admin_if_configured(
         &cfg,
         AdminState {
@@ -466,6 +488,8 @@ async fn run_exit(
             pool: None,
             mode: Mode::Exit,
             started_at,
+            config_path: config_path.clone(),
+            race_cfg,
         },
     );
     if cfg.bifrost.mdns_discovery {

@@ -29,6 +29,11 @@ pub enum AdminRequest {
     ResetPenalty { pub_key: String },
     /// Clear ALL active penalties — "give the fleet one more chance".
     ResetAllPenalties,
+    /// Re-read the daemon's config file from disk and apply
+    /// reloadable fields (egress.exits diff, race_exits,
+    /// race_timeout_ms). Private key, listen addresses, mode, and
+    /// admin/metrics endpoints still require a full restart.
+    Reload,
 }
 
 /// Uniform envelope for every response. Either `data` holds the
@@ -100,6 +105,16 @@ pub struct PeerRow {
     pub uptime_secs: u64,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+}
+
+/// Payload for `Reload`: a per-field summary of what changed.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReloadResponse {
+    pub exits_added: Vec<String>,
+    pub exits_removed: Vec<String>,
+    pub exits_skipped_mdns: usize,
+    pub race_exits: Option<usize>,
+    pub race_timeout_ms: Option<u64>,
 }
 
 #[cfg(test)]

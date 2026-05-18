@@ -368,9 +368,16 @@ What this protocol does **not** protect:
 * **`bifrost-ctl`** — admin CLI over the daemon's UNIX socket
   (`[bifrost].admin_socket` in the config). Sub-commands:
   `status`, `exits`, `peers`, `penalty <pk>`, `reset-penalty <pk>`,
-  `reset-all-penalties`. Default render is a tidy table; `--json`
-  dumps the raw envelope for scripts. Default socket path:
-  `/tmp/bifrost-socks5d-ctl.sock`.
+  `reset-all-penalties`, `reload`. Default render is a tidy table;
+  `--json` dumps the raw envelope for scripts. Default socket
+  path: `/tmp/bifrost-socks5d-ctl.sock`.
+
+  **`bifrost-ctl reload`** re-reads the daemon's config file and
+  hot-applies the reloadable fields: `[egress].exits` diff (added
+  /removed by pub_key, mDNS-discovered candidates preserved),
+  plus `race_exits` and `race_timeout_ms`. Mode swaps,
+  listen-address changes, and key rotation still require a full
+  restart.
 
 * **Prometheus exporter** — `[bifrost].metrics_addr` (e.g.
   `127.0.0.1:9099`) exposes per-candidate gauges:
@@ -392,10 +399,6 @@ What this protocol does **not** protect:
 ## Roadmap
 
 * Android NDK / iOS cross-builds for mobile clients
-* Aborted-loser Reset hint so racing exit-side TCPs tear down
-  immediately instead of waiting for the ARQ retransmit budget
-* Hot-reload: `bifrost-ctl reload` to pick up config changes
-  without a daemon restart
 
 ## Known limitations
 

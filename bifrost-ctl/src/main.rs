@@ -7,7 +7,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use bifrost_core::admin_proto::{
-    AdminRequest, AdminResponse, ExitRow, PeerRow, StatusResponse,
+    AdminRequest, AdminResponse, ExitRow, PeerRow, ReloadResponse, StatusResponse,
 };
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -49,6 +49,11 @@ enum Cmd {
     ResetPenalty { pub_key: String },
     /// Clear ALL active penalties.
     ResetAllPenalties,
+    /// Re-read the daemon's config file from disk and hot-apply
+    /// reloadable fields (egress.exits diff with mDNS preservation,
+    /// race_exits, race_timeout_ms). Mode swaps and listen-address
+    /// changes still need a full restart.
+    Reload,
 }
 
 #[tokio::main]
@@ -61,6 +66,7 @@ async fn main() -> Result<()> {
         Cmd::Penalty { pub_key } => AdminRequest::Penalty { pub_key: pub_key.clone() },
         Cmd::ResetPenalty { pub_key } => AdminRequest::ResetPenalty { pub_key: pub_key.clone() },
         Cmd::ResetAllPenalties => AdminRequest::ResetAllPenalties,
+        Cmd::Reload => AdminRequest::Reload,
     };
 
     let response = run_rpc(&cli.socket, &req).await?;
@@ -83,6 +89,7 @@ async fn main() -> Result<()> {
         Cmd::Status => render_status(serde_json::from_value(data)?),
         Cmd::Exits => render_exits(serde_json::from_value(data)?),
         Cmd::Peers => render_peers(serde_json::from_value(data)?),
+        Cmd::Reload => render_reload(serde_json::from_value(data)?),
         Cmd::Penalty { .. } | Cmd::ResetPenalty { .. } | Cmd::ResetAllPenalties => {
             // These return small status objects; pretty-print as JSON.
             println!("{}", serde_json::to_string_pretty(&data)?);
@@ -167,6 +174,39 @@ fn render_peers(rows: Vec<PeerRow>) {
             p.rx_bytes,
             p.tx_bytes,
         );
+    }
+}
+
+fn render_reload(r: ReloadResponse) {
+    if r.exits_added.is_empty()
+        && r.exits_removed.is_empty()
+        && r.exits_skipped_mdns == 0
+        && r.race_exits.is_none()
+        && r.race_timeout_ms.is_none()
+    {
+        println!("reload: no-op (config matches running state)");
+        return;
+    }
+    if let Some(n) = r.race_exits {
+        println!("race_exits      → {}", n);
+    }
+    if let Some(t) = r.race_timeout_ms {
+        println!("race_timeout_ms → {}", t);
+    }
+    if !r.exits_added.is_empty() {
+        println!("+ {} added exit(s):", r.exits_added.len());
+        for pk in &r.exits_added {
+            println!("    {}", &pk[..16]);
+        }
+    }
+    if !r.exits_removed.is_empty() {
+        println!("- {} removed exit(s):", r.exits_removed.len());
+        for pk in &r.exits_removed {
+            println!("    {}", &pk[..16]);
+        }
+    }
+    if r.exits_skipped_mdns > 0 {
+        println!("ignored {} mDNS-discovered candidate(s) (preserved)", r.exits_skipped_mdns);
     }
 }
 

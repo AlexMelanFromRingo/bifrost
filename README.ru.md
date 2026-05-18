@@ -366,9 +366,15 @@ Reliability-слой трактует Data и Close как единое sequence
 * **`bifrost-ctl`** — admin CLI поверх UNIX-сокета демона
   (`[bifrost].admin_socket` в конфиге). Команды:
   `status`, `exits`, `peers`, `penalty <pk>`, `reset-penalty <pk>`,
-  `reset-all-penalties`. По умолчанию — таблицы; `--json` отдаёт
-  сырой envelope для скриптов. Дефолтный socket:
-  `/tmp/bifrost-socks5d-ctl.sock`.
+  `reset-all-penalties`, `reload`. По умолчанию — таблицы;
+  `--json` отдаёт сырой envelope для скриптов. Дефолтный
+  socket: `/tmp/bifrost-socks5d-ctl.sock`.
+
+  **`bifrost-ctl reload`** перечитывает конфиг с диска и
+  hot-применяет reloadable поля: дельта `[egress].exits`
+  (добавление/удаление по pub_key, mDNS-открытые сохраняются),
+  плюс `race_exits` и `race_timeout_ms`. Смена режима,
+  listen-адресов и ротация ключей всё ещё требуют рестарта.
 
 * **Prometheus экспортер** — `[bifrost].metrics_addr` (например
   `127.0.0.1:9099`) отдаёт per-candidate gauges:
@@ -389,10 +395,6 @@ Reliability-слой трактует Data и Close как единое sequence
 ## Roadmap
 
 * Android NDK / iOS кросс-сборки для мобильных клиентов
-* Reset-hint для проигравших racer'ов, чтобы их exit-side TCP
-  закрывались сразу, а не ждали исчерпания ARQ retransmit budget
-* Hot-reload: `bifrost-ctl reload` чтобы подхватить конфиг без
-  рестарта демона
 
 ## Известные ограничения
 
