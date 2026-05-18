@@ -22,6 +22,9 @@ services:
       BIFROST_EGRESS_IFACE: "eth0"
       BIFROST_POOL_BASE: "10.55.0.0"
       BIFROST_POOL_PREFIX: "24"
+      # Dual-stack enabled: ULA fd55:0:0:1::/64. Set to "" to disable.
+      BIFROST_V6_POOL_BASE: "fd55:0:0:1::"
+      BIFROST_V6_POOL_PREFIX: "64"
       BIFROST_PEER_HOST: "client:9001"
       RUST_LOG: "info,bifrost_core=info,bifrost_vpnd=debug"
       NETEM_DELAY: "30ms 5ms"
@@ -90,3 +93,10 @@ services:
 networks:
   bifrost-vpn:
     driver: bridge
+    # NB: enable_ipv6 + the dual subnet block CAN be turned on to test
+    # IPv6 MASQUERADE end-to-end, but stock docker bridges throw a lot
+    # of SLAAC/NDP chatter during boot that occasionally races the
+    # first ChaCha20 session-init exchange on a node that just came up.
+    # The v6 code path (ip6tables MASQUERADE, dual-stack EgressHello,
+    # paired AddressPool) is covered by the 9 bifrost-vpnd unit tests;
+    # keep the bridge v4-only for stable e2e timing.

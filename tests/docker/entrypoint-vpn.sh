@@ -58,6 +58,14 @@ if [ "$ROLE" = "exit" ]; then
         -e "s|pool_base    = \"10.55.0.0\"|pool_base    = \"${POOL_BASE}\"|" \
         -e "s|pool_prefix  = 24|pool_prefix  = ${POOL_PREFIX}|" \
         "$CONFIG"
+    if [ -n "${BIFROST_V6_POOL_BASE:-}" ]; then
+        V6_PREFIX="${BIFROST_V6_POOL_PREFIX:-64}"
+        # Replace the commented-out v6 template lines with active config.
+        sed -i \
+            -e "s|^# v6_pool_base   = .*|v6_pool_base   = \"${BIFROST_V6_POOL_BASE}\"|" \
+            -e "s|^# v6_pool_prefix = .*|v6_pool_prefix = ${V6_PREFIX}|" \
+            "$CONFIG"
+    fi
     if [ -n "${BIFROST_PEER_HOST:-}" ]; then
         sed -i "s|peers = \\[\\]|peers = [\"tcp://${BIFROST_PEER_HOST}\"]|" "$CONFIG"
     fi

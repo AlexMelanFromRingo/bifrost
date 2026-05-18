@@ -121,6 +121,8 @@ async fn run_exit(
         cfg.exit.tun_name.clone(),
         cfg.exit.pool_base,
         cfg.exit.pool_prefix,
+        cfg.exit.v6_pool_base,
+        cfg.exit.v6_pool_prefix,
         cfg.exit.egress_iface.clone(),
     )
     .await

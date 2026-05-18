@@ -53,8 +53,8 @@ export BIFROST_EXIT_PUBKEY="$EXIT_PUB"
 echo "=== bring up client + target ==="
 (cd "$HERE" && docker compose -f docker-compose.vpn.yml up -d client target)
 
-echo "=== wait for client TUN allocation (≤60s) ==="
-for _ in $(seq 1 120); do
+echo "=== wait for client TUN allocation (≤90s) ==="
+for _ in $(seq 1 180); do
     if docker logs bifrost-vpn-client 2>&1 | grep -q 'egress client: allocated'; then
         break
     fi

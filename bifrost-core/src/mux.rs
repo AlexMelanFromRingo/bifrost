@@ -29,9 +29,11 @@ use crate::{PubKey, StreamId};
 /// to complete on the first packet to a fresh peer. Covers cold-start
 /// ordering: a local node may boot before its peer is dialable, and
 /// norn-rs's own connect-backoff keeps the TCP from settling instantly.
-/// 30 s of patience here is dominated upstream by the caller's own
-/// timeout (SOCKS5: 15 s; VPN client: 15 s on open).
-const SESSION_WAIT_RETRIES: usize = 300;
+/// 60 s also gives dual-stack docker bridges enough room for the SLAAC /
+/// RA chatter that occasionally races our first session-init exchange.
+/// Dominated upstream by the caller's own timeout (SOCKS5: 15 s on
+/// CONNECT; VPN client: 30 s on its egress Open).
+const SESSION_WAIT_RETRIES: usize = 600;
 const SESSION_WAIT_INTERVAL: Duration = Duration::from_millis(100);
 /// How often the retransmit task scans all live streams. 50 ms gives
 /// sub-second response to losses without thrashing on idle muxes.

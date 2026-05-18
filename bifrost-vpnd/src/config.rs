@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use bifrost_core::policy::EgressPolicy;
 use norn_rs::config::NodeConfig;
 use serde::Deserialize;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +62,13 @@ pub struct ExitSettings {
     pub pool_base: Ipv4Addr,
     #[serde(default = "default_pool_prefix")]
     pub pool_prefix: u8,
+    /// Optional ULA IPv6 prefix to hand out alongside IPv4. The host
+    /// portion is paired with the v4 lease (host index 2 in /24 → 2 in
+    /// /64), so each client gets one matching pair. None = v4-only.
+    #[serde(default)]
+    pub v6_pool_base: Option<Ipv6Addr>,
+    #[serde(default = "default_v6_pool_prefix")]
+    pub v6_pool_prefix: u8,
     /// Real network interface to MASQUERADE through. Typically `eth0`
     /// in containers; on bare metal something like `wlan0`/`enp4s0`.
     #[serde(default = "default_egress_iface")]
@@ -74,6 +81,8 @@ impl Default for ExitSettings {
             tun_name: default_egress_tun(),
             pool_base: default_pool_base(),
             pool_prefix: default_pool_prefix(),
+            v6_pool_base: None,
+            v6_pool_prefix: default_v6_pool_prefix(),
             egress_iface: default_egress_iface(),
         }
     }
@@ -82,6 +91,7 @@ impl Default for ExitSettings {
 fn default_egress_tun() -> String { "bifrost-eg0".to_string() }
 fn default_pool_base() -> Ipv4Addr { Ipv4Addr::new(10, 55, 0, 0) }
 fn default_pool_prefix() -> u8 { 24 }
+fn default_v6_pool_prefix() -> u8 { 64 }
 fn default_egress_iface() -> String { "eth0".to_string() }
 
 #[derive(Debug, Deserialize)]
@@ -154,10 +164,18 @@ impl VpnConfig {
                 }
             }
             Mode::Exit => {
-                if self.exit.pool_prefix < 16 || self.exit.pool_prefix > 30 {
+                if !(16..=30).contains(&self.exit.pool_prefix) {
                     anyhow::bail!(
                         "mode=\"exit\": pool_prefix /{} must be in [16, 30]",
                         self.exit.pool_prefix
+                    );
+                }
+                if self.exit.v6_pool_base.is_some()
+                    && !(64..=126).contains(&self.exit.v6_pool_prefix)
+                {
+                    anyhow::bail!(
+                        "mode=\"exit\": v6_pool_prefix /{} must be in [64, 126]",
+                        self.exit.v6_pool_prefix
                     );
                 }
             }
@@ -192,6 +210,10 @@ mode = "exit"
 tun_name     = "bifrost-eg0"
 pool_base    = "10.55.0.0"
 pool_prefix  = 24
+# Uncomment to enable dual-stack (IPv6 NAT66). The host portion is
+# paired with the IPv4 lease so each client gets matched addresses.
+# v6_pool_base   = "fd55:0:0:1::"
+# v6_pool_prefix = 64
 egress_iface = "eth0"
 
 [node]
