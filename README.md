@@ -48,10 +48,12 @@ stream.
 | `bifrost-vpnd` mesh        | ✅ v0.1  | norn-rs `tun-support`                |
 | `bifrost-vpnd` exit (NAT)  | ✅ done  | docker e2e w/ NetEm; SHA-256 match   |
 | `bifrost-vpnd` client      | ✅ done  | docker e2e                           |
-| IPv6 egress                | ⏸ later | only IPv4 NAT44 today                |
-| Trust-weighted exit pick   | ⏸ later | `EgressPolicy::Auto` is a stub today |
-| Karn/Partridge RTO         | ⏸ later | fixed-RTO doubling for now           |
+| IPv6 egress (NAT66)        | ✅ done  | 4 unit tests; dual-stack EgressHello |
+| Karn/Partridge SRTT/RTTVAR | ✅ done  | RFC 6298; 5 unit tests               |
+| Trust-weighted exit pick   | ✅ done  | `EgressPolicy::Auto`; 8 unit tests   |
 | Mobile build (Android/iOS) | ⏸ later | x86_64 + aarch64 Linux only          |
+| Multi-exit per stream      | ⏸ later | selective forwarding                 |
+| Native exit discovery      | ⏸ later | Auto reads from a config list today  |
 
 ---
 
@@ -221,11 +223,20 @@ mode = "client"                    # or "exit"
 socks5_listen = "127.0.0.1:1080"   # client mode only
 
 [egress]
-mode = "exit"                      # or "mesh" / "auto" (reserved)
+mode = "exit"                      # "exit" round-robin, "auto" weighted,
+                                   # or "mesh" (no egress, 0200::/7 only)
 exits = [
   { pub_key = "abcd...32 bytes hex", tag = "primary" },
+  { pub_key = "ef01...32 bytes hex", tag = "backup" },
 ]
 ```
+
+**`auto`** uses `Weight = Trust / (RTT_ms + Penalty_ms + 1)` to pick
+an exit. Trust + RTT come from norn-rs's live PeerStats (refreshed
+every 10 s). A failed CONNECT injects a +1 s penalty on that exit
+for 2 minutes so flaky peers self-deprioritise. Selection isn't
+deterministic: a weighted-random draw over the top 5 spreads load
+to prevent every client herding onto the same low-RTT exit at once.
 
 `bifrost-vpnd`-specific (exit mode):
 
@@ -233,10 +244,15 @@ exits = [
 mode = "exit"
 
 [exit]
-tun_name     = "bifrost-eg0"
-pool_base    = "10.55.0.0"
-pool_prefix  = 24                  # /24 = 253 leases (gateway + broadcast reserved)
-egress_iface = "eth0"              # interface that gets MASQUERADE'd
+tun_name       = "bifrost-eg0"
+pool_base      = "10.55.0.0"
+pool_prefix    = 24                # /24 = 253 leases (gateway + broadcast reserved)
+egress_iface   = "eth0"            # interface that gets MASQUERADE'd
+# Optional dual-stack: each client gets paired v4 + v6 leases. Host
+# index 2 in /24 maps to host index 2 in /64, so the same client has
+# matching addresses on both stacks. Omit v6_pool_base for v4-only.
+# v6_pool_base   = "fd55:0:0:1::"
+# v6_pool_prefix = 64
 ```
 
 `bifrost-vpnd`-specific (client mode):
@@ -347,12 +363,14 @@ What this protocol does **not** protect:
 
 ## Roadmap
 
-* `EgressPolicy::Auto` — pick exits weighted by trust score + RTT
-* IPv6 egress NAT66 on `bifrost-vpnd exit`
-* SRTT/RTTVAR per Karn/Partridge for tighter RTO
 * Multi-exit per stream (selective forwarding)
+* Native exit discovery — Auto reads from a config list today; the
+  next step is a `_bifrost-exit._norn` mDNS service that exit
+  daemons advertise so clients pick them up automatically.
 * Android NDK / iOS cross-builds for mobile clients
 * `bifrost-ctl` admin CLI on the UNIX admin socket
+* Prometheus exporter for the ScoredExitPool snapshot
+  (weight, trust, RTT, penalty per candidate)
 
 ---
 

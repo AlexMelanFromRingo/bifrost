@@ -49,10 +49,12 @@ sliding-window ARQ, который превращает ненадёжный dat
 | `bifrost-vpnd` mesh          | ✅ v0.1   | norn-rs `tun-support`                   |
 | `bifrost-vpnd` exit (NAT)    | ✅ done   | docker e2e с NetEm; SHA-256 совпадает   |
 | `bifrost-vpnd` client        | ✅ done   | docker e2e                              |
-| IPv6 egress                  | ⏸ потом  | пока только IPv4 NAT44                  |
-| Trust-weighted exit pick     | ⏸ потом  | `EgressPolicy::Auto` сейчас заглушка    |
-| Karn/Partridge RTO           | ⏸ потом  | сейчас фиксированный RTO с doubling     |
+| IPv6 egress (NAT66)          | ✅ done   | 4 unit-теста; dual-stack EgressHello    |
+| Karn/Partridge SRTT/RTTVAR   | ✅ done   | RFC 6298; 5 unit-тестов                 |
+| Trust-weighted exit pick     | ✅ done   | `EgressPolicy::Auto`; 8 unit-тестов     |
 | Mobile build (Android/iOS)   | ⏸ потом  | только x86_64 + aarch64 Linux           |
+| Multi-exit per stream        | ⏸ потом  | selective forwarding                    |
+| Native exit discovery        | ⏸ потом  | Auto читает список из конфига           |
 
 ---
 
@@ -219,11 +221,20 @@ mode = "client"                    # или "exit"
 socks5_listen = "127.0.0.1:1080"   # только client mode
 
 [egress]
-mode = "exit"                      # или "mesh" / "auto" (зарезервировано)
+mode = "exit"                      # "exit" — round-robin, "auto" —
+                                   # взвешенный, "mesh" — без выхода
 exits = [
   { pub_key = "abcd...32 bytes hex", tag = "primary" },
+  { pub_key = "ef01...32 bytes hex", tag = "backup" },
 ]
 ```
+
+**`auto`** использует формулу `Weight = Trust / (RTT_ms + Penalty_ms + 1)`
+для выбора exit'а. Trust + RTT берутся из живой `PeerStats` norn-rs
+(обновление каждые 10с). Провалившийся CONNECT накидывает штраф +1с
+на 2 минуты — больной exit сам отступает в тень. Выбор НЕ
+детерминированный: взвешенный random среди топ-5 — это размазывает
+нагрузку и предотвращает «громящее стадо» к одному low-RTT exit'у.
 
 Специфика `bifrost-vpnd` (exit mode):
 
@@ -231,10 +242,15 @@ exits = [
 mode = "exit"
 
 [exit]
-tun_name     = "bifrost-eg0"
-pool_base    = "10.55.0.0"
-pool_prefix  = 24                  # /24 = 253 лиза
-egress_iface = "eth0"              # интерфейс под MASQUERADE
+tun_name       = "bifrost-eg0"
+pool_base      = "10.55.0.0"
+pool_prefix    = 24                # /24 = 253 лиза
+egress_iface   = "eth0"            # интерфейс под MASQUERADE
+# Опциональный dual-stack: каждый клиент получает парные v4+v6 лизы.
+# Хост-индекс 2 в /24 соответствует хост-индексу 2 в /64 → у одного
+# клиента совпадающие адреса в обоих стеках. Без v6_pool_base — v4-only.
+# v6_pool_base   = "fd55:0:0:1::"
+# v6_pool_prefix = 64
 ```
 
 Специфика `bifrost-vpnd` (client mode):
@@ -345,12 +361,14 @@ Reliability-слой трактует Data и Close как единое sequence
 
 ## Roadmap
 
-* `EgressPolicy::Auto` — выбор exit'а взвешенно по trust score + RTT
-* IPv6 egress NAT66 на `bifrost-vpnd exit`
-* SRTT/RTTVAR по Karn/Partridge для более точного RTO
 * Multi-exit per stream (selective forwarding)
+* Нативное обнаружение exit'ов — Auto сейчас читает их из конфига,
+  следующий шаг — mDNS-сервис `_bifrost-exit._norn`, который exit-
+  демоны рекламируют, а клиенты подбирают автоматически.
 * Android NDK / iOS кросс-сборки для мобильных клиентов
 * `bifrost-ctl` admin CLI на UNIX admin-сокете
+* Prometheus экспортер для snapshot'а ScoredExitPool
+  (weight, trust, RTT, penalty по каждому кандидату)
 
 ---
 
