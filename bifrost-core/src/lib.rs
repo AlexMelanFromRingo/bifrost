@@ -22,11 +22,13 @@ pub mod frame;
 pub mod mux;
 pub mod policy;
 pub mod reliability;
+pub mod scoring;
 pub mod stream;
 
 pub use frame::{Frame, FrameKind, OpenTarget, MAX_FRAME_OVERHEAD};
 pub use mux::{accept_streams, MeshMux};
 pub use policy::{EgressPolicy, ExitPeer};
+pub use scoring::{spawn_refresher, ScoredExit, ScoredExitPool};
 pub use stream::MeshStream;
 
 /// 32-byte ed25519 public key — addresses everything inside the mesh.

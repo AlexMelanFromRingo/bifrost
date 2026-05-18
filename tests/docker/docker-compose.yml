@@ -42,6 +42,11 @@ services:
       BIFROST_SOCKS5_LISTEN: "0.0.0.0:1080"
       BIFROST_EXIT_HOST: "exit:9001"
       BIFROST_EXIT_PUBKEY: "${BIFROST_EXIT_PUBKEY:?BIFROST_EXIT_PUBKEY must be set by run.sh}"
+      # Flip to "1" to flip the client's policy from round-robin Exit
+      # to weighted-random Auto (Trust/RTT-driven). The chosen exit is
+      # the same here (single-peer fleet), but the log line proves the
+      # selection codepath is active and the pool gets warmed.
+      BIFROST_EGRESS_AUTO: "${BIFROST_EGRESS_AUTO:-1}"
       RUST_LOG: "info,bifrost_core=debug,norn_rs=info"
       NETEM_DELAY: "30ms 5ms"
       NETEM_LOSS: "1%"

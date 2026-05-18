@@ -67,6 +67,10 @@ elif [ "$ROLE" = "client" ]; then
         -e "s|peers = \\[\\]|peers = [\"tcp://${EXIT_HOST}\"]|" \
         "$CONFIG"
     sed -i "s|^exits = \\[$|exits = [\n  { pub_key = \"${EXIT_PUB}\", tag = \"docker\" },|" "$CONFIG"
+    # BIFROST_EGRESS_AUTO=1 flips the policy to weighted-random selection.
+    if [ "${BIFROST_EGRESS_AUTO:-0}" = "1" ]; then
+        sed -i 's|^mode = "exit"$|mode = "auto"|' "$CONFIG"
+    fi
 else
     echo "[entrypoint] unknown role: $ROLE" >&2
     exit 2

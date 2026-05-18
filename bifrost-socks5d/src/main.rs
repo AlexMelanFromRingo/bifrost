@@ -17,6 +17,7 @@ use bifrost_core::{
     frame::OpenTarget,
     mux::{AcceptedStream, MeshMux},
     policy::{EgressPolicy, ExitRotator},
+    scoring::{spawn_refresher, ScoredExitPool},
     stream::reply,
 };
 use clap::{Parser, Subcommand};
@@ -87,6 +88,29 @@ fn init_logging(level: &str) {
 
 // ── CLIENT ────────────────────────────────────────────────────────────────
 
+/// Either selection strategy: round-robin (`Exit`) or trust/RTT-weighted
+/// random (`Auto`). Both expose the same `pick()` API for handle_socks5;
+/// only Auto knows how to absorb failure feedback.
+enum ExitPicker {
+    Rotator(Arc<ExitRotator>),
+    Scored(Arc<ScoredExitPool>),
+}
+
+impl ExitPicker {
+    fn pick(&self) -> Option<(bifrost_core::PubKey, Option<String>)> {
+        match self {
+            Self::Rotator(r) => r.pick(),
+            Self::Scored(s) => s.pick(),
+        }
+    }
+
+    fn record_failure(&self, key: &bifrost_core::PubKey) {
+        if let Self::Scored(s) = self {
+            s.record_failure(key);
+        }
+    }
+}
+
 async fn run_client(cfg: DaemonConfig, mux: Arc<MeshMux>) -> Result<()> {
     let policy = cfg
         .egress
@@ -96,7 +120,19 @@ async fn run_client(cfg: DaemonConfig, mux: Arc<MeshMux>) -> Result<()> {
     if exits.is_empty() && !matches!(policy, EgressPolicy::Mesh) {
         warn!("egress mode is exit/auto but no exits configured — every CONNECT will fail");
     }
-    let rotator = Arc::new(ExitRotator::new(exits));
+    let picker = if policy.is_auto() {
+        let pool = Arc::new(ScoredExitPool::new(exits));
+        // Refresh once now so the snapshot is warm before the first
+        // CONNECT lands; the background tick keeps it fresh after.
+        pool.refresh(&mux.conn().get_peer_stats());
+        spawn_refresher(pool.clone(), mux.conn().clone(), Duration::from_secs(10));
+        info!("egress.auto: weighted-random pool of {} candidates", pool.snapshot().len());
+        ExitPicker::Scored(pool)
+    } else {
+        ExitPicker::Rotator(Arc::new(ExitRotator::new(exits)))
+    };
+    let picker = Arc::new(picker);
+
     let listener = TcpListener::bind(&cfg.socks5_listen)
         .await
         .with_context(|| format!("binding SOCKS5 listener {:?}", cfg.socks5_listen))?;
@@ -112,9 +148,9 @@ async fn run_client(cfg: DaemonConfig, mux: Arc<MeshMux>) -> Result<()> {
             }
         };
         let mux = mux.clone();
-        let rotator = rotator.clone();
+        let picker = picker.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_socks5(sock, mux, rotator).await {
+            if let Err(e) = handle_socks5(sock, mux, picker).await {
                 tracing::debug!("socks5 from {peer}: {e}");
             }
         });
@@ -124,18 +160,14 @@ async fn run_client(cfg: DaemonConfig, mux: Arc<MeshMux>) -> Result<()> {
 async fn handle_socks5(
     mut sock: TcpStream,
     mux: Arc<MeshMux>,
-    rotator: Arc<ExitRotator>,
+    picker: Arc<ExitPicker>,
 ) -> Result<()> {
     socks5::negotiate_methods(&mut sock).await?;
     let target = match socks5::read_request(&mut sock).await {
         Ok(t) => t,
-        Err(e) => {
-            // read_request has already written a reply for protocol-level
-            // errors; just close.
-            return Err(e);
-        }
+        Err(e) => return Err(e),
     };
-    let Some((exit_peer, tag)) = rotator.pick() else {
+    let Some((exit_peer, tag)) = picker.pick() else {
         let _ = socks5::write_reply(&mut sock, socks5::REP_GENERAL_FAILURE).await;
         anyhow::bail!("no exit peers configured");
     };
@@ -149,6 +181,10 @@ async fn handle_socks5(
         Ok(s) => s,
         Err(e) => {
             warn!("open(exit={}): {e}", hex::encode(&exit_peer[..8]));
+            // Auto mode absorbs the failure as a temporary penalty so
+            // the next CONNECT skips this peer. Rotator mode just
+            // moves on; round-robin will visit it again next pass.
+            picker.record_failure(&exit_peer);
             let _ = socks5::write_reply(&mut sock, socks5::REP_GENERAL_FAILURE).await;
             return Err(e);
         }
@@ -156,15 +192,22 @@ async fn handle_socks5(
     let ack = match mesh.await_open_ack().await {
         Ok(code) => code,
         Err(e) => {
+            picker.record_failure(&exit_peer);
             let _ = socks5::write_reply(&mut sock, socks5::REP_GENERAL_FAILURE).await;
             return Err(e.into());
         }
     };
     socks5::write_reply(&mut sock, ack).await?;
     if ack != socks5::REP_SUCCESS {
-        return Ok(()); // exit said the CONNECT failed; we relayed the code.
+        // Exit replied but couldn't dial the target — also a penalty
+        // signal, since a healthy exit on a working upstream would
+        // succeed. (HOST_UNREACHABLE / CONN_REFUSED for the target
+        // host are correctly attributed to the EXIT's view of that
+        // host, not the exit itself failing — but at the SOCKS5 layer
+        // that's the actionable signal we have.)
+        picker.record_failure(&exit_peer);
+        return Ok(());
     }
-    // Pipe both directions until either side closes.
     match tokio::io::copy_bidirectional(&mut sock, &mut mesh).await {
         Ok((up, down)) => tracing::debug!("CONNECT {} done up={up} down={down}", target.display()),
         Err(e) => tracing::debug!("CONNECT {} pipe err: {e}", target.display()),

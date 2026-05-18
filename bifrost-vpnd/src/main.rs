@@ -160,7 +160,7 @@ fn init_logging(level: &str) {
 fn describe_egress(p: &EgressPolicy) -> String {
     match p {
         EgressPolicy::Mesh => "mesh".into(),
-        EgressPolicy::Auto => "auto (reserved)".into(),
+        EgressPolicy::Auto { exits } => format!("auto (n={}, weighted by trust/RTT)", exits.len()),
         EgressPolicy::Exit { exits } => format!("exit (n={})", exits.len()),
     }
 }
