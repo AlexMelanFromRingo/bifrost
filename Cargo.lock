@@ -168,10 +168,22 @@ dependencies = [
  "norn-rs",
  "rand 0.8.6",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "bifrost-ctl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bifrost-core",
+ "clap",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -185,6 +197,7 @@ dependencies = [
  "hex",
  "norn-rs",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "toml",

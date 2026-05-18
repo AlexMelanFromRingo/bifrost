@@ -4,6 +4,7 @@ members = [
     "bifrost-core",
     "bifrost-socks5d",
     "bifrost-vpnd",
+    "bifrost-ctl",
 ]
 
 [workspace.package]

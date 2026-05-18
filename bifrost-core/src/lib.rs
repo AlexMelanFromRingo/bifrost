@@ -18,6 +18,7 @@
 // norn-rs delivers our datagrams in order without loss. Multi-hop paths
 // will need an ARQ layer; that's earmarked but not implemented yet.
 
+pub mod admin_proto;
 pub mod frame;
 pub mod metrics;
 pub mod mux;

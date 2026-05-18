@@ -212,6 +212,27 @@ impl ScoredExitPool {
     pub fn snapshot(&self) -> Vec<ScoredExit> {
         self.snapshot.lock().expect("snapshot mutex poisoned").clone()
     }
+
+    /// The candidate list this pool was built with (pub_key + tag),
+    /// unaffected by scoring. Useful for the admin CLI's "list known
+    /// exits" view independent of the live snapshot.
+    pub fn candidates(&self) -> &[(PubKey, Option<String>)] {
+        &self.candidates
+    }
+
+    /// Drop any active penalty for `key`. The next refresh recomputes
+    /// the weight from raw trust/RTT without inflation. Idempotent.
+    pub fn reset_penalty(&self, key: &PubKey) {
+        let mut p = self.penalties.lock().expect("penalties mutex poisoned");
+        p.remove(key);
+    }
+
+    /// Drop ALL active penalties — useful as a "give the fleet one
+    /// more chance" knob after a known incident has been resolved.
+    pub fn reset_all_penalties(&self) {
+        let mut p = self.penalties.lock().expect("penalties mutex poisoned");
+        p.clear();
+    }
 }
 
 /// Spawn the background refresher loop. Wakes every `interval` and
@@ -341,6 +362,34 @@ mod tests {
     fn empty_pool_returns_none() {
         let pool = ScoredExitPool::new(vec![]);
         assert!(pool.pick().is_none());
+    }
+
+    #[test]
+    fn reset_penalty_clears_a_single_entry() {
+        let pool = ScoredExitPool::new(vec![(pk(1), None), (pk(2), None)]);
+        let now = Instant::now();
+        pool.record_failure_at(&pk(1), now);
+        pool.record_failure_at(&pk(2), now);
+        pool.refresh_at(&[stat(1, 1.0, 10), stat(2, 1.0, 10)], now);
+        assert!(pool.snapshot().iter().all(|s| s.penalty_ms > 0.0));
+        pool.reset_penalty(&pk(1));
+        pool.refresh_at(&[stat(1, 1.0, 10), stat(2, 1.0, 10)], now);
+        let snap = pool.snapshot();
+        let one = snap.iter().find(|s| s.pub_key == pk(1)).unwrap();
+        let two = snap.iter().find(|s| s.pub_key == pk(2)).unwrap();
+        assert_eq!(one.penalty_ms, 0.0, "reset_penalty wipes the named entry");
+        assert!(two.penalty_ms > 0.0, "untouched entry stays penalised");
+    }
+
+    #[test]
+    fn reset_all_penalties_clears_everything() {
+        let pool = ScoredExitPool::new(vec![(pk(1), None), (pk(2), None)]);
+        let now = Instant::now();
+        pool.record_failure_at(&pk(1), now);
+        pool.record_failure_at(&pk(2), now);
+        pool.reset_all_penalties();
+        pool.refresh_at(&[stat(1, 1.0, 10), stat(2, 1.0, 10)], now);
+        assert!(pool.snapshot().iter().all(|s| s.penalty_ms == 0.0));
     }
 
     #[test]

@@ -9,10 +9,12 @@
 // flow back as OpenAck frames so the client can mirror them on its
 // SOCKS5 socket.
 
+mod admin;
 mod config;
 mod metrics;
 mod socks5;
 
+use admin::AdminState;
 use anyhow::{Context, Result};
 use bifrost_core::{
     frame::OpenTarget,
@@ -25,7 +27,7 @@ use clap::{Parser, Subcommand};
 use config::{DaemonConfig, Mode};
 use norn_rs::node::Node;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info, warn};
 
@@ -67,6 +69,7 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     let cfg = DaemonConfig::load(&config_path)?;
     init_logging(&cfg.node.log_level);
 
+    let started_at = Instant::now();
     info!("starting bifrost-socks5d in {:?} mode", cfg.mode);
     let node = Node::new(cfg.node.clone()).await.context("starting norn node")?;
     node.start().await.context("starting norn subsystems")?;
@@ -76,8 +79,8 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     let (mux, accept_rx) = MeshMux::new(conn);
 
     match cfg.mode {
-        Mode::Client => run_client(cfg, mux).await,
-        Mode::Exit => run_exit(mux, accept_rx).await,
+        Mode::Client => run_client(cfg, mux, started_at).await,
+        Mode::Exit => run_exit(cfg, mux, accept_rx, started_at).await,
     }
 }
 
@@ -112,7 +115,7 @@ impl ExitPicker {
     }
 }
 
-async fn run_client(cfg: DaemonConfig, mux: Arc<MeshMux>) -> Result<()> {
+async fn run_client(cfg: DaemonConfig, mux: Arc<MeshMux>, started_at: Instant) -> Result<()> {
     let policy = cfg
         .egress
         .as_ref()
@@ -151,6 +154,22 @@ async fn run_client(cfg: DaemonConfig, mux: Arc<MeshMux>) -> Result<()> {
         ExitPicker::Rotator(Arc::new(ExitRotator::new(exits)))
     };
     let picker = Arc::new(picker);
+
+    // Spin up the bifrost admin socket if configured. Works in both
+    // Auto (with pool) and Exit (rotator only — penalty/exits ops will
+    // return a "no pool" error but status/peers still work).
+    spawn_admin_if_configured(
+        &cfg,
+        AdminState {
+            conn: mux.conn().clone(),
+            pool: match picker.as_ref() {
+                ExitPicker::Scored(p) => Some(p.clone()),
+                ExitPicker::Rotator(_) => None,
+            },
+            mode: Mode::Client,
+            started_at,
+        },
+    );
 
     let listener = TcpListener::bind(&cfg.socks5_listen)
         .await
@@ -237,15 +256,39 @@ async fn handle_socks5(
 // ── EXIT ─────────────────────────────────────────────────────────────────
 
 async fn run_exit(
-    _mux: Arc<MeshMux>,
+    cfg: DaemonConfig,
+    mux: Arc<MeshMux>,
     mut accept_rx: tokio::sync::mpsc::Receiver<AcceptedStream>,
+    started_at: Instant,
 ) -> Result<()> {
     info!("exit mode: waiting for SOCKS5 CONNECTs over the mesh");
+    spawn_admin_if_configured(
+        &cfg,
+        AdminState {
+            conn: mux.conn().clone(),
+            pool: None,
+            mode: Mode::Exit,
+            started_at,
+        },
+    );
     while let Some(acc) = accept_rx.recv().await {
         tokio::spawn(handle_exit_stream(acc));
     }
     warn!("accept channel closed — mux read loop ended");
     Ok(())
+}
+
+fn spawn_admin_if_configured(cfg: &DaemonConfig, state: AdminState) {
+    if cfg.bifrost.admin_socket.is_empty() {
+        return;
+    }
+    let path = cfg.bifrost.admin_socket.clone();
+    let state = Arc::new(state);
+    tokio::spawn(async move {
+        if let Err(e) = admin::listen(&path, state).await {
+            warn!("bifrost admin socket: {e}");
+        }
+    });
 }
 
 async fn handle_exit_stream(acc: AcceptedStream) {

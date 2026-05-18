@@ -1,0 +1,18 @@
+[package]
+name = "bifrost-ctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Admin CLI for bifrost-socks5d and bifrost-vpnd over their UNIX admin socket"
+
+[[bin]]
+name = "bifrost-ctl"
+path = "src/main.rs"
+
+[dependencies]
+bifrost-core    = { path = "../bifrost-core" }
+tokio.workspace = true
+anyhow.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
+serde_json.workspace = true
