@@ -1,0 +1,35 @@
+# bifrost-socks5d — client mode example.
+#
+# Local SOCKS5 server on 127.0.0.1:1080 → mesh → exit peer → real TCP target.
+#
+# Steps to use:
+#   1. cp socks5-client.toml ~/bifrost.toml
+#   2. ./bifrost-socks5d genconfig | grep private_key  # generate a fresh key
+#      → paste the resulting `private_key = "..."` line into [node] below.
+#   3. Replace <EXIT-PUBKEY-HEX> with the exit's pub_key (printed at its
+#      startup as `our pub_key=...`).
+#   4. Replace <EXIT-HOST> with the exit's reachable hostname or IP.
+#   5. chmod 600 ~/bifrost.toml
+#   6. ./bifrost-socks5d run -c ~/bifrost.toml
+#
+# Then:  curl --socks5-hostname 127.0.0.1:1080 https://example.com
+
+mode = "client"
+socks5_listen = "127.0.0.1:1080"
+
+[node]
+private_key = "REPLACE_ME_WITH_GENCONFIG_OUTPUT"
+listen = ["tcp://0.0.0.0:9001"]
+peers = ["tcp://<EXIT-HOST>:9001"]
+# tun_name = "norn0"          # optional mesh TUN; comment out for headless client
+admin_socket = "/tmp/bifrost-client.sock"
+peer_cache_path = ""           # disable persistence for ephemeral lab setup
+multicast_enabled = false
+mdns_enabled = false
+log_level = "info"
+
+[egress]
+mode = "exit"
+exits = [
+  { pub_key = "<EXIT-PUBKEY-HEX>", tag = "primary" },
+]

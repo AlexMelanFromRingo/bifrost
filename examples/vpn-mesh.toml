@@ -1,0 +1,21 @@
+# bifrost-vpnd — mesh mode (v0.1 behaviour: 0200::/7 mesh-internal only).
+#
+# This is the simplest VPN configuration: a TUN device that routes the
+# norn-rs IPv6 overlay (0200::/7). No egress NAT, no internet access via
+# the mesh — just direct peer-to-peer reachability between mesh nodes.
+
+mode = "mesh"
+
+[egress]
+mode = "mesh"
+
+[node]
+private_key = "REPLACE_ME_WITH_GENCONFIG_OUTPUT"
+listen = ["tcp://0.0.0.0:9001"]
+peers = []                       # add `tcp://peer.example.com:9001` to bootstrap
+tun_name = "norn0"               # required for mesh mode
+admin_socket = "/tmp/bifrost-mesh.sock"
+peer_cache_path = "/var/lib/bifrost/mesh-peers.json"
+multicast_enabled = true         # LAN auto-discovery
+mdns_enabled = true
+log_level = "info"

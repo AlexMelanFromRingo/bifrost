@@ -1,0 +1,29 @@
+# bifrost-vpnd — exit mode (egress NAT).
+#
+# Runs an IPv4 TUN, sets ip_forward=1, installs:
+#   iptables -t nat -A POSTROUTING -s <pool> -o <iface> -j MASQUERADE
+#   iptables -A FORWARD -i <tun> -o <iface> -j ACCEPT
+#   iptables -A FORWARD -o <tun> -i <iface> -m conntrack \
+#            --ctstate RELATED,ESTABLISHED -j ACCEPT
+#
+# Requires CAP_NET_ADMIN at runtime:
+#   sudo setcap cap_net_admin+ep ./bifrost-vpnd
+# or just run the daemon as root.
+
+mode = "exit"
+
+[exit]
+tun_name     = "bifrost-eg0"
+pool_base    = "10.55.0.0"
+pool_prefix  = 24                # /24 = 253 client leases
+egress_iface = "eth0"            # interface that gets MASQUERADE'd
+
+[node]
+private_key = "REPLACE_ME_WITH_GENCONFIG_OUTPUT"
+listen = ["tcp://0.0.0.0:9001"]
+peers = []
+admin_socket = "/tmp/bifrost-vpn-exit.sock"
+peer_cache_path = "/var/lib/bifrost/vpn-exit-peers.json"
+multicast_enabled = false
+mdns_enabled = false
+log_level = "info"

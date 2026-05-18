@@ -1,0 +1,36 @@
+# bifrost-vpnd — client mode (tunnels local IP traffic through an exit).
+#
+# On startup the daemon:
+#   1. Connects to the exit through the mesh.
+#   2. Sends Open(Egress); exit replies with an EgressHello (allocated IP +
+#      gateway + MTU).
+#   3. Creates a TUN device with the allocated IP, optionally hijacks the
+#      kernel default route to point at the exit's gateway.
+#   4. Pipes IPv4 packets bidirectionally between the TUN and the mesh.
+#
+# CAP_NET_ADMIN required (same as exit-side).
+
+mode = "client"
+
+[client]
+tun_name              = "bifrost-eg0"
+# When true, replaces the system default route to point at the exit's
+# gateway. Off by default: it's a global change and you should opt in
+# explicitly once you trust the exit operator.
+install_default_route = false
+
+[node]
+private_key = "REPLACE_ME_WITH_GENCONFIG_OUTPUT"
+listen = ["tcp://0.0.0.0:9001"]
+peers = ["tcp://<EXIT-HOST>:9001"]
+admin_socket = "/tmp/bifrost-vpn-client.sock"
+peer_cache_path = ""
+multicast_enabled = false
+mdns_enabled = false
+log_level = "info"
+
+[egress]
+mode = "exit"
+exits = [
+  { pub_key = "<EXIT-PUBKEY-HEX>", tag = "main" },
+]

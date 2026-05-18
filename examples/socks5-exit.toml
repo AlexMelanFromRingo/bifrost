@@ -1,0 +1,27 @@
+# bifrost-socks5d — exit mode example.
+#
+# Accepts mesh streams from any peer, dials the requested host:port with
+# tokio::net::TcpStream, and pipes bytes both ways. SOCKS5 reply codes
+# (ECONNREFUSED, EHOSTUNREACH, etc.) flow back to the client unchanged.
+#
+# Steps:
+#   1. cp socks5-exit.toml /etc/bifrost/exit.toml
+#   2. ./bifrost-socks5d genconfig --exit | grep private_key
+#      → paste into [node] below.
+#   3. chmod 600 /etc/bifrost/exit.toml
+#   4. ./bifrost-socks5d run -c /etc/bifrost/exit.toml
+#
+# Publish the resulting `our pub_key=...` to your client operators.
+
+mode = "exit"
+
+[node]
+private_key = "REPLACE_ME_WITH_GENCONFIG_OUTPUT"
+listen = ["tcp://0.0.0.0:9001"]
+peers = []                     # exit is dial-able by clients, doesn't dial out itself
+admin_socket = "/tmp/bifrost-exit.sock"
+peer_cache_path = "/var/lib/bifrost/peers.json"
+multicast_enabled = false
+mdns_enabled = false
+metrics_addr = "127.0.0.1:9090"  # optional Prometheus scrape endpoint
+log_level = "info"
