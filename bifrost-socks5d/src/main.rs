@@ -17,6 +17,7 @@ mod socks5;
 use admin::AdminState;
 use anyhow::{Context, Result};
 use bifrost_core::{
+    discovery,
     frame::OpenTarget,
     mux::{AcceptedStream, MeshMux},
     policy::{EgressPolicy, ExitRotator},
@@ -142,6 +143,18 @@ async fn run_client(cfg: DaemonConfig, mux: Arc<MeshMux>, started_at: Instant) -
                     warn!("bifrost metrics endpoint: {e}");
                 }
             });
+        }
+        if cfg.bifrost.mdns_discovery {
+            match discovery::browse_exits(pool.clone(), mux.conn().pub_key) {
+                Ok(daemon) => {
+                    info!("mDNS exit discovery active ({})", discovery::SERVICE_TYPE);
+                    // Stash the handle in a Box<dyn Any + Send + Sync>
+                    // so it lives for the daemon's lifetime; dropping
+                    // it would unregister the browser.
+                    Box::leak(Box::new(daemon));
+                }
+                Err(e) => warn!("mDNS exit discovery failed to start: {e}"),
+            }
         }
         ExitPicker::Scored(pool)
     } else {
@@ -271,6 +284,16 @@ async fn run_exit(
             started_at,
         },
     );
+    if cfg.bifrost.mdns_discovery {
+        let port = cfg.node.tcp_listen_port().unwrap_or(9001);
+        match discovery::advertise_exit(mux.conn().pub_key, port) {
+            Ok(daemon) => {
+                info!("mDNS exit advertisement live on port {port}");
+                Box::leak(Box::new(daemon));
+            }
+            Err(e) => warn!("mDNS advertise failed: {e}"),
+        }
+    }
     while let Some(acc) = accept_rx.recv().await {
         tokio::spawn(handle_exit_stream(acc));
     }

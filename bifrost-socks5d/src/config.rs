@@ -34,7 +34,7 @@ pub struct DaemonConfig {
     pub bifrost: BifrostEndpoints,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct BifrostEndpoints {
     /// `host:port` for the bifrost-specific Prometheus exporter.
     /// Exposes ScoredExitPool gauges. Loopback strongly recommended.
@@ -43,6 +43,23 @@ pub struct BifrostEndpoints {
     /// UNIX socket path for `bifrost-ctl`. Empty = disabled.
     #[serde(default)]
     pub admin_socket: String,
+    /// Toggle mDNS exit discovery. Default: enabled — costs near-zero
+    /// idle and lets Auto-mode clients find new exits on the LAN
+    /// without a config-edit-and-reload.
+    #[serde(default = "default_true")]
+    pub mdns_discovery: bool,
+}
+
+fn default_true() -> bool { true }
+
+impl Default for BifrostEndpoints {
+    fn default() -> Self {
+        Self {
+            metrics_addr: String::new(),
+            admin_socket: String::new(),
+            mdns_discovery: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]

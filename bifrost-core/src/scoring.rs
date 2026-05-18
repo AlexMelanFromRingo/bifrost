@@ -73,7 +73,12 @@ struct Penalty {
 }
 
 pub struct ScoredExitPool {
-    candidates: Vec<(PubKey, Option<String>)>,
+    /// Candidate list — guarded so mDNS discovery (or any other
+    /// dynamic source) can add / remove peers at runtime without
+    /// restarting the daemon. Kept in Mutex<Vec<_>> rather than a
+    /// HashMap so the order is stable (e.g. for human-readable
+    /// admin output before the snapshot has been refreshed).
+    candidates: Mutex<Vec<(PubKey, Option<String>)>>,
     /// Per-peer RTT inflations from recent application-level failures.
     penalties: Mutex<HashMap<PubKey, Penalty>>,
     /// Most recent scoring snapshot, sorted descending by weight.
@@ -98,14 +103,63 @@ impl ScoredExitPool {
             })
             .collect();
         Self {
-            candidates,
+            candidates: Mutex::new(candidates),
             penalties: Mutex::new(HashMap::new()),
             snapshot: Mutex::new(initial),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.candidates.is_empty()
+        self.candidates.lock().expect("candidates mutex poisoned").is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.candidates.lock().expect("candidates mutex poisoned").len()
+    }
+
+    /// Add a peer to the rotation if it isn't already there. Returns
+    /// true when the peer was new (so callers can log a "discovered"
+    /// event without polling). Idempotent.
+    pub fn add_candidate(&self, pub_key: PubKey, tag: Option<String>) -> bool {
+        let mut c = self.candidates.lock().expect("candidates mutex poisoned");
+        if c.iter().any(|(k, _)| *k == pub_key) {
+            return false;
+        }
+        c.push((pub_key, tag.clone()));
+        // Seed the snapshot with a fallback entry so the very next
+        // pick() can see this peer without waiting for the next
+        // refresh tick.
+        let mut s = self.snapshot.lock().expect("snapshot mutex poisoned");
+        s.push(ScoredExit {
+            pub_key,
+            tag,
+            trust: UNKNOWN_TRUST,
+            rtt_ms: UNKNOWN_RTT_MS,
+            penalty_ms: 0.0,
+            weight: UNKNOWN_TRUST as f64 / (UNKNOWN_RTT_MS + 1.0),
+            stats_known: false,
+        });
+        // Re-sort so an immediate pick() doesn't fall through the
+        // top-N because we appended at the end.
+        s.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal));
+        true
+    }
+
+    /// Remove a peer from the rotation. Returns true if the peer was
+    /// present. Also drops any active penalty entry for it.
+    pub fn remove_candidate(&self, pub_key: &PubKey) -> bool {
+        let mut c = self.candidates.lock().expect("candidates mutex poisoned");
+        let before = c.len();
+        c.retain(|(k, _)| k != pub_key);
+        let removed = c.len() < before;
+        drop(c);
+        if removed {
+            let mut p = self.penalties.lock().expect("penalties mutex poisoned");
+            p.remove(pub_key);
+            let mut s = self.snapshot.lock().expect("snapshot mutex poisoned");
+            s.retain(|e| e.pub_key != *pub_key);
+        }
+        removed
     }
 
     /// Recompute the snapshot from a fresh PeerStats list. Drops any
@@ -123,8 +177,15 @@ impl ScoredExitPool {
             p.retain(|_, pen| pen.expires_at > now);
         }
         let penalties = self.penalties.lock().expect("penalties mutex poisoned");
-        let mut snapshot = Vec::with_capacity(self.candidates.len());
-        for (pk, tag) in &self.candidates {
+        // Snapshot the candidate list under its own lock so a parallel
+        // mDNS add_candidate doesn't race us mid-scan.
+        let candidates_snap: Vec<(PubKey, Option<String>)> = self
+            .candidates
+            .lock()
+            .expect("candidates mutex poisoned")
+            .clone();
+        let mut snapshot = Vec::with_capacity(candidates_snap.len());
+        for (pk, tag) in &candidates_snap {
             let (trust, rtt_ms, stats_known) = match stats.iter().find(|s| s.key == *pk) {
                 Some(s) => (s.trust, s.lag.as_secs_f64() * 1000.0, true),
                 None => (UNKNOWN_TRUST, UNKNOWN_RTT_MS, false),
@@ -213,11 +274,11 @@ impl ScoredExitPool {
         self.snapshot.lock().expect("snapshot mutex poisoned").clone()
     }
 
-    /// The candidate list this pool was built with (pub_key + tag),
-    /// unaffected by scoring. Useful for the admin CLI's "list known
-    /// exits" view independent of the live snapshot.
-    pub fn candidates(&self) -> &[(PubKey, Option<String>)] {
-        &self.candidates
+    /// Snapshot of the current candidate list (pub_key + tag). Cloned
+    /// so callers can't accidentally hold the candidates lock across
+    /// awaits.
+    pub fn candidates(&self) -> Vec<(PubKey, Option<String>)> {
+        self.candidates.lock().expect("candidates mutex poisoned").clone()
     }
 
     /// Drop any active penalty for `key`. The next refresh recomputes
@@ -379,6 +440,31 @@ mod tests {
         let two = snap.iter().find(|s| s.pub_key == pk(2)).unwrap();
         assert_eq!(one.penalty_ms, 0.0, "reset_penalty wipes the named entry");
         assert!(two.penalty_ms > 0.0, "untouched entry stays penalised");
+    }
+
+    #[test]
+    fn add_candidate_is_idempotent_and_seeds_snapshot() {
+        let pool = ScoredExitPool::new(vec![]);
+        assert!(pool.is_empty());
+        assert!(pool.add_candidate(pk(1), Some("first".into())));
+        assert!(!pool.add_candidate(pk(1), Some("dup".into())), "second add is a no-op");
+        assert_eq!(pool.len(), 1);
+        // Snapshot already has an entry so pick() works without a refresh.
+        let (chosen, _) = pool.pick().unwrap();
+        assert_eq!(chosen, pk(1));
+    }
+
+    #[test]
+    fn remove_candidate_clears_pool_and_penalty() {
+        let pool = ScoredExitPool::new(vec![(pk(1), None)]);
+        let now = Instant::now();
+        pool.record_failure_at(&pk(1), now);
+        assert!(pool.remove_candidate(&pk(1)));
+        assert!(pool.is_empty());
+        // Re-adding starts fresh — no leftover penalty.
+        pool.add_candidate(pk(1), None);
+        pool.refresh_at(&[stat(1, 1.0, 10)], now);
+        assert_eq!(pool.snapshot()[0].penalty_ms, 0.0);
     }
 
     #[test]
