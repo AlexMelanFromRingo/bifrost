@@ -189,9 +189,39 @@ impl MeshStream {
 
 impl Drop for MeshStream {
     fn drop(&mut self) {
+        // If the stream was abandoned WITHOUT a graceful poll_shutdown
+        // (typical for happy-eyeballs racing losers — JoinSet::abort_all
+        // tears the future down mid-await_open_ack), fire a Reset at
+        // the peer so the exit-side TCP closes immediately instead of
+        // lingering for the ARQ retransmit budget to exhaust (~30 s).
+        //
+        // Best-effort:
+        //   * `write_closed == true` means poll_shutdown already sent
+        //     Close (or this is a winner that completed normally);
+        //     skip the Reset.
+        //   * No tokio runtime in scope = drop happens in a non-async
+        //     context (shouldn't happen in practice but Drop must be
+        //     infallible). Skip silently.
+        if !self.write_closed {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let mux = self.mux.clone();
+                let peer = self.peer;
+                let sid = self.sid;
+                handle.spawn(async move {
+                    let _ = mux
+                        .send_frame(&peer, Frame::Reset { sid, code: RESET_ABORTED })
+                        .await;
+                });
+            }
+        }
         self.mux.drop_stream(&self.peer, self.sid);
     }
 }
+
+/// Reset code emitted by MeshStream::drop when the stream is
+/// abandoned without poll_shutdown. SOCKS5 doesn't define this code;
+/// 0x05 mirrors "Connection refused / aborted" sentinels.
+pub const RESET_ABORTED: u8 = 0x05;
 
 /// Pull ready events from the channel without blocking and apply their
 /// side effects. Returns true if at least one event was consumed.
