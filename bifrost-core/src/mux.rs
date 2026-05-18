@@ -247,7 +247,7 @@ fn handle_ack(mux: &Arc<MeshMux>, peer: PubKey, sid: StreamId, ack: u32, win: u3
         let mut r = entry.reliability.lock().expect("Reliability mutex poisoned");
         let before_win = r.write_window_available();
         let before_close = r.close_pending();
-        r.on_recv_ack(ack, win);
+        r.on_recv_ack(ack, win, std::time::Instant::now());
         let after_win = r.write_window_available();
         let after_close = r.close_pending();
         if before_close && !after_close {

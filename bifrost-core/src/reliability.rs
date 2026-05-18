@@ -1,29 +1,44 @@
 // Per-stream reliability state — sliding-window ARQ over a best-effort
 // MeshMux datagram channel.
 //
-// v0.2 keeps the design intentionally small:
+// Design (v0.3+):
 //   * Cumulative ACK after every Data frame (no delayed ACKs yet —
 //     simpler debugging, predictable latency, costs ~5% extra frames).
-//   * Single fixed RTO that doubles on retransmit and resets when the
-//     send queue drains. No SRTT/RTTVAR — RTO begins at 500 ms and
-//     caps at 8 s. Good enough for SOCKS5-grade interactive traffic;
-//     a future revision can swap in a proper Karn/Partridge estimator.
+//   * RTO estimated per RFC 6298 (Karn/Partridge SRTT/RTTVAR). Starts
+//     at a 500 ms guess, gets replaced by the first non-ambiguous
+//     sample; subsequent samples smooth via α=1/8 (SRTT) and β=1/4
+//     (RTTVAR). The retransmit timer doubles RTO on timeout per
+//     RFC 6298 §5.5; a clean ACK resets it to SRTT-based.
+//   * Karn's rule: a frame that has been retransmitted at least once
+//     produces no RTT sample (we can't tell which transmission the
+//     ACK answers).
 //   * Receive window = remaining rx_buf capacity (256 KiB default).
-//     Sender's peer_window starts optimistically (64 KiB) and is
-//     updated by every inbound ACK.
-//   * Close / Reset / Open / OpenAck are NOT carried by ARQ; they are
-//     single-shot at this layer. Close ordering is handled by waiting
-//     for the unacked queue to drain before sending Close (see
-//     MeshStream::poll_shutdown). If a lone Close is lost the
-//     receiver eventually times out the stream; v0.2 accepts this as
-//     a known limitation.
+//     Sender's peer_window starts optimistically (matches
+//     DEFAULT_RX_BUF_CAP) and is updated by every inbound ACK.
+//   * Close and Reset are NOT carried by ARQ themselves. Close has a
+//     parallel close-pending slot in the retransmit timer; Reset is
+//     intentionally single-shot (it's the "abort" sentinel, retries
+//     are pointless).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
+/// Initial RTO before the first RTT sample lands (RFC 6298 §2.1).
 pub const INITIAL_RTO: Duration = Duration::from_millis(500);
+/// Lower bound on RTO. RFC 6298 says 1 s for the public internet;
+/// mesh hops are much shorter so we allow 200 ms.
+pub const MIN_RTO: Duration = Duration::from_millis(200);
+/// Upper bound on RTO. Keeps a stuck stream from sleeping for minutes.
 pub const MAX_RTO: Duration = Duration::from_secs(8);
 pub const MAX_RETRIES: u8 = 16;
+/// RFC 6298 SRTT weight: SRTT ← (1-α)·SRTT + α·R'
+const ALPHA_NUM: u32 = 1;
+const ALPHA_DEN: u32 = 8;
+/// RFC 6298 RTTVAR weight: RTTVAR ← (1-β)·RTTVAR + β·|SRTT-R'|
+const BETA_NUM: u32 = 1;
+const BETA_DEN: u32 = 4;
+/// RFC 6298 §2.1 "K = 4" — RTO ← SRTT + K·RTTVAR
+const K: u32 = 4;
 /// Default receive-side buffer cap. Bytes beyond this trigger zero-window
 /// ACKs that pause the peer until the app drains us.
 pub const DEFAULT_RX_BUF_CAP: u32 = 256 * 1024;
@@ -119,8 +134,16 @@ pub struct Reliability {
     peer_close_seq: Option<u32>,
     eof_delivered: bool,
 
-    // ── Timing ───────────────────────────────────────────────────────────
+    // ── Timing (RFC 6298 RTT estimator) ──────────────────────────────────
     rto: Duration,
+    /// Smoothed RTT. Unused until `have_rtt_sample` flips to true.
+    srtt: Duration,
+    /// RTT variation estimate. Set to RTT/2 by the first sample, then
+    /// updated by β-weighted mean of |SRTT-R'|.
+    rttvar: Duration,
+    /// False until the first non-retransmitted frame has been ACKed.
+    /// Karn's rule: retransmits never contribute a sample.
+    have_rtt_sample: bool,
 }
 
 impl Default for Reliability {
@@ -147,7 +170,46 @@ impl Reliability {
             peer_close_seq: None,
             eof_delivered: false,
             rto: INITIAL_RTO,
+            srtt: Duration::ZERO,
+            rttvar: Duration::ZERO,
+            have_rtt_sample: false,
         }
+    }
+
+    /// RFC 6298 §2.2 / §2.3 RTT estimator. Called once per ACK that
+    /// covers at least one frame whose `retries == 0` (Karn's rule).
+    fn update_rtt(&mut self, sample: Duration) {
+        if !self.have_rtt_sample {
+            // §2.2: initial sample.
+            self.srtt = sample;
+            self.rttvar = sample / 2;
+            self.have_rtt_sample = true;
+        } else {
+            // §2.3: weighted moving average for both SRTT and RTTVAR.
+            // RTTVAR ← (1-β)·RTTVAR + β·|SRTT − R'|
+            let diff = if self.srtt > sample {
+                self.srtt - sample
+            } else {
+                sample - self.srtt
+            };
+            self.rttvar = weighted(self.rttvar, diff, BETA_NUM, BETA_DEN);
+            // SRTT ← (1-α)·SRTT + α·R'
+            self.srtt = weighted(self.srtt, sample, ALPHA_NUM, ALPHA_DEN);
+        }
+        // RTO ← SRTT + K·RTTVAR, clamped to [MIN_RTO, MAX_RTO].
+        let raw = self.srtt + self.rttvar * K;
+        self.rto = raw.clamp(MIN_RTO, MAX_RTO);
+    }
+
+    /// Inspect the current RTO. Mostly for tests / diagnostics.
+    pub fn current_rto(&self) -> Duration {
+        self.rto
+    }
+
+    /// Inspect the smoothed RTT estimate. Returns `None` until the
+    /// first Karn-eligible ACK lands.
+    pub fn srtt(&self) -> Option<Duration> {
+        self.have_rtt_sample.then_some(self.srtt)
     }
 
     // ── SENDER ───────────────────────────────────────────────────────────
@@ -176,18 +238,26 @@ impl Reliability {
 
     /// Process an incoming Ack. Drops cumulatively-ACKed frames. Updates
     /// the peer window. Clears close_pending if the peer has acknowledged
-    /// past the local FIN. Resets RTO on forward progress.
-    pub fn on_recv_ack(&mut self, ack: u32, win: u32) {
+    /// past the local FIN. Folds a Karn-eligible RTT sample (frame with
+    /// `retries == 0`) into the SRTT/RTTVAR estimator.
+    pub fn on_recv_ack(&mut self, ack: u32, win: u32, now: Instant) {
         self.peer_window = win;
-        let mut made_progress = false;
+        let mut sampled_rtt: Option<Duration> = None;
         while let Some(front) = self.unacked.front() {
             let end = front.seq.wrapping_add(front.data.len() as u32);
             // No wrap handling: streams are short enough that 4 GB never
             // accumulates between an ACK roundtrip. Documented assumption.
             if end <= ack {
+                // Karn: a frame that's been retransmitted at least once
+                // is ambiguous — the ACK could answer any of the copies,
+                // so its elapsed time is not a valid RTT. Sample only
+                // virgins. First eligible frame per ACK wins (covers
+                // the most-recent unambiguous round-trip).
+                if front.retries == 0 && sampled_rtt.is_none() {
+                    sampled_rtt = Some(now.duration_since(front.last_sent));
+                }
                 self.unacked_bytes = self.unacked_bytes.saturating_sub(front.data.len() as u32);
                 self.unacked.pop_front();
-                made_progress = true;
             } else {
                 break;
             }
@@ -197,13 +267,10 @@ impl Reliability {
             // delivered — see ack_state() on the receiver side.
             if ack > c.seq {
                 self.close_pending = None;
-                made_progress = true;
             }
         }
-        if made_progress {
-            // Forward progress — reset RTO so a future loss doesn't inherit
-            // a bloated backoff.
-            self.rto = INITIAL_RTO;
+        if let Some(sample) = sampled_rtt {
+            self.update_rtt(sample);
         }
     }
 
@@ -235,7 +302,11 @@ impl Reliability {
             }
         }
         if !due.data_jobs.is_empty() || due.close_job.is_some() {
-            self.rto = (self.rto * 2).min(MAX_RTO);
+            // RFC 6298 §5.5: double RTO on retransmit. This is
+            // independent of the SRTT estimate; the retransmit timer
+            // is conservative on purpose so spurious retransmits
+            // don't cascade.
+            self.rto = (self.rto * 2).clamp(MIN_RTO, MAX_RTO);
         }
         Ok(due)
     }
@@ -426,6 +497,20 @@ impl Reliability {
     }
 }
 
+/// Compute (1 - num/den)·a + (num/den)·b in integer-nanosecond space
+/// so we don't lose precision to f64 round-trips and we don't bring
+/// in a float-math dep.
+fn weighted(a: Duration, b: Duration, num: u32, den: u32) -> Duration {
+    debug_assert!(num < den, "weighted: num/den must be < 1");
+    let inv = den - num;
+    let a_ns = a.as_nanos();
+    let b_ns = b.as_nanos();
+    let scaled = (a_ns * inv as u128 + b_ns * num as u128) / den as u128;
+    // Saturate at u64::MAX nanoseconds (~585 years) — far past any
+    // sane RTT, so the clamp is purely defensive.
+    Duration::from_nanos(scaled.min(u64::MAX as u128) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,14 +557,15 @@ mod tests {
     #[test]
     fn ack_drops_cumulative() {
         let mut r = Reliability::default();
+        let now = Instant::now();
         let seq_a = r.allocate_seq(5).unwrap();
-        r.record_sent(seq_a, bytes("hello"), Instant::now());
+        r.record_sent(seq_a, bytes("hello"), now);
         let seq_b = r.allocate_seq(5).unwrap();
-        r.record_sent(seq_b, bytes("world"), Instant::now());
+        r.record_sent(seq_b, bytes("world"), now);
         assert_eq!(r.unacked_bytes(), 10);
-        r.on_recv_ack(5, INITIAL_PEER_WINDOW);
+        r.on_recv_ack(5, INITIAL_PEER_WINDOW, now + Duration::from_millis(50));
         assert_eq!(r.unacked_bytes(), 5);
-        r.on_recv_ack(10, INITIAL_PEER_WINDOW);
+        r.on_recv_ack(10, INITIAL_PEER_WINDOW, now + Duration::from_millis(60));
         assert_eq!(r.unacked_bytes(), 0);
         assert!(r.unacked_empty());
     }
@@ -523,7 +609,7 @@ mod tests {
         // Next byte exceeds the window → blocked.
         assert!(r.allocate_seq(1).is_none());
         // ACK opens the window again.
-        r.on_recv_ack(win, INITIAL_PEER_WINDOW);
+        r.on_recv_ack(win, INITIAL_PEER_WINDOW, Instant::now());
         assert!(r.allocate_seq(10_000).is_some());
     }
 
@@ -552,11 +638,11 @@ mod tests {
         assert_eq!(due.close_job.unwrap().seq, close_seq);
 
         // ACK that covers only the data (ack=5) doesn't clear close.
-        r.on_recv_ack(5, INITIAL_PEER_WINDOW);
+        r.on_recv_ack(5, INITIAL_PEER_WINDOW, now);
         assert!(r.close_pending(), "ACK that doesn't pass close_seq+1 keeps close pending");
 
         // ACK past close_seq (ack=6) clears close_pending.
-        r.on_recv_ack(6, INITIAL_PEER_WINDOW);
+        r.on_recv_ack(6, INITIAL_PEER_WINDOW, now);
         assert!(!r.close_pending(), "ACK past close_seq+1 clears the FIN");
     }
 
@@ -578,6 +664,90 @@ mod tests {
         let _ = r.on_recv_data(0, bytes("hello"));
         let (ack, _) = r.ack_state();
         assert_eq!(ack, 5, "ack stays at expected_seq until Close gap closes");
+    }
+
+    #[test]
+    fn rtt_first_sample_initializes_srtt() {
+        let mut r = Reliability::default();
+        assert!(r.srtt().is_none(), "no sample yet");
+        let t0 = Instant::now();
+        let seq = r.allocate_seq(4).unwrap();
+        r.record_sent(seq, bytes("abcd"), t0);
+        // 100 ms later the ACK lands.
+        r.on_recv_ack(4, INITIAL_PEER_WINDOW, t0 + Duration::from_millis(100));
+        let srtt = r.srtt().expect("first ACK must initialise SRTT");
+        assert_eq!(srtt, Duration::from_millis(100), "SRTT == first sample");
+        // RTO = SRTT + K·RTTVAR = 100ms + 4·50ms = 300ms, clamped >= MIN_RTO.
+        assert_eq!(r.current_rto(), Duration::from_millis(300));
+    }
+
+    #[test]
+    fn rtt_subsequent_samples_smooth() {
+        let mut r = Reliability::default();
+        let t0 = Instant::now();
+        // First sample: 100 ms.
+        let seq = r.allocate_seq(1).unwrap();
+        r.record_sent(seq, bytes("a"), t0);
+        r.on_recv_ack(1, INITIAL_PEER_WINDOW, t0 + Duration::from_millis(100));
+        let srtt_1 = r.srtt().unwrap();
+        // Second sample: 200 ms — SRTT moves a small fraction toward 200.
+        let seq2 = r.allocate_seq(1).unwrap();
+        let t1 = t0 + Duration::from_millis(200);
+        r.record_sent(seq2, bytes("b"), t1);
+        r.on_recv_ack(2, INITIAL_PEER_WINDOW, t1 + Duration::from_millis(200));
+        let srtt_2 = r.srtt().unwrap();
+        // (7/8)·100 + (1/8)·200 = 112.5 ms. Allow ±1 ms for ns/ms rounding.
+        let expected = Duration::from_micros(112_500);
+        let diff = if srtt_2 > expected { srtt_2 - expected } else { expected - srtt_2 };
+        assert!(diff < Duration::from_millis(1),
+                "SRTT after second sample ≈ 112.5 ms, got {srtt_2:?} (was {srtt_1:?})");
+    }
+
+    #[test]
+    fn karn_skips_retransmitted_frames() {
+        let mut r = Reliability::default();
+        let t0 = Instant::now();
+        let seq = r.allocate_seq(1).unwrap();
+        r.record_sent(seq, bytes("x"), t0);
+        // Pretend the retransmit timer fired: bump retries.
+        let _ = r
+            .retransmit_due(t0 + INITIAL_RTO + Duration::from_millis(50))
+            .unwrap();
+        // ACK lands now, but Karn forbids sampling the retransmitted frame.
+        r.on_recv_ack(1, INITIAL_PEER_WINDOW, t0 + INITIAL_RTO + Duration::from_millis(60));
+        assert!(r.srtt().is_none(),
+                "Karn: retransmitted frame must not produce an RTT sample");
+    }
+
+    #[test]
+    fn rto_clamped_between_min_and_max() {
+        // Force a tiny SRTT by sampling 1 µs (way below MIN_RTO).
+        let mut r = Reliability::default();
+        let t0 = Instant::now();
+        let seq = r.allocate_seq(1).unwrap();
+        r.record_sent(seq, bytes("y"), t0);
+        r.on_recv_ack(1, INITIAL_PEER_WINDOW, t0 + Duration::from_micros(1));
+        assert!(r.current_rto() >= MIN_RTO, "RTO must clamp to MIN_RTO");
+        // Doubling on retransmit shouldn't exceed MAX_RTO either.
+        let seq2 = r.allocate_seq(1).unwrap();
+        r.record_sent(seq2, bytes("z"), t0);
+        let mut t = t0;
+        // Six doublings starting from MIN_RTO=200ms hits 12.8s — above MAX_RTO=8s.
+        for _ in 0..6 {
+            t += Duration::from_secs(60); // ensure RTO elapsed
+            let _ = r.retransmit_due(t).unwrap();
+        }
+        assert!(r.current_rto() <= MAX_RTO, "RTO must clamp to MAX_RTO");
+    }
+
+    #[test]
+    fn weighted_average_handles_typical_inputs() {
+        // (7/8)·100 + (1/8)·200 = 112.5
+        let out = weighted(Duration::from_millis(100), Duration::from_millis(200), 1, 8);
+        assert_eq!(out.as_micros(), 112_500);
+        // (3/4)·40 + (1/4)·80 = 50
+        let out = weighted(Duration::from_millis(40), Duration::from_millis(80), 1, 4);
+        assert_eq!(out.as_millis(), 50);
     }
 
     #[test]
