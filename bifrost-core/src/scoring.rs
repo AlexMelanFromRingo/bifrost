@@ -223,6 +223,37 @@ impl ScoredExitPool {
         self.pick_with(|| rand::random::<f64>())
     }
 
+    /// Pick up to `n` DISTINCT candidates for parallel racing. Each
+    /// pick is independent weighted-random (sampling with replacement
+    /// per draw); we deduplicate the result so the same peer doesn't
+    /// appear twice. If the pool has fewer than `n` candidates, returns
+    /// what we have. Used by SOCKS5 happy-eyeballs to fan a CONNECT
+    /// across the top of the pool concurrently.
+    pub fn pick_n(&self, n: usize) -> Vec<(PubKey, Option<String>)> {
+        if n == 0 { return Vec::new(); }
+        let total = self.len();
+        let cap = n.min(total);
+        if cap == 0 { return Vec::new(); }
+        let mut out: Vec<(PubKey, Option<String>)> = Vec::with_capacity(cap);
+        let mut seen: std::collections::HashSet<PubKey> =
+            std::collections::HashSet::with_capacity(cap);
+        // Allow some extra attempts to converge despite duplicates in
+        // weighted draws — bounded so a wildly skewed weight
+        // distribution can't loop forever.
+        let max_attempts = (cap * 4).max(8);
+        for _ in 0..max_attempts {
+            if out.len() >= cap { break; }
+            if let Some((pk, tag)) = self.pick() {
+                if seen.insert(pk) {
+                    out.push((pk, tag));
+                }
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
     /// Deterministic variant for tests — caller injects the [0,1) draw.
     pub fn pick_with(&self, mut roll: impl FnMut() -> f64) -> Option<(PubKey, Option<String>)> {
         let snapshot = self.snapshot.lock().expect("snapshot mutex poisoned");
@@ -306,7 +337,16 @@ pub fn spawn_refresher(
     interval: Duration,
 ) {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(interval);
+        // First tick fires `interval` from NOW instead of at t=0.
+        // tokio::time::interval's default behaviour returns the first
+        // tick immediately, which on a cold-started daemon means we
+        // grab the norn-rs RouterState mutex while the underlying
+        // session-init handshake is still wiring itself up — that
+        // hand-shake then misses its window and the peer connection
+        // stalls for a full retransmit cycle. interval_at offsets
+        // the start so the daemon has time to settle.
+        let start = tokio::time::Instant::now() + interval;
+        let mut tick = tokio::time::interval_at(start, interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
@@ -476,6 +516,33 @@ mod tests {
         pool.reset_all_penalties();
         pool.refresh_at(&[stat(1, 1.0, 10), stat(2, 1.0, 10)], now);
         assert!(pool.snapshot().iter().all(|s| s.penalty_ms == 0.0));
+    }
+
+    #[test]
+    fn pick_n_returns_distinct_candidates() {
+        let pool = ScoredExitPool::new(vec![
+            (pk(1), None), (pk(2), None), (pk(3), None), (pk(4), None),
+        ]);
+        pool.refresh(&[
+            stat(1, 1.0, 20), stat(2, 1.0, 20), stat(3, 1.0, 20), stat(4, 1.0, 20),
+        ]);
+        let three = pool.pick_n(3);
+        assert_eq!(three.len(), 3, "must get 3 distinct candidates");
+        let set: std::collections::HashSet<_> = three.iter().map(|(k, _)| *k).collect();
+        assert_eq!(set.len(), 3, "picks must be unique");
+    }
+
+    #[test]
+    fn pick_n_caps_at_pool_size() {
+        let pool = ScoredExitPool::new(vec![(pk(1), None), (pk(2), None)]);
+        pool.refresh(&[stat(1, 1.0, 20), stat(2, 1.0, 20)]);
+        assert_eq!(pool.pick_n(5).len(), 2, "can't exceed pool size");
+    }
+
+    #[test]
+    fn pick_n_zero_returns_empty() {
+        let pool = ScoredExitPool::new(vec![(pk(1), None)]);
+        assert!(pool.pick_n(0).is_empty());
     }
 
     #[test]

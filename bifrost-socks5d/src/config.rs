@@ -48,7 +48,20 @@ pub struct BifrostEndpoints {
     /// without a config-edit-and-reload.
     #[serde(default = "default_true")]
     pub mdns_discovery: bool,
+    /// Happy-eyeballs racing: race the SOCKS5 Open frame across N
+    /// top-weighted exits and use the first that returns OpenAck
+    /// success. 1 disables racing (fall back to single pick).
+    /// Defaults to 3 — anti-blocking + redundancy without flooding.
+    #[serde(default = "default_race_exits")]
+    pub race_exits: usize,
+    /// Per-CONNECT race timeout. After this, every racer is aborted
+    /// and the SOCKS5 client gets a general-failure reply.
+    #[serde(default = "default_race_timeout_ms")]
+    pub race_timeout_ms: u64,
 }
+
+fn default_race_exits() -> usize { 3 }
+fn default_race_timeout_ms() -> u64 { 15_000 }
 
 fn default_true() -> bool { true }
 
@@ -58,6 +71,8 @@ impl Default for BifrostEndpoints {
             metrics_addr: String::new(),
             admin_socket: String::new(),
             mdns_discovery: true,
+            race_exits: default_race_exits(),
+            race_timeout_ms: default_race_timeout_ms(),
         }
     }
 }

@@ -24,6 +24,7 @@ services:
       # tiebreak (larger pub_key defers) can pick a survivor regardless
       # of whose key was generated higher.
       BIFROST_PEER_HOST: "client:9001"
+      BIFROST_DISABLE_MDNS: "${BIFROST_DISABLE_MDNS:-1}"
     cap_add:
       - NET_ADMIN
     networks:
@@ -46,7 +47,14 @@ services:
       # to weighted-random Auto (Trust/RTT-driven). The chosen exit is
       # the same here (single-peer fleet), but the log line proves the
       # selection codepath is active and the pool gets warmed.
+      # Defaults exercise the racing/Auto path. Override via env to
+      # bisect a flaky run: BIFROST_EGRESS_AUTO=0 falls back to the
+      # round-robin rotator; BIFROST_DISABLE_METRICS=1 skips the
+      # Prometheus listener (the bind during cold-start can occasion-
+      # ally race the norn-rs session handshake under load).
       BIFROST_EGRESS_AUTO: "${BIFROST_EGRESS_AUTO:-1}"
+      BIFROST_DISABLE_MDNS: "${BIFROST_DISABLE_MDNS:-1}"
+      BIFROST_DISABLE_METRICS: "${BIFROST_DISABLE_METRICS:-1}"
       RUST_LOG: "info,bifrost_core=debug,norn_rs=info"
       NETEM_DELAY: "30ms 5ms"
       NETEM_LOSS: "1%"

@@ -63,8 +63,8 @@ for i in $(seq 1 30); do
     sleep 0.5
 done
 
-echo "=== wait for mesh session establishment (≤10s) ==="
-sleep 8
+echo "=== wait for mesh session establishment (≤15s) ==="
+sleep 15
 
 echo "=== probe: small GET through SOCKS5 ==="
 # --socks5-hostname asks curl to forward the literal hostname through the

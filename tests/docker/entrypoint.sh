@@ -42,6 +42,11 @@ if [ "$ROLE" = "exit" ]; then
     if [ -n "${BIFROST_PEER_HOST:-}" ]; then
         PEERS_LINE="peers = [\"tcp://${BIFROST_PEER_HOST}\"]"
     fi
+    # Exit-mode template doesn't carry a [bifrost] section by default,
+    # so append one when the operator wants to disable bifrost mDNS.
+    if [ "${BIFROST_DISABLE_MDNS:-0}" = "1" ]; then
+        printf '\n[bifrost]\nmdns_discovery = false\n' >> "$CONFIG"
+    fi
     sed -i \
         -e "s|tcp://0.0.0.0:9001|tcp://0.0.0.0:${TCP_PORT}|" \
         -e 's|tun_name = "norn0"|tun_name = "bifrost-tun"|' \
@@ -70,6 +75,18 @@ elif [ "$ROLE" = "client" ]; then
     # BIFROST_EGRESS_AUTO=1 flips the policy to weighted-random selection.
     if [ "${BIFROST_EGRESS_AUTO:-0}" = "1" ]; then
         sed -i 's|^mode = "exit"$|mode = "auto"|' "$CONFIG"
+    fi
+    if [ "${BIFROST_DISABLE_ADMIN:-0}" = "1" ]; then
+        sed -i 's|^admin_socket  = .*|admin_socket  = ""|' "$CONFIG"
+    fi
+    if [ "${BIFROST_DISABLE_METRICS:-0}" = "1" ]; then
+        sed -i 's|^metrics_addr  = .*|metrics_addr  = ""|' "$CONFIG"
+    fi
+    # Optional kill switch for the bifrost mDNS discovery layer — the
+    # docker bridge can be a flaky multicast medium and racing-mode
+    # tests want to isolate from any browse-loop side effects.
+    if [ "${BIFROST_DISABLE_MDNS:-0}" = "1" ]; then
+        sed -i 's|^# UNIX socket|mdns_discovery = false\n# UNIX socket|' "$CONFIG"
     fi
 else
     echo "[entrypoint] unknown role: $ROLE" >&2

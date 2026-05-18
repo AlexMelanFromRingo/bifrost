@@ -23,6 +23,7 @@ use bifrost_core::{
     policy::{EgressPolicy, ExitRotator},
     scoring::{spawn_refresher, ScoredExitPool},
     stream::reply,
+    MeshStream, PubKey,
 };
 use clap::{Parser, Subcommand};
 use config::{DaemonConfig, Mode};
@@ -102,14 +103,37 @@ enum ExitPicker {
 }
 
 impl ExitPicker {
-    fn pick(&self) -> Option<(bifrost_core::PubKey, Option<String>)> {
+    fn pick(&self) -> Option<(PubKey, Option<String>)> {
         match self {
             Self::Rotator(r) => r.pick(),
             Self::Scored(s) => s.pick(),
         }
     }
 
-    fn record_failure(&self, key: &bifrost_core::PubKey) {
+    /// Up to `n` distinct candidates for happy-eyeballs racing. The
+    /// Scored variant draws weighted-random without replacement; the
+    /// Rotator variant just walks N times (round-robin already gives
+    /// us distinctness modulo pool size).
+    fn pick_n(&self, n: usize) -> Vec<(PubKey, Option<String>)> {
+        match self {
+            Self::Scored(s) => s.pick_n(n),
+            Self::Rotator(r) => {
+                let mut out = Vec::with_capacity(n);
+                let mut seen = std::collections::HashSet::new();
+                for _ in 0..(n * 2) {
+                    if out.len() >= n { break; }
+                    if let Some((pk, tag)) = r.pick() {
+                        if seen.insert(pk) {
+                            out.push((pk, tag));
+                        }
+                    } else { break; }
+                }
+                out
+            }
+        }
+    }
+
+    fn record_failure(&self, key: &PubKey) {
         if let Self::Scored(s) = self {
             s.record_failure(key);
         }
@@ -200,8 +224,10 @@ async fn run_client(cfg: DaemonConfig, mux: Arc<MeshMux>, started_at: Instant) -
         };
         let mux = mux.clone();
         let picker = picker.clone();
+        let race_exits = cfg.bifrost.race_exits;
+        let race_timeout = Duration::from_millis(cfg.bifrost.race_timeout_ms);
         tokio::spawn(async move {
-            if let Err(e) = handle_socks5(sock, mux, picker).await {
+            if let Err(e) = handle_socks5(sock, mux, picker, race_exits, race_timeout).await {
                 tracing::debug!("socks5 from {peer}: {e}");
             }
         });
@@ -212,58 +238,216 @@ async fn handle_socks5(
     mut sock: TcpStream,
     mux: Arc<MeshMux>,
     picker: Arc<ExitPicker>,
+    race_exits: usize,
+    race_timeout: Duration,
 ) -> Result<()> {
     socks5::negotiate_methods(&mut sock).await?;
     let target = match socks5::read_request(&mut sock).await {
         Ok(t) => t,
         Err(e) => return Err(e),
     };
-    let Some((exit_peer, tag)) = picker.pick() else {
+    let candidates = picker.pick_n(race_exits.max(1));
+    if candidates.is_empty() {
         let _ = socks5::write_reply(&mut sock, socks5::REP_GENERAL_FAILURE).await;
         anyhow::bail!("no exit peers configured");
-    };
+    }
+    let race_now = candidates.len() > 1;
     info!(
-        "CONNECT {} → exit {}{}",
+        "CONNECT {} → {} candidate(s) [{}]",
         target.display(),
-        hex::encode(&exit_peer[..8]),
-        tag.as_deref().map(|t| format!(" [{t}]")).unwrap_or_default()
+        candidates.len(),
+        candidates
+            .iter()
+            .map(|(pk, tag)| format!(
+                "{}{}",
+                hex::encode(&pk[..8]),
+                tag.as_deref().map(|t| format!("({t})")).unwrap_or_default(),
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
     );
-    let mut mesh = match mux.open(exit_peer, target.clone()).await {
+    let outcome = if race_now {
+        race_connect(&mux, target.clone(), candidates.clone(), race_timeout, &picker).await
+    } else {
+        single_connect(&mux, target.clone(), candidates[0].clone(), &picker).await
+    };
+    match outcome {
+        ConnectOutcome::Success { mut stream, pk, tag } => {
+            if race_now {
+                info!("CONNECT {} won by {}{}",
+                    target.display(),
+                    hex::encode(&pk[..8]),
+                    tag.as_deref().map(|t| format!(" [{t}]")).unwrap_or_default());
+            }
+            socks5::write_reply(&mut sock, socks5::REP_SUCCESS).await?;
+            match tokio::io::copy_bidirectional(&mut sock, &mut stream).await {
+                Ok((up, down)) => tracing::debug!(
+                    "CONNECT {} done up={up} down={down}", target.display()),
+                Err(e) => tracing::debug!("CONNECT {} pipe err: {e}", target.display()),
+            }
+            Ok(())
+        }
+        ConnectOutcome::AllRefused { last_code } => {
+            socks5::write_reply(&mut sock, last_code).await?;
+            Ok(())
+        }
+        ConnectOutcome::AllFailed { errors } => {
+            warn!(
+                "CONNECT {} failed across {} candidate(s): {}",
+                target.display(),
+                errors.len(),
+                errors
+                    .iter()
+                    .map(|(pk, e)| format!("{}={e}", hex::encode(&pk[..8])))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let _ = socks5::write_reply(&mut sock, socks5::REP_GENERAL_FAILURE).await;
+            anyhow::bail!("all candidates failed");
+        }
+    }
+}
+
+/// Outcome of (single or raced) CONNECT setup against the mesh.
+enum ConnectOutcome {
+    /// At least one exit returned OpenAck(SUCCESS); use this stream.
+    Success { stream: MeshStream, pk: PubKey, tag: Option<String> },
+    /// Every exit replied OpenAck with a non-success reply code (host
+    /// unreachable / connection refused, etc.). We pass the last code
+    /// back so the SOCKS5 client gets a meaningful REP.
+    AllRefused { last_code: u8 },
+    /// Every exit failed to OPEN or returned an unrelated error.
+    AllFailed { errors: Vec<(PubKey, String)> },
+}
+
+async fn single_connect(
+    mux: &Arc<MeshMux>,
+    target: OpenTarget,
+    candidate: (PubKey, Option<String>),
+    picker: &Arc<ExitPicker>,
+) -> ConnectOutcome {
+    let (pk, tag) = candidate;
+    let mut stream = match mux.open(pk, target).await {
         Ok(s) => s,
         Err(e) => {
-            warn!("open(exit={}): {e}", hex::encode(&exit_peer[..8]));
-            // Auto mode absorbs the failure as a temporary penalty so
-            // the next CONNECT skips this peer. Rotator mode just
-            // moves on; round-robin will visit it again next pass.
-            picker.record_failure(&exit_peer);
-            let _ = socks5::write_reply(&mut sock, socks5::REP_GENERAL_FAILURE).await;
-            return Err(e);
+            picker.record_failure(&pk);
+            return ConnectOutcome::AllFailed { errors: vec![(pk, e.to_string())] };
         }
     };
-    let ack = match mesh.await_open_ack().await {
-        Ok(code) => code,
-        Err(e) => {
-            picker.record_failure(&exit_peer);
-            let _ = socks5::write_reply(&mut sock, socks5::REP_GENERAL_FAILURE).await;
-            return Err(e.into());
+    // Cap the wait so a totally-deaf exit doesn't hang the SOCKS5
+    // request forever; 15 s matches the racing path's default.
+    match tokio::time::timeout(Duration::from_secs(15), stream.await_open_ack()).await {
+        Ok(Ok(code)) if code == socks5::REP_SUCCESS => {
+            tracing::debug!("single_connect: OpenAck SUCCESS from {}", hex::encode(&pk[..8]));
+            ConnectOutcome::Success { stream, pk, tag }
         }
-    };
-    socks5::write_reply(&mut sock, ack).await?;
-    if ack != socks5::REP_SUCCESS {
-        // Exit replied but couldn't dial the target — also a penalty
-        // signal, since a healthy exit on a working upstream would
-        // succeed. (HOST_UNREACHABLE / CONN_REFUSED for the target
-        // host are correctly attributed to the EXIT's view of that
-        // host, not the exit itself failing — but at the SOCKS5 layer
-        // that's the actionable signal we have.)
-        picker.record_failure(&exit_peer);
-        return Ok(());
+        Ok(Ok(code)) => {
+            picker.record_failure(&pk);
+            ConnectOutcome::AllRefused { last_code: code }
+        }
+        Ok(Err(e)) => {
+            picker.record_failure(&pk);
+            ConnectOutcome::AllFailed { errors: vec![(pk, e.to_string())] }
+        }
+        Err(_) => {
+            tracing::debug!("single_connect: OpenAck timeout from {}", hex::encode(&pk[..8]));
+            picker.record_failure(&pk);
+            ConnectOutcome::AllFailed { errors: vec![(pk, "OpenAck timeout (15 s)".into())] }
+        }
     }
-    match tokio::io::copy_bidirectional(&mut sock, &mut mesh).await {
-        Ok((up, down)) => tracing::debug!("CONNECT {} done up={up} down={down}", target.display()),
-        Err(e) => tracing::debug!("CONNECT {} pipe err: {e}", target.display()),
+}
+
+/// Happy Eyeballs for exits. Spawn one task per candidate to open a
+/// MeshStream + await OpenAck. As soon as one returns SUCCESS, abort
+/// the others and return the winning stream.
+///
+/// Caveat (documented in README): aborted losers' streams are
+/// dropped without sending Reset to the peer — the mux's retransmit
+/// budget on each exit-side stream will exhaust after ~30 s and the
+/// exit will tear down its TCP itself. For interactive CONNECT
+/// traffic this is a tolerable resource lag.
+async fn race_connect(
+    mux: &Arc<MeshMux>,
+    target: OpenTarget,
+    candidates: Vec<(PubKey, Option<String>)>,
+    race_timeout: Duration,
+    picker: &Arc<ExitPicker>,
+) -> ConnectOutcome {
+    use tokio::task::JoinSet;
+
+    let mut set: JoinSet<RacerOutcome> = JoinSet::new();
+    for (pk, tag) in candidates {
+        let mux = mux.clone();
+        let target = target.clone();
+        set.spawn(async move {
+            let mut stream = match mux.open(pk, target).await {
+                Ok(s) => s,
+                Err(e) => return RacerOutcome::OpenFailed { pk, err: e.to_string() },
+            };
+            match stream.await_open_ack().await {
+                Ok(code) if code == socks5::REP_SUCCESS => {
+                    RacerOutcome::Success { stream, pk, tag }
+                }
+                Ok(code) => RacerOutcome::AckRejected { pk, code },
+                Err(e) => RacerOutcome::AckFailed { pk, err: e.to_string() },
+            }
+        });
     }
-    Ok(())
+
+    let mut errors: Vec<(PubKey, String)> = Vec::new();
+    let mut last_refused: Option<u8> = None;
+    let deadline = tokio::time::Instant::now() + race_timeout;
+
+    loop {
+        let next = tokio::time::timeout_at(deadline, set.join_next()).await;
+        let joined = match next {
+            Ok(Some(j)) => j,
+            // None = JoinSet empty: every racer reported back.
+            Ok(None) => break,
+            // Err = deadline elapsed: bail with whatever we have.
+            Err(_) => {
+                set.abort_all();
+                break;
+            }
+        };
+        match joined {
+            Ok(RacerOutcome::Success { stream, pk, tag }) => {
+                // We've got a winner — abort everyone else so their
+                // exit-side dials don't burn target-network resources.
+                set.abort_all();
+                return ConnectOutcome::Success { stream, pk, tag };
+            }
+            Ok(RacerOutcome::AckRejected { pk, code }) => {
+                picker.record_failure(&pk);
+                last_refused = Some(code);
+                errors.push((pk, format!("OpenAck(0x{code:02x})")));
+            }
+            Ok(RacerOutcome::OpenFailed { pk, err })
+            | Ok(RacerOutcome::AckFailed { pk, err }) => {
+                picker.record_failure(&pk);
+                errors.push((pk, err));
+            }
+            Err(_join) => {} // task cancelled or panicked — ignore.
+        }
+    }
+
+    if let Some(code) = last_refused {
+        ConnectOutcome::AllRefused { last_code: code }
+    } else {
+        ConnectOutcome::AllFailed { errors }
+    }
+}
+
+/// What one racer task reports back to the orchestrator.
+enum RacerOutcome {
+    Success { stream: MeshStream, pk: PubKey, tag: Option<String> },
+    /// OpenAck arrived with a non-success reply code (e.g. exit
+    /// could reach us but couldn't dial the target).
+    AckRejected { pk: PubKey, code: u8 },
+    /// mux.open returned an error (no session, no route, etc.).
+    OpenFailed { pk: PubKey, err: String },
+    /// OpenAck never arrived (stream closed / reset / channel dead).
+    AckFailed { pk: PubKey, err: String },
 }
 
 // ── EXIT ─────────────────────────────────────────────────────────────────
