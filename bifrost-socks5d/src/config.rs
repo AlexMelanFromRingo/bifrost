@@ -26,6 +26,23 @@ pub struct DaemonConfig {
     /// Required when mode = "client". Ignored in exit mode.
     #[serde(default)]
     pub egress: Option<EgressPolicy>,
+
+    /// Optional bifrost-specific endpoints. Distinct from
+    /// `[node].metrics_addr` (which is norn-rs's own /metrics) and
+    /// from `[node].admin_socket` (norn-rs admin). Empty = disabled.
+    #[serde(default)]
+    pub bifrost: BifrostEndpoints,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct BifrostEndpoints {
+    /// `host:port` for the bifrost-specific Prometheus exporter.
+    /// Exposes ScoredExitPool gauges. Loopback strongly recommended.
+    #[serde(default)]
+    pub metrics_addr: String,
+    /// UNIX socket path for `bifrost-ctl`. Empty = disabled.
+    #[serde(default)]
+    pub admin_socket: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -95,6 +112,13 @@ exits = [
   # or via mDNS / multicast discovery on the LAN.
   # {{ pub_key = "0000...0000", tag = "primary" }},
 ]
+
+[bifrost]
+# Loopback-only Prometheus endpoint with ScoredExitPool gauges.
+# Comment out to disable.
+metrics_addr  = "127.0.0.1:9099"
+# UNIX socket for `bifrost-ctl` — runtime status / penalty CLI.
+admin_socket  = "/tmp/bifrost-socks5d-ctl.sock"
 "#,
         )
     }

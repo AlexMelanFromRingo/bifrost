@@ -10,6 +10,7 @@
 // SOCKS5 socket.
 
 mod config;
+mod metrics;
 mod socks5;
 
 use anyhow::{Context, Result};
@@ -127,8 +128,26 @@ async fn run_client(cfg: DaemonConfig, mux: Arc<MeshMux>) -> Result<()> {
         pool.refresh(&mux.conn().get_peer_stats());
         spawn_refresher(pool.clone(), mux.conn().clone(), Duration::from_secs(10));
         info!("egress.auto: weighted-random pool of {} candidates", pool.snapshot().len());
+        // The bifrost-specific Prometheus endpoint only makes sense
+        // when there's a ScoredExitPool to expose; skip it for
+        // round-robin Exit mode.
+        if !cfg.bifrost.metrics_addr.is_empty() {
+            let addr = cfg.bifrost.metrics_addr.clone();
+            let pool_for_metrics = pool.clone();
+            tokio::spawn(async move {
+                if let Err(e) = metrics::listen(&addr, pool_for_metrics).await {
+                    warn!("bifrost metrics endpoint: {e}");
+                }
+            });
+        }
         ExitPicker::Scored(pool)
     } else {
+        if !cfg.bifrost.metrics_addr.is_empty() {
+            warn!(
+                "bifrost.metrics_addr set but egress mode is not 'auto' — skipping endpoint \
+                 (the gauges are pool-specific and only have meaning with weighted selection)"
+            );
+        }
         ExitPicker::Rotator(Arc::new(ExitRotator::new(exits)))
     };
     let picker = Arc::new(picker);

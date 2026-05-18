@@ -19,6 +19,7 @@
 // will need an ARQ layer; that's earmarked but not implemented yet.
 
 pub mod frame;
+pub mod metrics;
 pub mod mux;
 pub mod policy;
 pub mod reliability;
