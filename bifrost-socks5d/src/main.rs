@@ -293,7 +293,15 @@ async fn handle_socks5(
                     tag.as_deref().map(|t| format!(" [{t}]")).unwrap_or_default());
             }
             socks5::write_reply(&mut sock, socks5::REP_SUCCESS).await?;
-            match tokio::io::copy_bidirectional(&mut sock, &mut stream).await {
+            // Tokio's default 8 KiB copy buffer caps SOCKS5 throughput
+            // on long-fat links: every 8 KiB chunk pays one mesh
+            // encrypt+frame+TCP-write round-trip, so per-byte CPU and
+            // syscall overhead dominates above ~30 Mbit/s. 64 KiB
+            // matches the mesh's MTU-driven chunk_size (65 KB) so the
+            // forwarder feeds the mesh in single full-sized frames.
+            match tokio::io::copy_bidirectional_with_sizes(
+                &mut sock, &mut stream, 64 * 1024, 64 * 1024,
+            ).await {
                 Ok((up, down)) => tracing::debug!(
                     "CONNECT {} done up={up} down={down}", target.display()),
                 Err(e) => tracing::debug!("CONNECT {} pipe err: {e}", target.display()),
@@ -557,7 +565,11 @@ async fn handle_exit_stream(acc: AcceptedStream) {
         warn!("exit: write OpenAck failed: {e}");
         return;
     }
-    match tokio::io::copy_bidirectional(&mut tcp, &mut mesh).await {
+    // 64 KiB buffers match the mesh chunk_size — see comment on the
+    // matching call in handle_socks5().
+    match tokio::io::copy_bidirectional_with_sizes(
+        &mut tcp, &mut mesh, 64 * 1024, 64 * 1024,
+    ).await {
         Ok((up, down)) => tracing::debug!("exit: {} done up={up} down={down}", target.display()),
         Err(e) => tracing::debug!("exit: {} pipe err: {e}", target.display()),
     }
