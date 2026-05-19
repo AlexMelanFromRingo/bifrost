@@ -58,40 +58,44 @@ might arrive out of order — usually fine, IP handles reorder).
 Expected uplift: enables 10+ Gbit/s scenarios. No measurable
 effect below ~500 Mbit/s.
 
-## 3. TUN GSO/GRO (`IFF_VNET_HDR` + `TUNSETOFFLOAD`) ⏳ foundation landed
+## 3. TUN GSO/GRO (`IFF_VNET_HDR` + `TUNSETOFFLOAD`) ✅ VNET_HDR + CSUM wired
 
-Status: **foundation in `bifrost-vpnd::tun_offload`**, not yet
-wired into the live data plane.
+Status: **live in the data plane**. `bifrost-vpnd/src/tun_dev.rs`
+replaces the `tun2` dependency with a hand-rolled `AsyncFd<OwnedFd>`
+that opens `/dev/net/tun` with `IFF_TUN | IFF_NO_PI | IFF_VNET_HDR`
+and, by default, enables `TUNSETOFFLOAD(TUN_F_CSUM)`. `tun2` is no
+longer in `bifrost-vpnd`'s dependency tree (the mesh-only mode in
+norn-rs still uses it).
 
-What's there today:
+What's wired in:
 
-* `VirtioNetHdr` type with `encode` / `decode` / `split`
-  round-trip helpers and 7 unit tests pinning the wire layout
-  against the kernel `include/uapi/linux/virtio_net.h` constants
-  (`GSO_TCPV4`, `GSO_UDP`, `GSO_TCPV6`, `ECN_FLAG`, etc.).
-* `try_enable_tun_offload(fd, flags)` — safe wrapper around the
-  `TUNSETOFFLOAD` ioctl. Linux-only; stubs to
-  `io::ErrorKind::Unsupported` elsewhere.
-* `offload_flag::*` constants (`CSUM`, `TSO4`, `TSO6`, `USO4`,
-  `USO6`) so callers don't have to look them up in
-  `if_tun.h`.
+* Every kernel TUN read strips the leading 12-byte `virtio_net_hdr`
+  before handing the IP packet to the data plane, so the rest of
+  the code keeps its plain-IP contract.
+* Every kernel TUN write goes through `writev(2)` with the
+  precomputed zero-header `iovec[0]` and the caller's packet
+  `iovec[1]` — no extra copy on the hot send path.
+* `TUNSETOFFLOAD(TUN_F_CSUM)` is best-effort. If the kernel
+  refuses (e.g. unprivileged build, older kernel) the daemon
+  logs a warning and continues with VNET_HDR-only framing; the
+  data plane is unaffected.
+* MTU is set inline via `SIOCSIFMTU` so the TUN comes up with the
+  same MTU `tun2` used to negotiate (1400 by default).
 
-What's not there yet:
+Follow-ups still on the table:
 
-* `bifrost-vpnd::egress` still opens the TUN device through
-  `tun2`, which doesn't expose `IFF_VNET_HDR`. Even if we call
-  `try_enable_tun_offload` on the resulting fd, the kernel
-  refuses offload flags without `IFF_VNET_HDR`, so the read /
-  write path stays at one-packet-per-syscall.
-* Wiring needs either (a) replacing `tun2` with a hand-rolled
-  `AsyncFd<File>` over the TUN, or (b) a fork / PR to `tun2`
-  exposing the flag. Both are concrete follow-ups; the wire
-  parser is already done and tested.
-
-Expected uplift after wiring: VPN closes the gap with SOCKS5
-throughput at multi-Gbit/s rates. WSL2 may not support
-`IFF_VNET_HDR` — kernel-side virtio TUN offload is patchy in WSL,
-so this is a "test on a native Linux host first" change.
+* Enable `TSO4` / `TSO6` / `USO4` / `USO6`. The kernel will then
+  emit TCP/UDP super-segments (multiple packets per read) and
+  accept the same on writes. The data plane needs a re-segmenter
+  before mesh forwarding, since the wire side carries one IP
+  packet per `Frame::Datagram`. Encode/decode helpers in
+  `tun_offload.rs` already round-trip the GSO fields; the
+  segmenter is the missing piece.
+* On WSL2 specifically, `IFF_VNET_HDR` works but the kernel
+  exposes a smaller set of offload flags than mainline. The
+  best-effort `TUNSETOFFLOAD` fallback covers this transparently,
+  so the WSL build still benefits from VNET_HDR framing without
+  hard-failing on missing CSUM support.
 
 ## 4. Hands-on CPU profile of the current bottleneck
 

@@ -777,14 +777,18 @@ pub async fn start_exit(
         info!("lease store: disabled (set [exit].lease_persistence_path to enable)");
     }
 
-    let mut tun_cfg = tun2::Configuration::default();
-    tun_cfg.tun_name(&tun_name).mtu(1400);
-    let dev = tun2::create_as_async(&tun_cfg)
-        .with_context(|| format!("creating egress TUN {tun_name}"))?;
+    let dev = crate::tun_dev::OffloadTun::open(
+        &tun_name,
+        1400,
+        crate::tun_dev::OffloadTun::DEFAULT_OFFLOAD,
+    )
+    .with_context(|| format!("creating egress TUN {tun_name}"))?;
     configure_exit_kernel(&tun_name, gw4, prefix4, gw6, prefix6, &egress_iface)?;
     info!(
-        "egress exit: tun={tun_name} v4_gw={gw4}/{prefix4} v6_gw={} egress_iface={egress_iface}",
-        gw6.map(|g| format!("{g}/{prefix6}")).unwrap_or_else(|| "<none>".into())
+        "egress exit: tun={tun_name} v4_gw={gw4}/{prefix4} v6_gw={} \
+         egress_iface={egress_iface} offload_active={}",
+        gw6.map(|g| format!("{g}/{prefix6}")).unwrap_or_else(|| "<none>".into()),
+        dev.offload_active()
     );
 
     let (tun_reader, tun_writer) = tokio::io::split(dev);
@@ -1169,10 +1173,16 @@ pub async fn start_client(
         hello.allocated_v4, v6_desc, hello.gateway_v4
     );
 
-    let mut tun_cfg = tun2::Configuration::default();
-    tun_cfg.tun_name(&tun_name).mtu(hello.mtu);
-    let dev = tun2::create_as_async(&tun_cfg)
-        .with_context(|| format!("creating client egress TUN {tun_name}"))?;
+    let dev = crate::tun_dev::OffloadTun::open(
+        &tun_name,
+        hello.mtu,
+        crate::tun_dev::OffloadTun::DEFAULT_OFFLOAD,
+    )
+    .with_context(|| format!("creating client egress TUN {tun_name}"))?;
+    info!(
+        "egress client: tun={tun_name} mtu={} offload_active={}",
+        hello.mtu, dev.offload_active()
+    );
     configure_client_kernel(
         &tun_name,
         hello.allocated_v4,

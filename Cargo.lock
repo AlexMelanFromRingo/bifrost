@@ -223,7 +223,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "tun2",
 ]
 
 [[package]]
