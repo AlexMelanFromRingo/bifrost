@@ -12,10 +12,12 @@ path = "src/main.rs"
 
 [features]
 default = ["tun"]
-# `tun` pulls in tun2 + norn-rs's tun module. Egress mode also needs
+# `tun` enables the kernel TUN paths. norn-rs's tun-support pulls
+# its own `tun2` for the mesh-only mode; the exit/client modes now
+# go through the hand-rolled `tun_dev` module (Linux-only, requires
 # CAP_NET_ADMIN at runtime to bring up the device and rewrite the
-# nat table — we don't try to fall back gracefully.
-tun = ["norn-rs/tun-support", "dep:tun2"]
+# nat table — we don't try to fall back gracefully).
+tun = ["norn-rs/tun-support"]
 
 [dependencies]
 bifrost-core    = { path = "../bifrost-core" }
@@ -30,7 +32,6 @@ serde_json.workspace = true
 toml.workspace = true
 clap.workspace = true
 hex.workspace = true
-tun2 = { version = "3", features = ["async"], optional = true }
 
 # Foundation for kernel-side TUN offload (`IFF_VNET_HDR` +
 # `TUNSETOFFLOAD`). Linux-only — wraps the ioctl. The module

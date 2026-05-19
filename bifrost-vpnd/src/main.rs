@@ -13,6 +13,8 @@
 mod config;
 mod egress;
 mod lease_store;
+#[cfg(all(feature = "tun", target_os = "linux"))]
+mod tun_dev;
 mod tun_offload;
 
 use anyhow::{Context, Result};
