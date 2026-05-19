@@ -76,7 +76,18 @@ pub struct MeshStream {
     sid: StreamId,
     rx: mpsc::Receiver<StreamEvent>,
     reliability: Arc<Mutex<Reliability>>,
-    /// Outstanding Data-send future from poll_write.
+    /// Outstanding Data-send future from poll_write. We deliberately
+    /// hold exactly one — naively pipelining N futures here looked
+    /// attractive (4-MB reliability window divided by ~64-KB chunks)
+    /// but stalls the stream the moment the application stops writing,
+    /// because nothing polls the queued futures until the next
+    /// poll_write / poll_flush call. The single-fut design lets ARQ
+    /// handle backpressure cleanly and, in practice, already saturates
+    /// the link: real-WAN testing 2026-05-18 confirmed bifrost-SOCKS5
+    /// matches raw TCP single-stream throughput on the same link
+    /// (~47 Mbit/s on the UA↔NL Oracle hop, where iperf3 itself
+    /// reports ~48 Mbit/s) — the per-stream ceiling is CUBIC + WAN
+    /// loss, not us.
     write_fut: Option<SendFut>,
     /// Close-send future for poll_shutdown.
     close_fut: Option<SendFut>,
