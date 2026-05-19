@@ -392,9 +392,46 @@ Reliability-слой трактует Data и Close как единое sequence
   ответившего успехом. `race_exits = 1` отключает racing;
   `race_timeout_ms` ограничивает гонку.
 
+## Производительность
+
+Реальный WAN-замер, 2026-05-18 / 19, single-stream throughput с
+домашнего UA WSL2-клиента до Oracle Cloud NL exit (~55 мс RTT,
+~50 Mbit/s aggregate TCP cap — подтверждено `iperf3 -P 8`):
+
+| путь | iter 1 (стартовый) | iter 10 (сейчас) | raw TCP |
+|---|---:|---:|---:|
+| SOCKS5 single-stream | 33 Mbit/s | **45 Mbit/s** (92% от raw TCP) | 48 Mbit/s |
+| L3 VPN single-stream | 0.9 Mbit/s + 25 MB timeouts | **40 Mbit/s** (80% от raw TCP) | 48 Mbit/s |
+| VPN p50 latency | 575 мс | **151 мс** | — |
+| VPN sustained 20 с | 3 chunks | **43 chunks** | — |
+
+Десять итераций подняли L3 VPN с «еле живой» до ~80% raw TCP на
+той же линии. Полный путь с бенчмарками и trade-off'ами на каждой
+итерации — в [HISTORY.md](HISTORY.md). Текущий потолок — сама WAN,
+не bifrost; графики и сырые данные —
+[real-WAN-репорт](https://github.com/AlexMelanFromRingo/bifrost/tree/master/bifrost-wan-test-2026-05-18).
+
+Главные конфигурируемые ручки под throughput:
+
+* **`MAX_PARALLEL_LINKS_PER_PEER`** в `norn-rs::router` (по умолчанию 8).
+  Перечисли тот же `tcp://host:port` URI N раз в `[node].peers` —
+  норн откроет N параллельных TCP/QUIC к этому peer'у. Каждое со
+  своим CUBIC cwnd; round-robin в `send_to_peer` агрегирует. Самый
+  большой win на per-packet-pipeline нагрузках (L3 VPN).
+* **`MAX_RX_BUF_CAP`** в `bifrost-core::reliability` (по умолчанию 32 MB).
+  Окно reliability на поток — автотюнится с 256 KB к 2 × BDP.
+  Затрагивает SOCKS5 / stream-трафик; `Frame::Datagram` fast-path
+  у `bifrost-vpnd` его минует.
+* **Coalescing-окно** в `bifrost-vpnd::egress`
+  (`COALESCE_DRAIN_TIMEOUT = 500 µs`,
+  `MAX_COALESCED_PACKETS = 16`). Батчит IP-пакеты в одну
+  Datagram-фрейм для L3 VPN.
+
 ## Roadmap
 
-* Android NDK / iOS кросс-сборки для мобильных клиентов
+Полный список следующих шагов — в [ROADMAP.md](ROADMAP.md)
+(kernel-side GSO/GRO на TUN, sendmmsg-батчинг, multi-core
+crypto-pool, Android NDK).
 
 ## Известные ограничения
 
