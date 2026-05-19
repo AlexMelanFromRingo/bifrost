@@ -159,6 +159,16 @@ impl LeaseStore {
             }).collect(),
         };
         let body = serde_json::to_vec_pretty(&file).context("serialising lease store")?;
+        // Ensure the parent directory exists. Operators often point
+        // `lease_persistence_path` at e.g. `/var/lib/bifrost/leases.json`;
+        // on a fresh deploy that directory may not yet be created.
+        // `create_dir_all` is a no-op if the path already exists.
+        if let Some(parent) = self.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating lease-store parent dir {:?}", parent))?;
+        }
         let tmp = self.path.with_extension("tmp");
         // Truncate-and-write the .tmp; rename onto the real path.
         let mut f = std::fs::OpenOptions::new()
@@ -385,5 +395,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// Operators usually point `lease_persistence_path` at something
+    /// like `/var/lib/bifrost/leases.json`. On a fresh deploy that
+    /// directory may not exist yet — the first `save()` would
+    /// otherwise fail with ENOENT on the `.tmp` open. Verify
+    /// `save()` creates the parent dir transparently.
+    #[test]
+    fn save_creates_missing_parent_dir() {
+        let tmpdir = tempdir_pathbuf();
+        // Aim at a NESTED subdir that doesn't exist yet.
+        let path = tmpdir.join("missing-subdir").join("leases.json");
+        assert!(!path.parent().unwrap().exists());
+        let mut store = LeaseStore::new(&path);
+        store.insert(
+            peer(0x42),
+            Lease { v4: Ipv4Addr::new(10, 55, 0, 7), v6: None },
+        );
+        store.save().expect("save must mkdir -p the parent");
+        assert!(path.exists());
+        // Round-trip: a fresh store loads what we wrote.
+        let mut back = LeaseStore::new(&path);
+        let loaded = back.load().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].1.v4, Ipv4Addr::new(10, 55, 0, 7));
     }
 }
