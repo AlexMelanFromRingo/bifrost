@@ -30,3 +30,10 @@ toml.workspace = true
 clap.workspace = true
 hex.workspace = true
 tun2 = { version = "3", features = ["async"], optional = true }
+
+# Foundation for kernel-side TUN offload (`IFF_VNET_HDR` +
+# `TUNSETOFFLOAD`). Linux-only — wraps the ioctl. The module
+# (`src/tun_offload.rs`) is unconditional so its unit tests run
+# everywhere; the actual ioctl is `#[cfg(target_os = "linux")]`.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
