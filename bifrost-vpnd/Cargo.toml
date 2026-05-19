@@ -43,3 +43,9 @@ hex.workspace = true
 # everywhere; the actual ioctl is `#[cfg(target_os = "linux")]`.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# Constructing a real PacketConn in admin module tests needs an
+# ed25519 SigningKey. Workspace-level dep so the version is pinned
+# in lockstep with norn-rs's own copy.
+ed25519-dalek.workspace = true

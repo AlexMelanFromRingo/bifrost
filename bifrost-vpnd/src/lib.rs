@@ -20,6 +20,7 @@
 //!   external tools can validate / generate configs without
 //!   depending on the daemon binary.
 
+pub mod admin;
 pub mod config;
 pub mod egress;
 pub mod lease_store;
