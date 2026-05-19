@@ -396,9 +396,48 @@ What this protocol does **not** protect:
   the first success. `race_exits = 1` disables; `race_timeout_ms`
   caps the race.
 
+## Performance
+
+Real-WAN benchmark, 2026-05-18 / 19, single-stream throughput from a
+residential UA WSL2 client to an Oracle Cloud NL exit (~55 ms RTT,
+~50 Mbit/s aggregate TCP cap on the path — confirmed by `iperf3 -P 8`):
+
+| path | iter 1 (initial) | iter 10 (current) | underlying TCP raw |
+|---|---:|---:|---:|
+| SOCKS5 single-stream | 33 Mbit/s | **45 Mbit/s** (92% of raw TCP) | 48 Mbit/s |
+| L3 VPN single-stream | 0.9 Mbit/s + 25 MB timeouts | **40 Mbit/s** (80% of raw TCP) | 48 Mbit/s |
+| VPN p50 latency | 575 ms | **151 ms** | — |
+| VPN sustained 20 s | 3 chunks | **43 chunks** | — |
+
+Ten optimisation iterations took L3 VPN from "barely usable" to
+~80% of raw TCP on the same link. The full journey, with
+benchmarks and trade-offs per iteration, is in
+[HISTORY.md](HISTORY.md). The current bottleneck is the WAN itself,
+not bifrost; see the
+[real-WAN test report](https://github.com/AlexMelanFromRingo/bifrost/tree/master/bifrost-wan-test-2026-05-18)
+in the same testbed for graphs.
+
+Configurable knobs that matter most for throughput:
+
+* **`MAX_PARALLEL_LINKS_PER_PEER`** in `norn-rs::router` (default 8).
+  List the same `tcp://host:port` URI N times under `[node].peers`
+  to bond N parallel TCP/QUIC connections per peer. Each runs its
+  own CUBIC cwnd; round-robin in `send_to_peer` aggregates them.
+  Biggest single win on per-packet-pipeline workloads (L3 VPN).
+* **`MAX_RX_BUF_CAP`** in `bifrost-core::reliability` (default 32 MB).
+  Per-stream reliability window — autotunes from 256 KB toward
+  2 × BDP. Affects SOCKS5 / stream-based traffic only; the
+  `Frame::Datagram` fast path used by `bifrost-vpnd` skips it.
+* **Coalescing window** in `bifrost-vpnd::egress`
+  (`COALESCE_DRAIN_TIMEOUT = 500 µs`,
+  `MAX_COALESCED_PACKETS = 16`). Batches IP packets into one
+  Datagram frame for L3 VPN.
+
 ## Roadmap
 
-* Android NDK / iOS cross-builds for mobile clients
+See [ROADMAP.md](ROADMAP.md) for the next-step list (kernel-side
+GSO/GRO on TUN, sendmmsg batching, multi-core crypto pool, Android
+NDK builds).
 
 ## Known limitations
 
