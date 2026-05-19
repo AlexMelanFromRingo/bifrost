@@ -188,6 +188,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bifrost-ffi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bifrost-core",
+ "bifrost-vpnd",
+ "hex",
+ "libc",
+ "norn-rs",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bifrost-socks5d"
 version = "0.1.0"
 dependencies = [

@@ -191,6 +191,7 @@ async fn read_framed<R: AsyncRead + Unpin>(
 /// Writes one length-prefixed packet to a mesh stream. Mirrors the
 /// format consumed by `read_framed`. `pkt` must be non-empty and
 /// no larger than `MAX_RELAYED_PACKET`.
+#[cfg(feature = "tun")]
 async fn write_framed<W: AsyncWrite + Unpin>(
     w: &mut W, pkt: &[u8],
 ) -> std::io::Result<()> {
@@ -1110,14 +1111,49 @@ pub async fn start_client(
     tun_name: String,
     install_default_route: bool,
 ) -> Result<()> {
+    let (mesh, hello) = client_handshake(mux.clone(), exit_peer).await?;
+    let dev = crate::tun_dev::OffloadTun::open(
+        &tun_name,
+        hello.mtu,
+        crate::tun_dev::OffloadTun::DEFAULT_OFFLOAD,
+    )
+    .with_context(|| format!("creating client egress TUN {tun_name}"))?;
+    info!(
+        "egress client: tun={tun_name} mtu={} offload_active={}",
+        hello.mtu, dev.offload_active()
+    );
+    configure_client_kernel(
+        &tun_name,
+        hello.allocated_v4,
+        hello.v4_prefix,
+        hello.gateway_v4,
+        hello.allocated_v6,
+        hello.v6_prefix,
+        hello.gateway_v6,
+        install_default_route,
+    )?;
+    let (tun_reader, tun_writer) = tokio::io::split(dev);
+    run_client_pump(tun_reader, tun_writer, mux, exit_peer, mesh).await
+}
+
+/// Run the client → exit handshake: wait for the peer to be
+/// reachable on the mesh, open an Egress stream, await the
+/// OpenAck, and read the framed [`EgressHello`]. Returns the live
+/// control stream + the parsed hello. Used by `start_client` and
+/// by `bifrost-ffi` (mobile shim).
+pub async fn client_handshake(
+    mux: Arc<MeshMux>,
+    exit_peer: bifrost_core::PubKey,
+) -> Result<(bifrost_core::stream::MeshStream, EgressHello)> {
     info!(
         "egress client: opening tunnel to exit {}",
         hex::encode(&exit_peer[..8])
     );
-    // Wait until the underlying transport reports a connection to the
-    // exit peer (handshake done, session manager has the entry). Without
-    // this poll, mux.open's session-wait races the very first dial and
-    // burns its retry budget on a connection that didn't exist yet.
+    // Wait until the underlying transport reports a connection to
+    // the exit peer (handshake done, session manager has the entry).
+    // Without this poll, mux.open's session-wait races the very
+    // first dial and burns its retry budget on a connection that
+    // didn't exist yet.
     let wait_started = std::time::Instant::now();
     loop {
         let stats = mux.conn().get_peer_stats();
@@ -1127,10 +1163,6 @@ pub async fn start_client(
                 hex::encode(&exit_peer[..8]),
                 wait_started.elapsed()
             );
-            // The peer-stats entry appears once handle_conn starts; the
-            // ChaCha20 session takes a few SessionInit/Response round-
-            // trips after that. Sleeping briefly avoids burning the
-            // mux.open retry budget on guaranteed-fail attempts.
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             break;
         }
@@ -1153,7 +1185,6 @@ pub async fn start_client(
     if ack != 0 {
         anyhow::bail!("exit refused egress with code 0x{ack:02x}");
     }
-    // Read the EgressHello — framed like everything else on this stream.
     let mut hello_buf = [0u8; MAX_RELAYED_PACKET];
     let hello_len = read_framed(&mut mesh, &mut hello_buf)
         .await
@@ -1165,36 +1196,37 @@ pub async fn start_client(
         );
     }
     let hello = EgressHello::decode(&hello_buf[..EGRESS_HELLO_SIZE])?;
-    let v6_desc = hello.allocated_v6
+    let v6_desc = hello
+        .allocated_v6
         .map(|v6| format!(" + {v6}/{}", hello.v6_prefix))
         .unwrap_or_default();
     info!(
         "egress client: allocated {}{} (v4 gw={})",
         hello.allocated_v4, v6_desc, hello.gateway_v4
     );
+    Ok((mesh, hello))
+}
 
-    let dev = crate::tun_dev::OffloadTun::open(
-        &tun_name,
-        hello.mtu,
-        crate::tun_dev::OffloadTun::DEFAULT_OFFLOAD,
-    )
-    .with_context(|| format!("creating client egress TUN {tun_name}"))?;
-    info!(
-        "egress client: tun={tun_name} mtu={} offload_active={}",
-        hello.mtu, dev.offload_active()
-    );
-    configure_client_kernel(
-        &tun_name,
-        hello.allocated_v4,
-        hello.v4_prefix,
-        hello.gateway_v4,
-        hello.allocated_v6,
-        hello.v6_prefix,
-        hello.gateway_v6,
-        install_default_route,
-    )?;
-
-    let (mut tun_reader, tun_writer) = tokio::io::split(dev);
+/// Spawn the client-side data plane over a caller-provided TUN
+/// device split into `AsyncRead` / `AsyncWrite` halves. Used by
+/// `start_client` (with an `OffloadTun`) and by `bifrost-ffi`
+/// (with the host-provided VpnService / NEPacketTunnelProvider fd).
+///
+/// `mesh` is the control stream from `client_handshake`; we hold
+/// it open in a background task and surface its EOF as a log line.
+/// The two real data tasks are spawned and own the tunnel from here
+/// on — this function returns once they're scheduled.
+pub async fn run_client_pump<R, W>(
+    mut tun_reader: R,
+    tun_writer: W,
+    mux: Arc<MeshMux>,
+    exit_peer: bifrost_core::PubKey,
+    mesh: bifrost_core::stream::MeshStream,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let tun_writer = Arc::new(tokio::sync::Mutex::new(tun_writer));
 
     // Register the IP-packet datagram channel for inbound traffic
@@ -1252,13 +1284,9 @@ pub async fn start_client(
     // them one-by-one to the TUN.
     let mux_for_tun = mux.clone();
     tokio::spawn(async move {
-        // Slots for one batch. `slots` keeps owned packet bytes so
-        // PacketBatchIter-style borrowing inside the loop is clean.
         let mut buf = vec![0u8; 65536];
         let mut slots: Vec<Vec<u8>> = Vec::with_capacity(MAX_COALESCED_PACKETS);
         loop {
-            // First packet: blocking read so an idle tunnel doesn't
-            // spin.
             let n = match tun_reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
@@ -1267,10 +1295,6 @@ pub async fn start_client(
             if let Some(pkt) = extract_routable(&buf[..n]) {
                 slots.push(pkt.to_vec());
             }
-
-            // Opportunistic drain: pull subsequent packets until we
-            // hit the count / byte budget OR the timeout fires
-            // (no more packets ready in the kernel TUN queue).
             let mut bytes_acc: usize = slots.iter().map(|p| p.len() + 2).sum::<usize>() + 1;
             while slots.len() < MAX_COALESCED_PACKETS && bytes_acc < COALESCE_BYTE_BUDGET {
                 let next = tokio::time::timeout(
@@ -1278,8 +1302,8 @@ pub async fn start_client(
                     tun_reader.read(&mut buf),
                 ).await;
                 let n2 = match next {
-                    Ok(Ok(0)) | Ok(Err(_)) => { slots.clear(); break; } // EOF on TUN
-                    Err(_) => break, // 100 μs elapsed, no more packets
+                    Ok(Ok(0)) | Ok(Err(_)) => { slots.clear(); break; }
+                    Err(_) => break,
                     Ok(Ok(n)) => n,
                 };
                 if let Some(pkt) = extract_routable(&buf[..n2]) {
@@ -1287,14 +1311,9 @@ pub async fn start_client(
                     slots.push(pkt.to_vec());
                 }
             }
-
             if slots.is_empty() {
-                // The trailing read may have produced only chatter we
-                // filtered out — wait for the next routable packet.
                 continue;
             }
-
-            // Borrowed-slice view for the encoder.
             let refs: Vec<&[u8]> = slots.iter().map(|v| v.as_slice()).collect();
             let payload = encode_packet_batch(&refs);
             if let Err(e) = mux_for_tun
@@ -1312,6 +1331,7 @@ pub async fn start_client(
     // just log and let the TUN sit (process exit cleans up properly).
     // A future revision could trigger a graceful TUN teardown.
     tokio::spawn(async move {
+        let mut mesh = mesh;
         let mut throwaway = Vec::new();
         let _ = mesh.read_to_end(&mut throwaway).await;
         warn!("egress client: control stream closed by exit");
@@ -1394,6 +1414,7 @@ fn is_routable_dst(version_nibble: u8, pkt: &[u8]) -> bool {
 }
 
 #[cfg(not(feature = "tun"))]
+#[allow(clippy::too_many_arguments)] // mirrors the real `start_exit` signature so callers don't branch
 pub async fn start_exit(
     _mux: Arc<MeshMux>,
     _accept_rx: mpsc::Receiver<AcceptedStream>,
