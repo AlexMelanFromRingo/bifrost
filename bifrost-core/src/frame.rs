@@ -41,6 +41,15 @@ pub enum FrameKind {
     OpenAck = 0x05,
     /// Cumulative ACK + advertised receive window (v2 reliability).
     Ack     = 0x06,
+    /// Unreliable datagram, no per-stream ARQ. Carries a 1-byte
+    /// channel tag so multiple subsystems (vpnd, future apps) can
+    /// share the mux without colliding. Use this for traffic where
+    /// the upper layer is itself responsible for reliability
+    /// (e.g. tunnelled IP packets where TCP/QUIC handles
+    /// retransmits end-to-end). Skipping the stream layer avoids
+    /// the per-packet single-fut serialisation that caps L3 VPN
+    /// throughput at ~5 Mbit/s on a real WAN.
+    Datagram = 0x07,
 }
 
 impl FrameKind {
@@ -52,6 +61,7 @@ impl FrameKind {
             0x04 => Self::Reset,
             0x05 => Self::OpenAck,
             0x06 => Self::Ack,
+            0x07 => Self::Datagram,
             _ => return None,
         })
     }
@@ -182,9 +192,18 @@ pub enum Frame {
     /// `win` is the bytes of receive buffer the receiver can still
     /// absorb without dropping. The sender uses `win` for flow control.
     Ack { sid: StreamId, ack: u32, win: u32 },
+    /// Unreliable channel-tagged datagram. The `sid` field is reused
+    /// as a (peer-scoped) channel tag — only the low byte is
+    /// meaningful, the upper 24 bits are reserved for future use and
+    /// must be zero on the wire today. No seq, no ACK, no per-stream
+    /// state in MeshMux — the read loop dispatches to a per-channel
+    /// receiver registered via `MeshMux::register_datagram_channel`.
+    Datagram { channel: u8, payload: Vec<u8> },
 }
 
 impl Frame {
+    /// Stream id, or for Datagrams the zero-padded channel tag —
+    /// callers wanting the channel byte should use `channel()` instead.
     pub fn sid(&self) -> StreamId {
         match self {
             Self::Open { sid, .. }
@@ -193,6 +212,7 @@ impl Frame {
             | Self::Reset { sid, .. }
             | Self::OpenAck { sid, .. }
             | Self::Ack { sid, .. } => *sid,
+            Self::Datagram { channel, .. } => *channel as StreamId,
         }
     }
 
@@ -204,6 +224,7 @@ impl Frame {
             Self::Reset { .. } => FrameKind::Reset,
             Self::OpenAck { .. } => FrameKind::OpenAck,
             Self::Ack { .. } => FrameKind::Ack,
+            Self::Datagram { .. } => FrameKind::Datagram,
         }
     }
 
@@ -224,6 +245,10 @@ impl Frame {
             Self::Ack { ack, win, .. } => {
                 out.extend_from_slice(&ack.to_be_bytes());
                 out.extend_from_slice(&win.to_be_bytes());
+            }
+            Self::Datagram { payload, .. } => {
+                // sid already encoded above as channel-in-low-byte.
+                out.extend_from_slice(payload);
             }
         }
         Ok(out)
@@ -272,6 +297,15 @@ impl Frame {
                 let ack = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
                 let win = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
                 Self::Ack { sid, ack, win }
+            }
+            FrameKind::Datagram => {
+                // sid stores the channel tag in the low byte; reject
+                // values that have non-zero high bits so we can
+                // repurpose them later.
+                if sid > 0xff {
+                    bail!("datagram: channel high bits set (got 0x{sid:08x}, want ≤ 0xff)");
+                }
+                Self::Datagram { channel: sid as u8, payload: body.to_vec() }
             }
         })
     }
@@ -372,5 +406,32 @@ mod tests {
         bytes.push(200);   // len=200 but no body follows
         bytes.extend_from_slice(&[0u8; 2]); // port
         assert!(Frame::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn datagram_roundtrip() {
+        for f in [
+            Frame::Datagram { channel: 0x01, payload: b"hello world".to_vec() },
+            Frame::Datagram { channel: 0xff, payload: vec![] },
+            Frame::Datagram { channel: 0x42, payload: (0..2000).map(|i| i as u8).collect() },
+        ] {
+            let bytes = f.encode().unwrap();
+            let back = Frame::decode(&bytes).unwrap();
+            assert_eq!(f, back, "round-trip mismatch for {f:?}");
+        }
+    }
+
+    #[test]
+    fn datagram_rejects_reserved_high_bits() {
+        // Craft a Datagram-kind frame whose sid has the upper 24 bits
+        // set — must be rejected so we can repurpose them later.
+        let bytes = vec![
+            PROTO_VERSION,
+            FrameKind::Datagram as u8,
+            0x00, 0x00, 0x01, 0x42, // sid = 0x00000142 > 0xff
+        ];
+        let err = Frame::decode(&bytes).expect_err("should reject reserved bits");
+        assert!(format!("{err}").contains("channel high bits set"),
+            "unexpected error: {err}");
     }
 }

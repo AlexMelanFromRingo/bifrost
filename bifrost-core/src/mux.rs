@@ -63,11 +63,37 @@ impl StreamTable {
     }
 }
 
+/// Per-channel handler for `Frame::Datagram` frames. Each registered
+/// channel gets one sender; the read loop dispatches by the 1-byte
+/// channel tag carried in the frame's `sid` low byte.
+type DatagramSender = mpsc::Sender<DatagramRecv>;
+
+/// Inbound datagram delivered to a registered channel handler. Mirrors
+/// `Frame::Datagram` plus the source pub-key the PacketConn already
+/// authenticated for us.
+#[derive(Debug, Clone)]
+pub struct DatagramRecv {
+    pub from: PubKey,
+    pub payload: Vec<u8>,
+}
+
 pub struct MeshMux {
     conn: Arc<PacketConn>,
     table: Arc<Mutex<StreamTable>>,
     accept_tx: mpsc::Sender<AcceptedStream>,
+    /// Channel-tag → handler. Registered once at startup by subsystems
+    /// (vpnd uses `DATAGRAM_CHANNEL_EGRESS`); read_loop snapshots a
+    /// clone per inbound Datagram so registration is lock-free on the
+    /// hot path.
+    datagram_handlers: Arc<Mutex<HashMap<u8, DatagramSender>>>,
 }
+
+/// Channel tag for `bifrost-vpnd`'s raw IP-packet fast path. Each TUN
+/// packet rides a `Frame::Datagram { channel: DATAGRAM_CHANNEL_EGRESS }`
+/// directly through MeshMux's read loop, skipping the per-stream ARQ
+/// in `MeshStream`. Tags ≤ 0xff are reserved; new subsystems should
+/// pick a stable value here so we can't collide across deployments.
+pub const DATAGRAM_CHANNEL_EGRESS: u8 = 0x01;
 
 /// One newly-arrived `Open` from a peer, ready to be turned into a stream.
 pub struct AcceptedStream {
@@ -86,10 +112,57 @@ impl MeshMux {
             conn: conn.clone(),
             table: Arc::new(Mutex::new(StreamTable::default())),
             accept_tx,
+            datagram_handlers: Arc::new(Mutex::new(HashMap::new())),
         });
         tokio::spawn(read_loop(mux.clone()));
         tokio::spawn(retransmit_tick(mux.clone()));
         (mux, accept_rx)
+    }
+
+    /// Subscribe to inbound `Frame::Datagram` frames carrying `channel`.
+    /// Returns a `Receiver<DatagramRecv>` the caller drains; the channel
+    /// is bounded so a slow consumer back-pressures the mux read loop
+    /// (preferable to unbounded growth — VPN packets are best-effort
+    /// anyway, the kernel's TCP/QUIC inside the tunnel handles loss).
+    ///
+    /// Re-registration on an existing tag replaces the previous handler;
+    /// callers must call this once at startup. Returns an error if
+    /// `channel` is 0 (reserved as a "no datagrams" sentinel).
+    pub fn register_datagram_channel(
+        self: &Arc<Self>,
+        channel: u8,
+        capacity: usize,
+    ) -> Result<mpsc::Receiver<DatagramRecv>> {
+        if channel == 0 {
+            anyhow::bail!("datagram channel 0 is reserved");
+        }
+        let (tx, rx) = mpsc::channel(capacity);
+        let mut h = self.datagram_handlers.lock()
+            .expect("datagram_handlers mutex poisoned");
+        h.insert(channel, tx);
+        Ok(rx)
+    }
+
+    /// Send one datagram to `peer` on `channel`. Returns when the
+    /// PacketConn has accepted the bytes for transmission; no per-stream
+    /// state is touched and there is no retransmit — the caller is
+    /// responsible for any reliability they need on top.
+    ///
+    /// Cheap relative to `mux.send_frame(Frame::Data {...})`: skips
+    /// reliability bookkeeping, no seq allocation, no window check, no
+    /// retransmit-task entry. The hot path for L3 VPN traffic.
+    pub async fn send_datagram(
+        &self,
+        peer: &PubKey,
+        channel: u8,
+        payload: &[u8],
+    ) -> Result<()> {
+        if channel == 0 {
+            anyhow::bail!("datagram channel 0 is reserved");
+        }
+        let frame = Frame::Datagram { channel, payload: payload.to_vec() };
+        let bytes = frame.encode()?;
+        write_with_session_wait(&self.conn, peer, &bytes).await
     }
 
     pub fn conn(&self) -> &Arc<PacketConn> {
@@ -209,6 +282,49 @@ async fn read_loop(mux: Arc<MeshMux>) {
             Frame::Reset { sid, code } => {
                 signal(&mux, &peer, sid, StreamEvent::Reset(code)).await;
                 mux.drop_stream(&peer, sid);
+            }
+            Frame::Datagram { channel, payload } => {
+                // Snapshot the handler clone with the lock held briefly
+                // to avoid blocking the read loop on a slow consumer.
+                let handler = {
+                    let h = mux.datagram_handlers
+                        .lock()
+                        .expect("datagram_handlers mutex poisoned");
+                    h.get(&channel).cloned()
+                };
+                if let Some(tx) = handler {
+                    // Use try_send so a wedged subsystem can't stall the
+                    // mux read loop, taking the whole node down with it.
+                    // Datagrams are best-effort by contract — dropped
+                    // packets are the upper layer's problem (TCP/QUIC
+                    // inside a VPN tunnel handles loss end-to-end).
+                    let recv = DatagramRecv { from: peer, payload };
+                    if let Err(e) = tx.try_send(recv) {
+                        match e {
+                            mpsc::error::TrySendError::Full(_) => {
+                                trace!(
+                                    "mux: datagram channel {} full, dropping packet from {}",
+                                    channel, hex::encode(&peer[..8])
+                                );
+                            }
+                            mpsc::error::TrySendError::Closed(_) => {
+                                debug!(
+                                    "mux: datagram channel {} receiver gone — unregistering",
+                                    channel
+                                );
+                                let mut h = mux.datagram_handlers
+                                    .lock()
+                                    .expect("datagram_handlers mutex poisoned");
+                                h.remove(&channel);
+                            }
+                        }
+                    }
+                } else {
+                    trace!(
+                        "mux: dropping datagram from {} on unregistered channel {}",
+                        hex::encode(&peer[..8]), channel
+                    );
+                }
             }
         }
     }
