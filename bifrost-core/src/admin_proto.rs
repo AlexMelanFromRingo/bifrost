@@ -34,6 +34,14 @@ pub enum AdminRequest {
     /// race_timeout_ms). Private key, listen addresses, mode, and
     /// admin/metrics endpoints still require a full restart.
     Reload,
+    /// List every sticky IP lease currently held by an exit (or the
+    /// one assigned to a client). vpnd-only — socks5d responds with
+    /// an empty list.
+    Leases,
+    /// Drop the sticky lease for one peer, freeing its IP slot for
+    /// the next handshake — mirrors HTTP DELETE semantics. vpnd-only
+    /// on the exit side. `pub_key` is 64 hex chars.
+    EvictLease { pub_key: String },
 }
 
 /// Uniform envelope for every response. Either `data` holds the
@@ -115,6 +123,41 @@ pub struct ReloadResponse {
     pub exits_skipped_mdns: usize,
     pub race_exits: Option<usize>,
     pub race_timeout_ms: Option<u64>,
+}
+
+/// One row in the `Leases` payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaseRow {
+    /// Peer that holds this lease (64-char ed25519 pub_key).
+    pub pub_key: String,
+    /// IPv4 lease in dotted notation, e.g. "10.55.0.2".
+    pub v4: String,
+    /// IPv6 lease if dual-stack was negotiated, else null.
+    pub v6: Option<String>,
+    /// True when the peer's `MeshStream` is currently up; false for
+    /// disconnected leases still held by the persistence layer.
+    pub live: bool,
+}
+
+/// Payload for `Leases`. `total` separates "in memory" from
+/// "persisted on disk" — they diverge when a peer disconnects but
+/// the lease is kept for sticky reconnect.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LeasesResponse {
+    pub rows: Vec<LeaseRow>,
+    pub persistence_path: Option<String>,
+}
+
+/// Payload for `EvictLease`. `evicted` is true iff the peer had an
+/// active lease at the time of the call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvictLeaseResponse {
+    pub pub_key: String,
+    pub evicted: bool,
+    /// What the lease *was* (rendered as dotted/colon strings)
+    /// — present when `evicted = true`, for operator audit.
+    pub freed_v4: Option<String>,
+    pub freed_v6: Option<String>,
 }
 
 #[cfg(test)]

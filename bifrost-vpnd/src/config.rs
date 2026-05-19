@@ -86,6 +86,12 @@ pub struct ExitSettings {
     /// public inspection either).
     #[serde(default)]
     pub lease_persistence_path: String,
+
+    /// UNIX socket for the vpnd admin RPC (Status / Peers / Leases
+    /// / EvictLease). `bifrost-ctl --socket <this>` talks to it.
+    /// Empty disables the admin server entirely.
+    #[serde(default = "default_admin_socket_exit")]
+    pub admin_socket: String,
 }
 
 impl Default for ExitSettings {
@@ -98,6 +104,7 @@ impl Default for ExitSettings {
             v6_pool_prefix: default_v6_pool_prefix(),
             egress_iface: default_egress_iface(),
             lease_persistence_path: String::new(),
+            admin_socket: default_admin_socket_exit(),
         }
     }
 }
@@ -107,6 +114,8 @@ fn default_pool_base() -> Ipv4Addr { Ipv4Addr::new(10, 55, 0, 0) }
 fn default_pool_prefix() -> u8 { 24 }
 fn default_v6_pool_prefix() -> u8 { 64 }
 fn default_egress_iface() -> String { "eth0".to_string() }
+fn default_admin_socket_exit() -> String { "/tmp/bifrost-vpnd-exit.sock".to_string() }
+fn default_admin_socket_client() -> String { "/tmp/bifrost-vpnd-client.sock".to_string() }
 
 #[derive(Debug, Deserialize)]
 pub struct ClientSettings {
@@ -119,6 +128,11 @@ pub struct ClientSettings {
     /// a system-wide change and the operator should opt in.
     #[serde(default)]
     pub install_default_route: bool,
+    /// UNIX socket for the vpnd admin RPC on the client side. Mirrors
+    /// `exit.admin_socket` — `bifrost-ctl` can hit either end. Empty
+    /// disables the admin server.
+    #[serde(default = "default_admin_socket_client")]
+    pub admin_socket: String,
 }
 
 impl Default for ClientSettings {
@@ -126,6 +140,7 @@ impl Default for ClientSettings {
         Self {
             tun_name: default_egress_tun(),
             install_default_route: false,
+            admin_socket: default_admin_socket_client(),
         }
     }
 }
@@ -229,6 +244,11 @@ pool_prefix  = 24
 # v6_pool_base   = "fd55:0:0:1::"
 # v6_pool_prefix = 64
 egress_iface = "eth0"
+# Persist (peer → IP) so a returning client lands on the same lease
+# after the exit restarts. Empty disables persistence.
+# lease_persistence_path = "/var/lib/bifrost/leases.json"
+# bifrost-ctl admin socket (Status / Peers / Leases / EvictLease).
+admin_socket = "/tmp/bifrost-vpnd-exit.sock"
 
 [node]
 {body}"#
@@ -243,6 +263,8 @@ tun_name              = "bifrost-eg0"
 # Hijack the system default route. Off by default; turn on once you
 # trust the exit operator to see every byte of outbound traffic.
 install_default_route = false
+# bifrost-ctl admin socket on the client side.
+admin_socket          = "/tmp/bifrost-vpnd-client.sock"
 
 [egress]
 mode = "exit"

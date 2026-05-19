@@ -105,6 +105,12 @@ impl LeaseStore {
         !self.path.as_os_str().is_empty()
     }
 
+    /// Path as a string for log / admin-payload rendering. Returns
+    /// the empty string when persistence is disabled.
+    pub fn path_display(&self) -> String {
+        self.path.to_string_lossy().into_owned()
+    }
+
     /// Pull `(peer, lease)` pairs out of the store. Returns an
     /// empty vec when the file doesn't exist, the path is empty,
     /// or the file is unparseable (the caller is expected to log

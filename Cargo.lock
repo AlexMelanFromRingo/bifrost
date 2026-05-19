@@ -229,6 +229,7 @@ dependencies = [
  "anyhow",
  "bifrost-core",
  "clap",
+ "ed25519-dalek",
  "hex",
  "libc",
  "norn-rs",

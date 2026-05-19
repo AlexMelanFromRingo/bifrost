@@ -209,6 +209,17 @@ fn dispatch(req: AdminRequest, state: &AdminState) -> AdminResponse {
         },
 
         AdminRequest::Reload => reload(state),
+
+        // Lease management is a bifrost-vpnd concept; socks5d has no
+        // address pool. Respond with an empty list / not-applicable
+        // so cross-daemon ctl tooling can hit either socket without
+        // special-casing the daemon kind.
+        AdminRequest::Leases => AdminResponse::ok(
+            bifrost_core::admin_proto::LeasesResponse::default(),
+        ),
+        AdminRequest::EvictLease { pub_key: _ } => {
+            AdminResponse::err("socks5d has no lease store — connect to bifrost-vpnd's admin socket instead")
+        }
     }
 }
 

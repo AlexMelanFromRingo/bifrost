@@ -123,6 +123,7 @@ async fn run_exit(
         cfg.exit.v6_pool_prefix,
         cfg.exit.egress_iface.clone(),
         cfg.exit.lease_persistence_path.clone(),
+        cfg.exit.admin_socket.clone(),
     )
     .await
 }
@@ -144,6 +145,7 @@ async fn run_client(mux: Arc<MeshMux>, cfg: &VpnConfig) -> Result<()> {
         exit_peer,
         cfg.client.tun_name.clone(),
         cfg.client.install_default_route,
+        cfg.client.admin_socket.clone(),
     )
     .await?;
     futures_park().await;

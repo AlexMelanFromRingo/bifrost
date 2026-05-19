@@ -484,6 +484,12 @@ impl EgressTable {
     pub fn lease_of(&self, peer: &bifrost_core::PubKey) -> Option<Lease> {
         self.lease_by_peer.get(peer).copied()
     }
+
+    /// All `(peer, lease)` pairs currently in the table — used by
+    /// the admin layer for the `Leases` endpoint.
+    pub fn snapshot(&self) -> Vec<(bifrost_core::PubKey, Lease)> {
+        self.lease_by_peer.iter().map(|(p, l)| (*p, *l)).collect()
+    }
 }
 
 pub type SharedTable = Arc<Mutex<EgressTable>>;
@@ -712,6 +718,7 @@ pub async fn start_exit(
     v6_pool_prefix: u8,
     egress_iface: String,
     lease_persistence_path: String,
+    admin_socket: String,
 ) -> Result<()> {
     let pool = Arc::new(Mutex::new(
         AddressPool::new(v4_pool_base, v4_pool_prefix, v6_pool_base, v6_pool_prefix)
@@ -777,6 +784,24 @@ pub async fn start_exit(
     } else {
         info!("lease store: disabled (set [exit].lease_persistence_path to enable)");
     }
+
+    // Bring up the vpnd admin socket before the data plane so an
+    // operator running `bifrost-ctl leases` against a freshly-started
+    // exit sees the reseeded entries immediately, even if no client
+    // has connected yet.
+    crate::admin::spawn_listener(
+        admin_socket.into(),
+        crate::admin::AdminState {
+            conn: mux.conn().clone(),
+            mode: crate::admin::AdminMode::Exit,
+            started_at: std::time::Instant::now(),
+            pool: Some(pool.clone()),
+            table: Some(table.clone()),
+            lease_store: Some(lease_store.clone()),
+            self_lease: None,
+        },
+    )
+    .context("starting vpnd admin socket")?;
 
     let dev = crate::tun_dev::OffloadTun::open(
         &tun_name,
@@ -1110,8 +1135,26 @@ pub async fn start_client(
     exit_peer: [u8; 32],
     tun_name: String,
     install_default_route: bool,
+    admin_socket: String,
 ) -> Result<()> {
     let (mesh, hello) = client_handshake(mux.clone(), exit_peer).await?;
+    let self_lease = Lease {
+        v4: hello.allocated_v4,
+        v6: hello.allocated_v6,
+    };
+    crate::admin::spawn_listener(
+        admin_socket.into(),
+        crate::admin::AdminState {
+            conn: mux.conn().clone(),
+            mode: crate::admin::AdminMode::Client,
+            started_at: std::time::Instant::now(),
+            pool: None,
+            table: None,
+            lease_store: None,
+            self_lease: Some(self_lease),
+        },
+    )
+    .context("starting vpnd admin socket")?;
     let dev = crate::tun_dev::OffloadTun::open(
         &tun_name,
         hello.mtu,
@@ -1435,6 +1478,7 @@ pub async fn start_client(
     _exit_peer: [u8; 32],
     _tun_name: String,
     _install_default_route: bool,
+    _admin_socket: String,
 ) -> Result<()> {
     anyhow::bail!("egress client requires the `tun` feature (rebuild with --features tun)")
 }

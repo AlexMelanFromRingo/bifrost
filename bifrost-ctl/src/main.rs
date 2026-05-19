@@ -7,7 +7,8 @@
 
 use anyhow::{anyhow, Context, Result};
 use bifrost_core::admin_proto::{
-    AdminRequest, AdminResponse, ExitRow, PeerRow, ReloadResponse, StatusResponse,
+    AdminRequest, AdminResponse, EvictLeaseResponse, ExitRow, LeasesResponse, PeerRow,
+    ReloadResponse, StatusResponse,
 };
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -54,6 +55,12 @@ enum Cmd {
     /// race_exits, race_timeout_ms). Mode swaps and listen-address
     /// changes still need a full restart.
     Reload,
+    /// List sticky IP leases held by a bifrost-vpnd exit (or the
+    /// single self-lease on a client). vpnd-only.
+    Leases,
+    /// Drop the sticky lease for one peer so its IP slot is freed
+    /// for the next handshake. pub_key is 64 hex chars.
+    EvictLease { pub_key: String },
 }
 
 #[tokio::main]
@@ -67,6 +74,8 @@ async fn main() -> Result<()> {
         Cmd::ResetPenalty { pub_key } => AdminRequest::ResetPenalty { pub_key: pub_key.clone() },
         Cmd::ResetAllPenalties => AdminRequest::ResetAllPenalties,
         Cmd::Reload => AdminRequest::Reload,
+        Cmd::Leases => AdminRequest::Leases,
+        Cmd::EvictLease { pub_key } => AdminRequest::EvictLease { pub_key: pub_key.clone() },
     };
 
     let response = run_rpc(&cli.socket, &req).await?;
@@ -90,6 +99,8 @@ async fn main() -> Result<()> {
         Cmd::Exits => render_exits(serde_json::from_value(data)?),
         Cmd::Peers => render_peers(serde_json::from_value(data)?),
         Cmd::Reload => render_reload(serde_json::from_value(data)?),
+        Cmd::Leases => render_leases(serde_json::from_value(data)?),
+        Cmd::EvictLease { .. } => render_evict_lease(serde_json::from_value(data)?),
         Cmd::Penalty { .. } | Cmd::ResetPenalty { .. } | Cmd::ResetAllPenalties => {
             // These return small status objects; pretty-print as JSON.
             println!("{}", serde_json::to_string_pretty(&data)?);
@@ -207,6 +218,49 @@ fn render_reload(r: ReloadResponse) {
     }
     if r.exits_skipped_mdns > 0 {
         println!("ignored {} mDNS-discovered candidate(s) (preserved)", r.exits_skipped_mdns);
+    }
+}
+
+fn render_leases(r: LeasesResponse) {
+    if r.rows.is_empty() {
+        println!("(no active leases)");
+        if let Some(p) = r.persistence_path.as_deref() {
+            println!("persistence: {p}");
+        }
+        return;
+    }
+    println!(
+        "{:<20} {:<17} {:<40} {:>6}",
+        "PUB_KEY(8)", "IPv4", "IPv6", "STATUS"
+    );
+    for row in &r.rows {
+        println!(
+            "{:<20} {:<17} {:<40} {:>6}",
+            &row.pub_key[..16.min(row.pub_key.len())],
+            row.v4,
+            row.v6.as_deref().unwrap_or("-"),
+            if row.live { "live" } else { "sticky" }
+        );
+    }
+    if let Some(p) = r.persistence_path.as_deref() {
+        println!();
+        println!("persistence: {p}");
+    }
+}
+
+fn render_evict_lease(r: EvictLeaseResponse) {
+    if r.evicted {
+        let v6 = r.freed_v6.as_deref().map(|s| format!(" + {s}")).unwrap_or_default();
+        println!(
+            "evicted {} (freed {}{v6})",
+            &r.pub_key[..16.min(r.pub_key.len())],
+            r.freed_v4.as_deref().unwrap_or("?"),
+        );
+    } else {
+        println!(
+            "no lease found for {} (already evicted or never had one)",
+            &r.pub_key[..16.min(r.pub_key.len())]
+        );
     }
 }
 
