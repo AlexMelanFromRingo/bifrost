@@ -12,6 +12,7 @@
 
 mod config;
 mod egress;
+mod lease_store;
 mod tun_offload;
 
 use anyhow::{Context, Result};
@@ -125,6 +126,7 @@ async fn run_exit(
         cfg.exit.v6_pool_base,
         cfg.exit.v6_pool_prefix,
         cfg.exit.egress_iface.clone(),
+        cfg.exit.lease_persistence_path.clone(),
     )
     .await
 }

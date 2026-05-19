@@ -73,6 +73,19 @@ pub struct ExitSettings {
     /// in containers; on bare metal something like `wlan0`/`enp4s0`.
     #[serde(default = "default_egress_iface")]
     pub egress_iface: String,
+    /// Where to persist the `peer → lease` mapping so clients
+    /// reconnecting after an exit restart land back on the same
+    /// IPv4/IPv6 lease. Empty (the default) keeps the v0.1
+    /// behaviour: every restart re-allocates fresh slots and
+    /// returning clients may shuffle addresses.
+    ///
+    /// On atomic write we use a `<path>.tmp + rename(2)` dance so
+    /// a power-cut mid-save leaves the prior file intact rather
+    /// than truncating it to garbage. The file is written `0600`
+    /// (it's lease metadata, not secrets — but it's not for
+    /// public inspection either).
+    #[serde(default)]
+    pub lease_persistence_path: String,
 }
 
 impl Default for ExitSettings {
@@ -84,6 +97,7 @@ impl Default for ExitSettings {
             v6_pool_base: None,
             v6_pool_prefix: default_v6_pool_prefix(),
             egress_iface: default_egress_iface(),
+            lease_persistence_path: String::new(),
         }
     }
 }

@@ -124,13 +124,27 @@ a packaging one. Tracking issue:
 <https://github.com/AlexMelanFromRingo/bifrost/issues> (not
 filed yet).
 
-## 6. Persistent crash-recovery for `bifrost-vpnd` leases
+## 6. Persistent crash-recovery for `bifrost-vpnd` leases ✅ done
 
-Today an exit's address pool is in-memory only; restart hands
-out the same `.2 .3 .4 ...` slots and a returning client
-might land on a different IP. Persisting `lease_by_peer` to
-disk (via `bifrost-ctl reload`'s mechanism) would keep
-client-side state stable across exit reboots.
+`bifrost-vpnd/src/lease_store.rs` keeps `(peer_pubkey → lease)`
+in a JSON v1 file that round-trips through `<path>.tmp +
+fsync + rename(2)` so a power-cut mid-save can never truncate
+the prior file. Enable it by setting `exit.lease_persistence_path`
+in the TOML; empty (the default) preserves v0.1 behaviour.
+
+On startup `egress::start_exit` reads the file, calls
+`AddressPool::reserve` for each host index so fresh
+allocations never collide with sticky leases, and reinstates
+`EgressTable::lease_of` so the very first handshake from a
+returning client resumes its previous IPv4/IPv6 pair without
+touching the wire. Disconnect no longer releases the lease —
+sticky-by-default — so a flapping TCP client gets the same
+address across reconnects within a single exit lifetime *and*
+across exit restarts.
+
+Eviction is manual today (delete the file or future
+`bifrost-ctl evict-lease`); auto-expiry by last-seen would be
+a small follow-up but isn't needed for the v0.1 use case.
 
 ## What's *not* on the roadmap
 
