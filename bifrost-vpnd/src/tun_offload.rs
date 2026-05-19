@@ -79,12 +79,33 @@
 use std::io;
 use std::os::fd::AsRawFd;
 
-/// Size of `virtio_net_hdr_v1` on the wire (without `num_buffers`).
-/// Newer kernels emit a 12-byte header by default; the optional
-/// `num_buffers` field bumps it to 14 bytes but only when
-/// `IFF_VNET_HDR` is paired with `TUN_F_NUM_BUFFERS`, which we
-/// don't enable.
-pub const VIRTIO_NET_HDR_LEN: usize = 12;
+/// Default kernel TUN virtio_net_hdr size: 10 bytes.
+///
+/// Layout (matches `struct virtio_net_hdr` in `<linux/virtio_net.h>`):
+///
+/// ```text
+///   u8  flags                  1 byte
+///   u8  gso_type               1 byte
+///   u16 hdr_len                2 bytes
+///   u16 gso_size               2 bytes
+///   u16 csum_start             2 bytes
+///   u16 csum_offset            2 bytes
+///                          ───────────
+///                              10 bytes
+/// ```
+///
+/// The kernel can be asked to use a 12-byte layout (with a trailing
+/// `u16 num_buffers` field, matching `virtio_net_hdr_mrg_rxbuf`)
+/// via `TUNSETVNETHDRSZ`, but the default — and what we need to
+/// match for unmodified `IFF_VNET_HDR` reads/writes — is 10.
+///
+/// History note: earlier revisions of this constant were set to
+/// 12, which caused us to strip two extra bytes from the head of
+/// every TUN read. The wire packet then looked like a malformed
+/// IP header to the receiving exit (IHL nibble shifted into the
+/// version slot), so the kernel silently dropped it — see
+/// the bench session on 2026-05-19.
+pub const VIRTIO_NET_HDR_LEN: usize = 10;
 
 /// `virtio_net_hdr_v1` layout (Linux `include/uapi/linux/virtio_net.h`).
 ///
@@ -243,7 +264,8 @@ mod tests {
     fn virtio_net_hdr_decode_short_buffer_is_none() {
         assert!(VirtioNetHdr::decode(&[]).is_none());
         assert!(VirtioNetHdr::decode(&[0u8; 5]).is_none());
-        assert!(VirtioNetHdr::decode(&[0u8; 11]).is_none());
+        // exactly one byte short of the 10-byte basic layout
+        assert!(VirtioNetHdr::decode(&[0u8; 9]).is_none());
     }
 
     #[test]

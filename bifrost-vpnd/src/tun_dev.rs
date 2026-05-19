@@ -53,7 +53,7 @@ use tokio::io::{unix::AsyncFd, AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{info, warn};
 
 use crate::tun_offload::{
-    offload_flag, try_enable_tun_offload, VirtioNetHdr, VIRTIO_NET_HDR_LEN,
+    try_enable_tun_offload, VirtioNetHdr, VIRTIO_NET_HDR_LEN,
 };
 
 // ── Linux TUN ioctl/flag constants ──────────────────────────────
@@ -115,16 +115,26 @@ pub struct OffloadTun {
 }
 
 impl OffloadTun {
-    /// Sensible default offload mask: just `TUN_F_CSUM`.
+    /// Sensible default offload mask: `0` (no offload, just VNET_HDR
+    /// framing).
     ///
-    /// With `IFF_VNET_HDR` on but no GSO flags, the kernel still
-    /// frames every read/write with a virtio header but never
-    /// produces super-segments — so we don't need to teach the
-    /// upper layer to re-segment yet. `CSUM` is the cheap win:
-    /// the kernel trusts our outgoing packets' checksums and we
-    /// trust the incoming ones, saving a memcpy-and-fold on both
-    /// directions for every TCP/UDP packet.
-    pub const DEFAULT_OFFLOAD: u32 = offload_flag::CSUM;
+    /// `TUN_F_CSUM` looks like a cheap win on paper but it isn't
+    /// safe for our wire transport: with it on, the kernel hands us
+    /// outbound packets carrying `NEEDS_CSUM` in the virtio header
+    /// (checksum field is invalid). We strip the header and forward
+    /// the raw IP packet to the exit, which writes it back with a
+    /// zero virtio header — the receiving kernel sees an
+    /// already-checksummed packet (flag=0) but the bytes have an
+    /// invalid checksum, and the kernel silently drops it. Either
+    /// the wire protocol needs to propagate the virtio header
+    /// end-to-end, or we compute the checksum ourselves in
+    /// userspace.
+    ///
+    /// Until one of those lands, `DEFAULT_OFFLOAD = 0` keeps the
+    /// VNET_HDR framing (so the wire layout matches what the
+    /// future TSO/USO segmenter expects) but makes the kernel
+    /// fill in checksums itself — same correctness as plain TUN.
+    pub const DEFAULT_OFFLOAD: u32 = 0;
 
     /// Open `/dev/net/tun`, configure the interface, and wrap it
     /// in an async-ready handle.
@@ -447,17 +457,15 @@ mod tests {
     }
 
     #[test]
-    fn default_offload_mask_is_csum_only() {
-        // `DEFAULT_OFFLOAD` must NOT include any GSO flags, since
-        // the data plane can't yet re-segment super-packets before
-        // forwarding them on the mesh. The day we add a re-segmenter,
-        // this test gets updated alongside.
-        assert_eq!(OffloadTun::DEFAULT_OFFLOAD, offload_flag::CSUM);
-        assert_eq!(
-            OffloadTun::DEFAULT_OFFLOAD
-                & (offload_flag::TSO4 | offload_flag::TSO6 | offload_flag::USO4),
-            0
-        );
+    fn default_offload_mask_is_zero() {
+        // `DEFAULT_OFFLOAD` must be 0 until the wire protocol
+        // propagates the virtio header end-to-end (or we compute
+        // checksums in userspace). With CSUM/TSO/USO on, the
+        // exit kernel sees packets framed `flag=0` but carrying
+        // unchecksummed bytes — and silently drops them. The day
+        // we land a re-segmenter + header propagation, this test
+        // gets updated alongside.
+        assert_eq!(OffloadTun::DEFAULT_OFFLOAD, 0);
     }
 
     #[test]
