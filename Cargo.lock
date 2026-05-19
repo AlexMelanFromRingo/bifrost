@@ -214,6 +214,7 @@ dependencies = [
  "bifrost-core",
  "clap",
  "hex",
+ "libc",
  "norn-rs",
  "serde",
  "thiserror 2.0.18",
@@ -1135,7 +1136,7 @@ dependencies = [
 
 [[package]]
 name = "norn-rs"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "blake2",

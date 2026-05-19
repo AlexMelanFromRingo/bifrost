@@ -12,6 +12,7 @@
 
 mod config;
 mod egress;
+mod tun_offload;
 
 use anyhow::{Context, Result};
 use bifrost_core::mux::MeshMux;

@@ -7,22 +7,30 @@ several of these don't move the needle — the WAN is the
 bottleneck, not bifrost. They're prerequisites for fast LANs and
 inter-region cloud bonding where the WAN headroom is real.
 
-## 1. `sendmmsg` batching in `norn-rs::transport`
+## 1. `sendmmsg` batching in `norn-rs::transport` ✅ done in 0.7.0
 
-Today every encrypted Traffic frame is one `tcp.write_all(buf)`
-syscall on the writer task. At 50 Mbit/s and 64 KB frames that's
-~100 syscalls/s — fine. At 1 Gbit/s with 1400-byte vpnd packets
-that becomes ~90 k syscalls/s, and per-syscall overhead starts to
-show up in `perf`.
+Status: **landed** in `norn-rs::router::handle_conn` writer task
+and `norn-rs::packet::write_frames_batched`.
 
-Linux's `sendmmsg(2)` accepts an array of buffers and submits
-them in one syscall. The writer task could drain its mpsc channel
-until empty or up to a budget, then issue one `sendmmsg`. tokio
-exposes `tokio::net::UdpSocket::send_mmsg` for UDP; for the TCP
-path we'd use raw `libc::sendmmsg` via `AsRawFd`.
+The writer task now drains up to 32 sibling frames from its mpsc
+channel with `try_recv()` after the blocking `recv().await`,
+concatenates them into one `[varint_len][payload]…` buffer, and
+ships the whole thing with one `write_all`. Functionally
+equivalent to `sendmmsg(2)`: one syscall, one mio waker
+round-trip per *batch* of frames instead of per frame. Three
+new unit tests pin the wire format (`write_frames_batched_*`
+in `src/packet.rs`).
 
-Expected uplift: 5-20% on Gbit links, near-zero on our 50 Mbit/s
-WAN.
+`PacketConn::write_to_batch(payloads, dst)` exposes the same
+pattern at the application API: encrypt + envelope N payloads
+to the same peer under one round of session-manager mutex
+acquisitions. Currently unused — wired in when an upper-layer
+caller wants the amortisation (vpnd's coalesce path already
+batches at a higher level, so doesn't need it).
+
+Expected uplift on a Gbit+ link: 5-20%. On our 50 Mbit/s WAN
+the writer was nowhere near syscall-bound, so no change in
+the iter 11 bench (good — it confirms the change is safe).
 
 ## 2. Multi-core crypto worker pool
 
@@ -50,24 +58,40 @@ might arrive out of order — usually fine, IP handles reorder).
 Expected uplift: enables 10+ Gbit/s scenarios. No measurable
 effect below ~500 Mbit/s.
 
-## 3. TUN GSO/GRO (`IFF_VNET_HDR` + `TUNSETOFFLOAD`)
+## 3. TUN GSO/GRO (`IFF_VNET_HDR` + `TUNSETOFFLOAD`) ⏳ foundation landed
 
-Today vpnd reads one IP packet per `tun.read()` syscall. With
-`IFF_VNET_HDR`, the kernel can hand us multiple packets in one
-read as a "super-packet" prefixed by a `virtio_net_hdr`, and we
-can write super-packets back the same way. This is the same
-mechanism WireGuard uses on Linux to hit 1+ Gbit/s on a single
-core.
+Status: **foundation in `bifrost-vpnd::tun_offload`**, not yet
+wired into the live data plane.
 
-Requires patching the `tun2` crate (or replacing it with raw
-`AsyncFd<File>` on the TUN fd plus our own ioctl wrappers) to
-expose the flag. Then `bifrost-vpnd::egress` would issue
-`recvmsg` with `MSG_TRUNC` and parse the virtio header to find
-the per-segment lengths.
+What's there today:
 
-Expected uplift on a real Linux host: VPN closes the gap with
-SOCKS5 throughput at multi-Gbit/s rates. WSL2 may not support
-this — kernel-side virtio TUN offload is patchy in WSL.
+* `VirtioNetHdr` type with `encode` / `decode` / `split`
+  round-trip helpers and 7 unit tests pinning the wire layout
+  against the kernel `include/uapi/linux/virtio_net.h` constants
+  (`GSO_TCPV4`, `GSO_UDP`, `GSO_TCPV6`, `ECN_FLAG`, etc.).
+* `try_enable_tun_offload(fd, flags)` — safe wrapper around the
+  `TUNSETOFFLOAD` ioctl. Linux-only; stubs to
+  `io::ErrorKind::Unsupported` elsewhere.
+* `offload_flag::*` constants (`CSUM`, `TSO4`, `TSO6`, `USO4`,
+  `USO6`) so callers don't have to look them up in
+  `if_tun.h`.
+
+What's not there yet:
+
+* `bifrost-vpnd::egress` still opens the TUN device through
+  `tun2`, which doesn't expose `IFF_VNET_HDR`. Even if we call
+  `try_enable_tun_offload` on the resulting fd, the kernel
+  refuses offload flags without `IFF_VNET_HDR`, so the read /
+  write path stays at one-packet-per-syscall.
+* Wiring needs either (a) replacing `tun2` with a hand-rolled
+  `AsyncFd<File>` over the TUN, or (b) a fork / PR to `tun2`
+  exposing the flag. Both are concrete follow-ups; the wire
+  parser is already done and tested.
+
+Expected uplift after wiring: VPN closes the gap with SOCKS5
+throughput at multi-Gbit/s rates. WSL2 may not support
+`IFF_VNET_HDR` — kernel-side virtio TUN offload is patchy in WSL,
+so this is a "test on a native Linux host first" change.
 
 ## 4. Hands-on CPU profile of the current bottleneck
 
