@@ -55,8 +55,19 @@ use tracing::{debug, info, trace, warn};
 ///   mtu_in_16     (1 byte — MTU/16, multiples of 16 bytes)
 ///   pad           (1 byte — reserved for future flags, must be zero)
 pub const EGRESS_HELLO_MAGIC: &[u8; 4] = b"BFEG";
-pub const EGRESS_HELLO_VERSION: u8 = 2;
-pub const EGRESS_HELLO_SIZE: usize = 50;
+pub const EGRESS_HELLO_VERSION: u8 = 3;
+pub const EGRESS_HELLO_SIZE: usize = 52;
+
+/// Bit flags carried in `EgressHello::capabilities`. Both sides must
+/// advertise a flag for the corresponding feature to activate; if
+/// either is missing, the data plane falls back to the pre-v3
+/// behaviour for that feature.
+///
+/// `VNET_HDR` (0x0001) — the per-packet wire format carries a 10-byte
+/// `virtio_net_hdr` prefix in front of every IP packet inside the
+/// `Frame::Datagram` batches. Necessary for TSO/USO offload (the
+/// kernel encodes super-segments in this header).
+pub const EGRESS_CAP_VNET_HDR: u16 = 0x0001;
 
 /// Hard cap on a single relayed packet. Comfortably larger than any
 /// real-world MTU (v6 jumbograms top out at 9180 bytes; we round to
@@ -64,7 +75,12 @@ pub const EGRESS_HELLO_SIZE: usize = 50;
 /// and tear the stream down — protects against a malicious peer
 /// sending u16::MAX-length headers to make us allocate 64 KB per
 /// packet.
-pub const MAX_RELAYED_PACKET: usize = 16 * 1024;
+/// Maximum size of a single wire-format slot `[vhdr | IP packet]`.
+///
+/// Sized to accommodate a TSO super-segment under default Linux
+/// `dev->gso_max_size` (64 KiB) without truncating; we leave a
+/// small margin for the vhdr and miscellaneous TLV growth.
+pub const MAX_RELAYED_PACKET: usize = 60 * 1024;
 
 /// Maximum number of IP packets coalesced into a single Datagram
 /// payload. 16 is a sweet spot on real WAN testing: small enough to
@@ -220,6 +236,9 @@ pub struct EgressHello {
     pub gateway_v6: Option<Ipv6Addr>,
     pub v6_prefix: u8,
     pub mtu: u16,
+    /// Bitmask of supported features (see `EGRESS_CAP_*` constants).
+    /// New in v3; v2 callers see this slot as zeros.
+    pub capabilities: u16,
 }
 
 impl EgressHello {
@@ -240,6 +259,7 @@ impl EgressHello {
         out[47] = self.v6_prefix;
         out[48] = ((self.mtu / 16).min(255)) as u8;
         // out[49] reserved.
+        out[50..52].copy_from_slice(&self.capabilities.to_be_bytes());
         out
     }
 
@@ -272,6 +292,7 @@ impl EgressHello {
             (None, None, 0)
         };
         let mtu = (buf[48] as u16) * 16;
+        let capabilities = u16::from_be_bytes([buf[50], buf[51]]);
         Ok(Self {
             allocated_v4: v4.into(),
             gateway_v4: gw4.into(),
@@ -280,6 +301,7 @@ impl EgressHello {
             gateway_v6,
             v6_prefix,
             mtu,
+            capabilities,
         })
     }
 }
@@ -858,23 +880,29 @@ pub async fn start_exit(
             // halfway-through a packet.
             let mut w = tun_writer_in.lock().await;
             let mut batch_failed = false;
-            for pkt in PacketBatchIter::new(&payload) {
-                let version_nibble = pkt[0] >> 4;
+            for slot in PacketBatchIter::new(&payload) {
+                // Each slot is `[10-byte vhdr | IP packet]`. Anti-
+                // spoof reads from the IP part; the vhdr stays
+                // attached for the TUN write so the receiving
+                // kernel sees the same `gso_type` the sender's
+                // kernel produced.
+                let ip = match ip_part(slot) { Some(p) => p, None => continue };
+                let version_nibble = ip[0] >> 4;
                 let spoofed = match version_nibble {
-                    4 if pkt.len() >= 20 => {
-                        let src = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
+                    4 if ip.len() >= 20 => {
+                        let src = Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]);
                         src != lease.v4
                     }
-                    6 if pkt.len() >= 40 => {
+                    6 if ip.len() >= 40 => {
                         let mut octets = [0u8; 16];
-                        octets.copy_from_slice(&pkt[8..24]);
+                        octets.copy_from_slice(&ip[8..24]);
                         let src = Ipv6Addr::from(octets);
                         Some(src) != lease.v6
                     }
                     _ => true,
                 };
                 if spoofed {
-                    if is_routable_dst(version_nibble, pkt) {
+                    if is_routable_dst(version_nibble, ip) {
                         debug!(
                             "egress exit: spoofed packet from {} (ver={version_nibble}), drop",
                             hex::encode(&from[..8])
@@ -882,7 +910,7 @@ pub async fn start_exit(
                     }
                     continue;
                 }
-                if let Err(e) = w.write_all(pkt).await {
+                if let Err(e) = w.write_all(slot).await {
                     warn!("egress exit: TUN write failed: {e}");
                     batch_failed = true;
                     break;
@@ -1088,6 +1116,10 @@ async fn handle_egress_handshake(
         gateway_v6,
         v6_prefix,
         mtu: 1400,
+        // v3: we always speak the vhdr wire format. The bit is
+        // informational here — the version check on the receiving
+        // side already enforces compatibility.
+        capabilities: EGRESS_CAP_VNET_HDR,
     };
     if let Err(e) = write_framed(&mut mesh, &hello.encode()).await {
         warn!("egress exit: hello send failed for {peer_short} ({alloc_desc}): {e}");
@@ -1228,7 +1260,11 @@ pub async fn client_handshake(
     if ack != 0 {
         anyhow::bail!("exit refused egress with code 0x{ack:02x}");
     }
-    let mut hello_buf = [0u8; MAX_RELAYED_PACKET];
+    // `MAX_RELAYED_PACKET` is 60 KiB to accommodate TSO super-frames
+    // on the data plane; the hello itself is 52 bytes. Allocate on
+    // the heap so the future stays small (this is hot only at
+    // tunnel setup, never on the per-packet path).
+    let mut hello_buf = vec![0u8; MAX_RELAYED_PACKET];
     let hello_len = read_framed(&mut mesh, &mut hello_buf)
         .await
         .context("reading framed egress hello")?
@@ -1384,7 +1420,7 @@ where
 }
 
 /// Parse one TUN read, look up the destination peer in the egress
-/// table, and append the IP packet bytes to that peer's coalesce
+/// table, and append the (vhdr+IP) bytes to that peer's coalesce
 /// bucket. Used by the exit-side TUN reader; the client-side reader
 /// has only one destination so it doesn't bucket.
 #[cfg(feature = "tun")]
@@ -1394,14 +1430,13 @@ fn push_to_bucket(
     total_bytes: &mut usize,
     raw: &[u8],
 ) {
-    let Some(pkt) = extract_routable(raw) else { return; };
-    // Decode dst IP once; mirrors the matching logic in
-    // is_routable_dst but yields the address we need to route by.
-    let dst: IpAddr = if pkt[0] >> 4 == 4 && pkt.len() >= 20 {
-        Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]).into()
-    } else if pkt[0] >> 4 == 6 && pkt.len() >= 40 {
+    let Some(slot) = extract_routable(raw) else { return; };
+    let ip = match ip_part(slot) { Some(p) => p, None => return };
+    let dst: IpAddr = if ip[0] >> 4 == 4 && ip.len() >= 20 {
+        Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]).into()
+    } else if ip[0] >> 4 == 6 && ip.len() >= 40 {
         let mut octets = [0u8; 16];
-        octets.copy_from_slice(&pkt[24..40]);
+        octets.copy_from_slice(&ip[24..40]);
         Ipv6Addr::from(octets).into()
     } else {
         return;
@@ -1410,33 +1445,42 @@ fn push_to_bucket(
         trace!("egress exit: drop packet to unknown peer {dst}");
         return;
     };
-    *total_bytes += pkt.len() + 2;
-    buckets.entry(peer).or_default().push(pkt.to_vec());
+    *total_bytes += slot.len() + 2;
+    buckets.entry(peer).or_default().push(slot.to_vec());
 }
 
-/// Extract the IP payload from a raw TUN read (handling tun2's
-/// optional 4-byte PI prefix) and return it only if it has a
-/// routable destination. Used by the coalescing TUN reader as
-/// a one-shot filter so the hot path stays a couple of `?`-style
-/// returns rather than 30 lines of nested match.
-fn extract_routable(buf: &[u8]) -> Option<&[u8]> {
-    if buf.is_empty() { return None; }
-    let (offset, version_nibble) = if buf[0] >> 4 == 4 || buf[0] >> 4 == 6 {
-        (0, buf[0] >> 4)
-    } else if buf.len() > 4 && (buf[4] >> 4 == 4 || buf[4] >> 4 == 6) {
-        (4, buf[4] >> 4)
-    } else {
+/// Split a wire-format slot `[virtio_net_hdr | ip_packet]` into the
+/// IP-only tail. Returns None if the slot can't hold a vhdr — the
+/// caller should drop it.
+fn ip_part(slot: &[u8]) -> Option<&[u8]> {
+    if slot.len() < crate::tun_offload::VIRTIO_NET_HDR_LEN {
         return None;
-    };
-    let pkt = &buf[offset..];
-    if !is_routable_dst(version_nibble, pkt) { return None; }
-    Some(pkt)
+    }
+    Some(&slot[crate::tun_offload::VIRTIO_NET_HDR_LEN..])
+}
+
+/// Filter a raw TUN read for forwarding. Inputs always start with
+/// the kernel's 10-byte `virtio_net_hdr`; we hand the IP part to
+/// the routability check and, on a pass, return the FULL `[vhdr |
+/// IP]` slot so the receiver can write it back to its own TUN
+/// verbatim (preserving `gso_type` for TSO/USO segmentation).
+fn extract_routable(buf: &[u8]) -> Option<&[u8]> {
+    let ip = ip_part(buf)?;
+    if ip.is_empty() {
+        return None;
+    }
+    let version_nibble = ip[0] >> 4;
+    if !is_routable_dst(version_nibble, ip) {
+        return None;
+    }
+    Some(buf)
 }
 
 /// True if the packet's destination address is sensible to forward
 /// across the egress tunnel. Filters out multicast, link-local, and
 /// loopback — those belong on the local link and would be dropped
-/// (noisily) on the exit side anyway.
+/// (noisily) on the exit side anyway. `pkt` is the **IP** slice
+/// (caller has already stripped the vhdr via [`ip_part`]).
 fn is_routable_dst(version_nibble: u8, pkt: &[u8]) -> bool {
     match version_nibble {
         4 if pkt.len() >= 20 => {
@@ -1597,6 +1641,7 @@ mod tests {
             gateway_v6: None,
             v6_prefix: 0,
             mtu: 1408,
+            capabilities: EGRESS_CAP_VNET_HDR,
         };
         let back = EgressHello::decode(&h.encode()).unwrap();
         assert_eq!(back.allocated_v4, h.allocated_v4);
@@ -1604,6 +1649,7 @@ mod tests {
         assert_eq!(back.v4_prefix, h.v4_prefix);
         assert!(back.allocated_v6.is_none(), "v6_present=0 → None");
         assert_eq!(back.mtu, 1408);
+        assert_eq!(back.capabilities & EGRESS_CAP_VNET_HDR, EGRESS_CAP_VNET_HDR);
     }
 
     #[test]
@@ -1616,11 +1662,13 @@ mod tests {
             gateway_v6: Some(v6("fd55:0:0:1::1")),
             v6_prefix: 64,
             mtu: 1408,
+            capabilities: EGRESS_CAP_VNET_HDR,
         };
         let back = EgressHello::decode(&h.encode()).unwrap();
         assert_eq!(back.allocated_v6, h.allocated_v6);
         assert_eq!(back.gateway_v6, h.gateway_v6);
         assert_eq!(back.v6_prefix, 64);
+        assert_eq!(back.capabilities, h.capabilities);
     }
 
     #[test]
@@ -1633,6 +1681,7 @@ mod tests {
             gateway_v6: None,
             v6_prefix: 0,
             mtu: 1400,
+            capabilities: 0,
         }
         .encode();
         bytes[0] = b'X';

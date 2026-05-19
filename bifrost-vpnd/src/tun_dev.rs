@@ -53,7 +53,7 @@ use tokio::io::{unix::AsyncFd, AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{info, warn};
 
 use crate::tun_offload::{
-    try_enable_tun_offload, VirtioNetHdr, VIRTIO_NET_HDR_LEN,
+    offload_flag, try_enable_tun_offload, VIRTIO_NET_HDR_LEN,
 };
 
 // ── Linux TUN ioctl/flag constants ──────────────────────────────
@@ -108,33 +108,32 @@ pub struct OffloadTun {
     /// logging at startup and for future per-flag fast-path
     /// branching; the read/write path itself doesn't care.
     offload_active: bool,
-    /// Pre-encoded zero virtio_net_hdr we prepend to every write
-    /// via `writev(2)`. Keeping this on the struct avoids a tiny
-    /// stack alloc on the hot send path.
-    write_hdr: [u8; VIRTIO_NET_HDR_LEN],
 }
 
 impl OffloadTun {
-    /// Sensible default offload mask: `0` (no offload, just VNET_HDR
-    /// framing).
+    /// Default offload mask: `CSUM | TSO4 | TSO6 | USO4`.
     ///
-    /// `TUN_F_CSUM` looks like a cheap win on paper but it isn't
-    /// safe for our wire transport: with it on, the kernel hands us
-    /// outbound packets carrying `NEEDS_CSUM` in the virtio header
-    /// (checksum field is invalid). We strip the header and forward
-    /// the raw IP packet to the exit, which writes it back with a
-    /// zero virtio header — the receiving kernel sees an
-    /// already-checksummed packet (flag=0) but the bytes have an
-    /// invalid checksum, and the kernel silently drops it. Either
-    /// the wire protocol needs to propagate the virtio header
-    /// end-to-end, or we compute the checksum ourselves in
-    /// userspace.
+    /// The EgressHello v3 wire format propagates the 10-byte
+    /// virtio_net_hdr end-to-end through the mesh, so super-segments
+    /// the kernel hands us at the client (gso_type=TCPV4/TCPV6/UDP)
+    /// can be written to the exit's TUN verbatim — the exit kernel
+    /// then re-segments on the way to its real NIC. One read on the
+    /// client becomes one mesh datagram becomes one write on the
+    /// exit, regardless of how many TCP segments the super-frame
+    /// represents. On a 1500-byte MTU TCP flow that's a 10× drop
+    /// in syscall + crypto + framing overhead per byte.
     ///
-    /// Until one of those lands, `DEFAULT_OFFLOAD = 0` keeps the
-    /// VNET_HDR framing (so the wire layout matches what the
-    /// future TSO/USO segmenter expects) but makes the kernel
-    /// fill in checksums itself — same correctness as plain TUN.
-    pub const DEFAULT_OFFLOAD: u32 = 0;
+    /// CSUM is included because the same vhdr propagation also
+    /// carries `NEEDS_CSUM` correctly to the receiving kernel — the
+    /// previously-broken case (header stripped, raw bytes forwarded,
+    /// receiver assumes valid checksum) doesn't apply anymore.
+    ///
+    /// USO4 (UDP segmentation offload, Linux ≥ 6.0) is best-effort:
+    /// older kernels return `EINVAL` from `TUNSETOFFLOAD` and we
+    /// retry with TSO-only. The `try_enable_tun_offload` log line
+    /// at startup shows what actually stuck.
+    pub const DEFAULT_OFFLOAD: u32 =
+        offload_flag::CSUM | offload_flag::TSO4 | offload_flag::TSO6 | offload_flag::USO4;
 
     /// Open `/dev/net/tun`, configure the interface, and wrap it
     /// in an async-ready handle.
@@ -193,24 +192,42 @@ impl OffloadTun {
             );
         }
 
-        // Best-effort TUNSETOFFLOAD. The kernel rejects unknown
-        // flags and refuses on `IFF_VNET_HDR=off`; we tolerate
-        // both by falling back to the per-packet (no-CSUM) path.
+        // Best-effort TUNSETOFFLOAD with a USO-aware retry. USO4
+        // landed in Linux 6.0; older kernels reject the bit with
+        // `EINVAL`. We try the full requested mask first, and on
+        // failure peel off USO and retry — that keeps WSL2 / RHEL8
+        // builds running TSO+CSUM while letting modern kernels get
+        // the full feature set transparently.
         let offload_active = if want_offload != 0 {
-            match try_enable_tun_offload(&owned, want_offload) {
-                Ok(()) => {
+            let primary = try_enable_tun_offload(&owned, want_offload);
+            let outcome = match primary {
+                Ok(()) => Ok(want_offload),
+                Err(e1) if (want_offload & (offload_flag::USO4 | offload_flag::USO6)) != 0 => {
+                    let downgraded =
+                        want_offload & !(offload_flag::USO4 | offload_flag::USO6);
+                    match try_enable_tun_offload(&owned, downgraded) {
+                        Ok(()) => Ok(downgraded),
+                        Err(e2) => Err((e1, Some(e2))),
+                    }
+                }
+                Err(e1) => Err((e1, None)),
+            };
+            match outcome {
+                Ok(active_flags) => {
                     info!(
-                        "tun_dev: TUNSETOFFLOAD on {finalised_name}, flags={:#x}",
+                        "tun_dev: TUNSETOFFLOAD on {finalised_name}, flags={active_flags:#x} \
+                         (requested {:#x})",
                         want_offload
                     );
                     true
                 }
-                Err(e) => {
+                Err((e1, e2)) => {
                     warn!(
-                        "tun_dev: TUNSETOFFLOAD({:#x}) on {finalised_name} \
-                         failed: {e} — falling back to VNET_HDR-only \
-                         (per-packet, no checksum offload)",
-                        want_offload
+                        "tun_dev: TUNSETOFFLOAD({:#x}) on {finalised_name} failed: {e1}{} \
+                         — falling back to VNET_HDR-only (per-packet, no GSO)",
+                        want_offload,
+                        e2.map(|e| format!(" (downgrade retry also failed: {e})"))
+                            .unwrap_or_default(),
                     );
                     false
                 }
@@ -226,7 +243,6 @@ impl OffloadTun {
             name: finalised_name,
             mtu,
             offload_active,
-            write_hdr: VirtioNetHdr::raw_no_offload().encode(),
         })
     }
 
@@ -256,6 +272,11 @@ impl AsRawFd for OffloadTun {
 }
 
 impl AsyncRead for OffloadTun {
+    /// Pass the kernel's `[virtio_net_hdr | ip_packet]` slab through
+    /// to the caller verbatim — no longer strip the 10-byte header.
+    /// The mesh data plane carries the vhdr end-to-end so the exit
+    /// can write back exactly what the client kernel produced
+    /// (preserving `gso_type` for TSO/USO super-segments).
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -294,8 +315,6 @@ impl AsyncRead for OffloadTun {
             }
             let n = n as usize;
             if n == 0 {
-                // EOF — surface as Ok(()) with no bytes filled,
-                // matching tokio convention.
                 return Poll::Ready(Ok(()));
             }
             if n < VIRTIO_NET_HDR_LEN {
@@ -307,46 +326,46 @@ impl AsyncRead for OffloadTun {
                     ),
                 )));
             }
-            let payload_len = n - VIRTIO_NET_HDR_LEN;
-            // Slide payload to the start of the unfilled region.
-            // copy_within handles the overlap (src is to the right
-            // of dst, so it's a forward copy).
-            unfilled.copy_within(VIRTIO_NET_HDR_LEN..n, 0);
-            dst.advance(payload_len);
+            dst.advance(n);
             return Poll::Ready(Ok(()));
         }
     }
 }
 
 impl AsyncWrite for OffloadTun {
+    /// Caller hands us `[virtio_net_hdr | ip_packet]` verbatim; we
+    /// `write(2)` it as one slab. The vhdr is the caller's
+    /// responsibility — the wire/data-plane decides whether it's a
+    /// zero passthrough or a real `gso_type` super-segment hint.
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let me = self.get_mut();
+        if buf.len() < VIRTIO_NET_HDR_LEN {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "TUN write needs at least {VIRTIO_NET_HDR_LEN}-byte vhdr; got {}",
+                    buf.len()
+                ),
+            )));
+        }
         loop {
             let mut guard = match me.fd.poll_write_ready(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(r) => r?,
             };
-            // writev(2) lets us prepend the 12-byte header without
-            // copying the caller's `buf`. Kernel-side this is one
-            // contiguous packet — `iovec[0]` then `iovec[1]`.
-            let iov = [
-                libc::iovec {
-                    iov_base: me.write_hdr.as_ptr() as *mut libc::c_void,
-                    iov_len: VIRTIO_NET_HDR_LEN,
-                },
-                libc::iovec {
-                    iov_base: buf.as_ptr() as *mut libc::c_void,
-                    iov_len: buf.len(),
-                },
-            ];
-            // SAFETY: both iovecs point at valid memory we own for
-            // the duration of the syscall (`me.write_hdr` is on
-            // `me`, `buf` is the caller's slice held for `poll_write`).
-            let n = unsafe { libc::writev(me.fd.as_raw_fd(), iov.as_ptr(), 2) };
+            // SAFETY: `buf` is the caller's slice held alive for
+            // the duration of `poll_write`.
+            let n = unsafe {
+                libc::write(
+                    me.fd.as_raw_fd(),
+                    buf.as_ptr() as *const libc::c_void,
+                    buf.len(),
+                )
+            };
             if n < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::WouldBlock {
@@ -355,17 +374,7 @@ impl AsyncWrite for OffloadTun {
                 }
                 return Poll::Ready(Err(e));
             }
-            let kn = n as usize;
-            // Kernel always accepts the whole packet or nothing —
-            // there's no partial-packet write on a TUN. Defend
-            // against a degenerate short return anyway.
-            if kn < VIRTIO_NET_HDR_LEN {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    format!("TUN writev returned {kn}, below virtio header size"),
-                )));
-            }
-            return Poll::Ready(Ok(kn - VIRTIO_NET_HDR_LEN));
+            return Poll::Ready(Ok(n as usize));
         }
     }
 
@@ -457,15 +466,19 @@ mod tests {
     }
 
     #[test]
-    fn default_offload_mask_is_zero() {
-        // `DEFAULT_OFFLOAD` must be 0 until the wire protocol
-        // propagates the virtio header end-to-end (or we compute
-        // checksums in userspace). With CSUM/TSO/USO on, the
-        // exit kernel sees packets framed `flag=0` but carrying
-        // unchecksummed bytes — and silently drops them. The day
-        // we land a re-segmenter + header propagation, this test
-        // gets updated alongside.
-        assert_eq!(OffloadTun::DEFAULT_OFFLOAD, 0);
+    fn default_offload_mask_enables_csum_tso_uso() {
+        // EgressHello v3 carries vhdr end-to-end so we can finally
+        // turn on TSO+CSUM safely (and USO on kernels that support
+        // it — `try_enable_tun_offload` has a USO-aware retry path).
+        const WANT: u32 = offload_flag::CSUM
+            | offload_flag::TSO4
+            | offload_flag::TSO6
+            | offload_flag::USO4;
+        const _: () = {
+            assert!(OffloadTun::DEFAULT_OFFLOAD == WANT);
+            assert!(OffloadTun::DEFAULT_OFFLOAD & offload_flag::CSUM != 0);
+            assert!(OffloadTun::DEFAULT_OFFLOAD & offload_flag::TSO4 != 0);
+        };
     }
 
     #[test]
