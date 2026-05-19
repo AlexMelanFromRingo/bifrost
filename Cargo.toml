@@ -35,3 +35,12 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+# A debug-friendly profile for `perf record` / flamegraph runs.
+# Inherits release optimisations but keeps line-table debug info
+# so `perf report` resolves stack frames to function names. Use
+# with `cargo build --profile release-debug`.
+[profile.release-debug]
+inherits = "release"
+strip = false
+debug = "line-tables-only"
