@@ -807,7 +807,7 @@ mod tests {
         let srtt_2 = r.srtt().unwrap();
         // (7/8)·100 + (1/8)·200 = 112.5 ms. Allow ±1 ms for ns/ms rounding.
         let expected = Duration::from_micros(112_500);
-        let diff = if srtt_2 > expected { srtt_2 - expected } else { expected - srtt_2 };
+        let diff = srtt_2.abs_diff(expected);
         assert!(diff < Duration::from_millis(1),
                 "SRTT after second sample ≈ 112.5 ms, got {srtt_2:?} (was {srtt_1:?})");
     }
