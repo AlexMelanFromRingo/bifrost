@@ -33,7 +33,7 @@ use bifrost_core::{
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, info, warn};
@@ -57,6 +57,78 @@ use tracing::{debug, info, warn};
 pub const EGRESS_HELLO_MAGIC: &[u8; 4] = b"BFEG";
 pub const EGRESS_HELLO_VERSION: u8 = 2;
 pub const EGRESS_HELLO_SIZE: usize = 50;
+
+/// Hard cap on a single relayed packet. Comfortably larger than any
+/// real-world MTU (v6 jumbograms top out at 9180 bytes; we round to
+/// 16 KB). Frames larger than this are treated as a protocol error
+/// and tear the stream down — protects against a malicious peer
+/// sending u16::MAX-length headers to make us allocate 64 KB per
+/// packet.
+pub const MAX_RELAYED_PACKET: usize = 16 * 1024;
+
+/// Reads one length-prefixed packet from a mesh stream into `dst`.
+/// Wire format: 2-byte big-endian length, followed by that many bytes
+/// of opaque payload (an IP packet or an `EgressHello`).
+///
+/// Returns `Ok(Some(n))` for a successful read, `Ok(None)` if the
+/// stream closed cleanly at a frame boundary, and `Err` for any
+/// other I/O failure or a length that won't fit `dst` or exceeds
+/// `MAX_RELAYED_PACKET`.
+async fn read_framed<R: AsyncRead + Unpin>(
+    r: &mut R, dst: &mut [u8],
+) -> std::io::Result<Option<usize>> {
+    let mut hdr = [0u8; 2];
+    // Hand-rolled read so we can distinguish "clean EOF before any
+    // header byte" from "EOF in the middle of a header" — the first
+    // is normal teardown, the second is a torn stream.
+    let mut got = 0;
+    while got < hdr.len() {
+        match r.read(&mut hdr[got..]).await? {
+            0 if got == 0 => return Ok(None),
+            0 => return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "stream closed mid-frame-header",
+            )),
+            n => got += n,
+        }
+    }
+    let len = u16::from_be_bytes(hdr) as usize;
+    if len == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "zero-length framed packet",
+        ));
+    }
+    if len > dst.len() || len > MAX_RELAYED_PACKET {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("framed packet too large: {len} bytes"),
+        ));
+    }
+    r.read_exact(&mut dst[..len]).await?;
+    Ok(Some(len))
+}
+
+/// Writes one length-prefixed packet to a mesh stream. Mirrors the
+/// format consumed by `read_framed`. `pkt` must be non-empty and
+/// no larger than `MAX_RELAYED_PACKET`.
+async fn write_framed<W: AsyncWrite + Unpin>(
+    w: &mut W, pkt: &[u8],
+) -> std::io::Result<()> {
+    if pkt.is_empty() || pkt.len() > MAX_RELAYED_PACKET {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("framed packet size out of range: {}", pkt.len()),
+        ));
+    }
+    // Coalesce the length + payload into one syscall to keep the
+    // small-packet pipeline tight. Two write_all calls would still be
+    // correct, just chattier.
+    let mut hdr_and_pkt = Vec::with_capacity(2 + pkt.len());
+    hdr_and_pkt.extend_from_slice(&(pkt.len() as u16).to_be_bytes());
+    hdr_and_pkt.extend_from_slice(pkt);
+    w.write_all(&hdr_and_pkt).await
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct EgressHello {
@@ -353,6 +425,26 @@ pub fn configure_exit_kernel(
         "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT",
     ])?;
 
+    // MSS clamp on the egress TUN: without this, TCP sessions inside
+    // the tunnel send 1460-byte segments based on the host MTU and
+    // then either fragment at the IP layer or stall waiting for an
+    // ICMP-needed that won't come from CGNAT. Clamping rewrites
+    // outgoing SYNs so the inner TCP negotiates MSS ≤ tunnel-MTU - 40,
+    // avoiding fragmentation entirely. This is the canonical OpenVPN /
+    // WireGuard recipe and is essentially free at runtime.
+    ensure_rule("iptables", &[
+        "-t", "mangle", "-A", "FORWARD",
+        "-o", tun_name,
+        "-p", "tcp", "-m", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+        "-j", "TCPMSS", "--clamp-mss-to-pmtu",
+    ])?;
+    ensure_rule("iptables", &[
+        "-t", "mangle", "-A", "FORWARD",
+        "-i", tun_name,
+        "-p", "tcp", "-m", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+        "-j", "TCPMSS", "--clamp-mss-to-pmtu",
+    ])?;
+
     // IPv6 NAT66 + FORWARD rules (skip if v4-only).
     if let Some(gw6) = gateway_v6 {
         let v6_cidr = format!("{}/{}", gw6, v6_prefix);
@@ -376,6 +468,19 @@ pub fn configure_exit_kernel(
         ensure_rule("ip6tables", &[
             "-A", "FORWARD", "-o", tun_name, "-i", egress_iface,
             "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT",
+        ])?;
+        // Same MSS clamping logic as the v4 side — see comment above.
+        ensure_rule("ip6tables", &[
+            "-t", "mangle", "-A", "FORWARD",
+            "-o", tun_name,
+            "-p", "tcp", "-m", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+            "-j", "TCPMSS", "--clamp-mss-to-pmtu",
+        ])?;
+        ensure_rule("ip6tables", &[
+            "-t", "mangle", "-A", "FORWARD",
+            "-i", tun_name,
+            "-p", "tcp", "-m", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+            "-j", "TCPMSS", "--clamp-mss-to-pmtu",
         ])?;
     }
     Ok(())
@@ -597,7 +702,7 @@ async fn handle_egress_stream(
         v6_prefix,
         mtu: 1400,
     };
-    if let Err(e) = mesh.write_all(&hello.encode()).await {
+    if let Err(e) = write_framed(&mut mesh, &hello.encode()).await {
         warn!("egress exit: hello send failed for {peer_short} ({alloc_desc}): {e}");
         pool.lock().unwrap().release(lease);
         return;
@@ -620,15 +725,19 @@ async fn handle_egress_stream(
     let lease_for_in = lease;
     let peer_short_for_in = peer_short.clone();
     let in_handle = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
+        let mut buf = vec![0u8; MAX_RELAYED_PACKET];
         loop {
-            let n = match mesh_reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
+            let n = match read_framed(&mut mesh_reader, &mut buf).await {
+                Ok(Some(n)) => n,
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(
+                        "egress exit: framed read failed for {}: {e}",
+                        peer_short_for_in
+                    );
+                    break;
+                }
             };
-            if n == 0 {
-                continue;
-            }
             // Reject anything that doesn't look like an IP packet, and
             // anti-spoof: confirm the src address matches the lease
             // we handed this peer.
@@ -669,7 +778,7 @@ async fn handle_egress_stream(
     // TUN → mesh
     let out_handle = tokio::spawn(async move {
         while let Some(pkt) = out_rx.recv().await {
-            if let Err(e) = mesh_writer.write_all(&pkt).await {
+            if let Err(e) = write_framed(&mut mesh_writer, &pkt).await {
                 debug!("egress exit: mesh write failed: {e}");
                 break;
             }
@@ -742,12 +851,18 @@ pub async fn start_client(
     if ack != 0 {
         anyhow::bail!("exit refused egress with code 0x{ack:02x}");
     }
-    // Read the EgressHello.
-    let mut hello_buf = [0u8; EGRESS_HELLO_SIZE];
-    mesh.read_exact(&mut hello_buf)
+    // Read the EgressHello — framed like everything else on this stream.
+    let mut hello_buf = [0u8; MAX_RELAYED_PACKET];
+    let hello_len = read_framed(&mut mesh, &mut hello_buf)
         .await
-        .context("reading egress hello")?;
-    let hello = EgressHello::decode(&hello_buf)?;
+        .context("reading framed egress hello")?
+        .ok_or_else(|| anyhow::anyhow!("exit closed stream before sending hello"))?;
+    if hello_len != EGRESS_HELLO_SIZE {
+        anyhow::bail!(
+            "egress hello has unexpected length {hello_len} (want {EGRESS_HELLO_SIZE})"
+        );
+    }
+    let hello = EgressHello::decode(&hello_buf[..EGRESS_HELLO_SIZE])?;
     let v6_desc = hello.allocated_v6
         .map(|v6| format!(" + {v6}/{}", hello.v6_prefix))
         .unwrap_or_default();
@@ -778,11 +893,15 @@ pub async fn start_client(
     // mesh → TUN
     let tun_writer_clone = tun_writer.clone();
     tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
+        let mut buf = vec![0u8; MAX_RELAYED_PACKET];
         loop {
-            let n = match mesh_reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
+            let n = match read_framed(&mut mesh_reader, &mut buf).await {
+                Ok(Some(n)) => n,
+                Ok(None) => break,
+                Err(e) => {
+                    warn!("egress client: framed read failed: {e}");
+                    break;
+                }
             };
             let mut w = tun_writer_clone.lock().await;
             if let Err(e) = w.write_all(&buf[..n]).await {
@@ -801,7 +920,7 @@ pub async fn start_client(
     // local is also a tiny privacy win — the exit operator never
     // sees the client's link-local solicitations.
     tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
+        let mut buf = vec![0u8; MAX_RELAYED_PACKET];
         loop {
             let n = match tun_reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
@@ -818,7 +937,7 @@ pub async fn start_client(
             if !is_routable_dst(version_nibble, pkt) {
                 continue;
             }
-            if let Err(e) = mesh_writer.write_all(pkt).await {
+            if let Err(e) = write_framed(&mut mesh_writer, pkt).await {
                 debug!("egress client: mesh write failed: {e}");
                 break;
             }
@@ -893,8 +1012,92 @@ fn _suppress_unused() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::duplex;
 
     fn v6(s: &str) -> Ipv6Addr { s.parse().unwrap() }
+
+    // ── Length-prefix framing round-trips ───────────────────────────
+
+    #[tokio::test]
+    async fn framed_single_packet_roundtrip() {
+        let (mut a, mut b) = duplex(64 * 1024);
+        let pkt = (0..1400u16).map(|i| i as u8).collect::<Vec<_>>();
+        write_framed(&mut a, &pkt).await.unwrap();
+        a.shutdown().await.unwrap();
+        let mut buf = vec![0u8; MAX_RELAYED_PACKET];
+        let n = read_framed(&mut b, &mut buf).await.unwrap().unwrap();
+        assert_eq!(n, pkt.len());
+        assert_eq!(&buf[..n], &pkt[..]);
+        // Next read should report graceful EOF.
+        let eof = read_framed(&mut b, &mut buf).await.unwrap();
+        assert!(eof.is_none(), "expected None at EOF, got {eof:?}");
+    }
+
+    #[tokio::test]
+    async fn framed_split_writes_dont_split_packets() {
+        // Mesh streams may chunk reads across packet boundaries —
+        // this is the exact failure mode that capped vpnd at
+        // 0.9 Mbit/s before framing. We simulate it here by writing
+        // three packets back-to-back, then reading them through a
+        // duplex pipe that batches in arbitrary chunks.
+        let (mut a, mut b) = duplex(8);
+        let packets = vec![
+            vec![0x45u8; 60],
+            vec![0x46u8; 1400],
+            vec![0x47u8; 200],
+        ];
+        let pkts_clone = packets.clone();
+        let w = tokio::spawn(async move {
+            for p in &pkts_clone {
+                write_framed(&mut a, p).await.unwrap();
+            }
+            a.shutdown().await.unwrap();
+        });
+        let mut buf = vec![0u8; MAX_RELAYED_PACKET];
+        for expected in &packets {
+            let n = read_framed(&mut b, &mut buf).await.unwrap().unwrap();
+            assert_eq!(n, expected.len());
+            assert_eq!(&buf[..n], &expected[..]);
+        }
+        assert!(read_framed(&mut b, &mut buf).await.unwrap().is_none());
+        w.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn framed_rejects_oversized_length_header() {
+        let (mut a, mut b) = duplex(64 * 1024);
+        // Write a header claiming a packet larger than MAX_RELAYED_PACKET.
+        let claim = (MAX_RELAYED_PACKET as u32 + 1) as u16;
+        a.write_all(&claim.to_be_bytes()).await.unwrap();
+        a.shutdown().await.unwrap();
+        let mut buf = vec![0u8; MAX_RELAYED_PACKET];
+        let err = read_framed(&mut b, &mut buf).await
+            .expect_err("oversized header must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn framed_torn_header_is_an_error() {
+        let (mut a, mut b) = duplex(64 * 1024);
+        // Send exactly one byte of the 2-byte length header, then close.
+        a.write_all(&[0x05]).await.unwrap();
+        a.shutdown().await.unwrap();
+        let mut buf = vec![0u8; MAX_RELAYED_PACKET];
+        let err = read_framed(&mut b, &mut buf).await
+            .expect_err("torn header must be flagged, not silently EOF");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn framed_rejects_zero_length_packet() {
+        let (mut a, mut b) = duplex(64 * 1024);
+        a.write_all(&0u16.to_be_bytes()).await.unwrap();
+        a.shutdown().await.unwrap();
+        let mut buf = vec![0u8; MAX_RELAYED_PACKET];
+        let err = read_framed(&mut b, &mut buf).await
+            .expect_err("len=0 frames must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn egress_hello_v4_only_roundtrip() {
