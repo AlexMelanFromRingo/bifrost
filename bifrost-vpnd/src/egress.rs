@@ -394,6 +394,48 @@ impl AddressPool {
             self.in_use[host] = false;
         }
     }
+
+    /// Mark a specific lease as taken. Used by the persistent
+    /// lease store to reseed the pool at startup so that already-
+    /// allocated v4 addresses are not handed out a second time to
+    /// a new peer.
+    ///
+    /// Returns:
+    ///
+    /// * `Ok(())` — the lease lies inside the pool's range and
+    ///   the slot has now been marked taken (whether it was
+    ///   already taken or not).
+    /// * `Err(_)` — the lease points to a host outside the
+    ///   configured range (operator changed `pool_base` /
+    ///   `pool_prefix` since the file was written, or the file is
+    ///   from a different deployment). The caller should drop the
+    ///   entry from the loaded set and let the peer get a fresh
+    ///   lease on reconnect.
+    pub fn reserve(&mut self, lease: Lease) -> Result<()> {
+        let host = u32::from_be_bytes(lease.v4.octets())
+            .checked_sub(u32::from_be_bytes(self.v4_base.octets()))
+            .ok_or_else(|| anyhow::anyhow!(
+                "lease {:?} is below pool base {:?}", lease.v4, self.v4_base
+            ))? as usize;
+        if host >= self.in_use.len() {
+            anyhow::bail!(
+                "lease {:?} (host index {host}) is outside pool of {} hosts",
+                lease.v4, self.in_use.len()
+            );
+        }
+        // .0 (network), .1 (gateway), and .max-1 (broadcast) are
+        // reserved by `new`; reserving them from the lease store
+        // would mean the file was written against a different
+        // pool layout. Refuse rather than corrupt the pool.
+        if host == 0 || host == 1 || host == self.in_use.len() - 1 {
+            anyhow::bail!(
+                "lease {:?} (host {host}) is a pool-reserved slot — refusing to reuse",
+                lease.v4
+            );
+        }
+        self.in_use[host] = true;
+        Ok(())
+    }
 }
 
 // ── Reverse table ─────────────────────────────────────────────────────────
@@ -668,6 +710,7 @@ pub async fn start_exit(
     v6_pool_base: Option<Ipv6Addr>,
     v6_pool_prefix: u8,
     egress_iface: String,
+    lease_persistence_path: String,
 ) -> Result<()> {
     let pool = Arc::new(Mutex::new(
         AddressPool::new(v4_pool_base, v4_pool_prefix, v6_pool_base, v6_pool_prefix)
@@ -679,6 +722,60 @@ pub async fn start_exit(
         let p = pool.lock().unwrap();
         (p.gateway_v4(), p.v4_prefix(), p.gateway_v6(), p.v6_prefix())
     };
+
+    // ── Lease persistence (sticky reconnects across restart) ─────
+    //
+    // Load any prior `peer → lease` mappings from disk and reseed
+    // both the AddressPool (so we don't double-allocate a held v4)
+    // and the EgressTable (so the first handshake from a returning
+    // peer finds an existing lease and skips a fresh allocation).
+    // Entries whose v4 doesn't fit the configured pool are dropped
+    // with a warning — operator probably changed pool_base /
+    // pool_prefix between restarts; the peer will pick up a new
+    // slot on reconnect.
+    let lease_store = Arc::new(Mutex::new(
+        crate::lease_store::LeaseStore::new(lease_persistence_path.clone())
+    ));
+    let table: SharedTable = Arc::new(Mutex::new(EgressTable::default()));
+    if !lease_persistence_path.is_empty() {
+        let loaded = crate::lease_store::load_with_warn(
+            std::path::Path::new(&lease_persistence_path)
+        );
+        let mut reseeded = 0usize;
+        let mut dropped  = 0usize;
+        {
+            let mut p = pool.lock().unwrap();
+            let mut t = table.lock().unwrap();
+            let mut s = lease_store.lock().unwrap();
+            for (peer, lease) in loaded {
+                match p.reserve(lease) {
+                    Ok(()) => {
+                        t.insert(peer, lease);
+                        s.insert(peer, lease);
+                        reseeded += 1;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "lease store: dropping {} (peer {}): {e}",
+                            lease.v4, hex::encode(&peer[..8])
+                        );
+                        dropped += 1;
+                    }
+                }
+            }
+        }
+        info!(
+            "lease store: reseeded {reseeded} sticky lease(s) from {:?}{}",
+            lease_persistence_path,
+            if dropped > 0 {
+                format!(" ({dropped} dropped as out-of-range)")
+            } else {
+                String::new()
+            }
+        );
+    } else {
+        info!("lease store: disabled (set [exit].lease_persistence_path to enable)");
+    }
 
     let mut tun_cfg = tun2::Configuration::default();
     tun_cfg.tun_name(&tun_name).mtu(1400);
@@ -692,7 +789,10 @@ pub async fn start_exit(
 
     let (tun_reader, tun_writer) = tokio::io::split(dev);
     let tun_writer = Arc::new(tokio::sync::Mutex::new(tun_writer));
-    let table: SharedTable = Arc::new(Mutex::new(EgressTable::default()));
+    // `table` was created above (alongside the lease store
+    // reseed); from here on it's the shared routing/anti-spoof
+    // map used by the datagram receivers and the handshake
+    // workers.
 
     // Register the IP-packet datagram channel. Each Frame::Datagram
     // landing on DATAGRAM_CHANNEL_EGRESS is one IP packet from a
@@ -838,9 +938,10 @@ pub async fn start_exit(
         }
         let pool = pool.clone();
         let table = table.clone();
+        let lease_store = lease_store.clone();
         tokio::spawn(async move {
             handle_egress_handshake(
-                acc, pool, table,
+                acc, pool, table, lease_store,
                 gw4, prefix4, gw6, prefix6,
             ).await;
         });
@@ -860,10 +961,12 @@ pub async fn start_exit(
 /// already happen at the TCP/QUIC layer *inside* the tunnel — doing
 /// them again in our ARQ caps single-flow throughput at ~5 Mbit/s).
 #[cfg(feature = "tun")]
+#[allow(clippy::too_many_arguments)] // v4+v6 gateway layout + persistence handle
 async fn handle_egress_handshake(
     acc: AcceptedStream,
     pool: SharedPool,
     table: SharedTable,
+    lease_store: Arc<Mutex<crate::lease_store::LeaseStore>>,
     gateway_v4: Ipv4Addr,
     v4_prefix: u8,
     gateway_v6: Option<Ipv6Addr>,
@@ -872,23 +975,79 @@ async fn handle_egress_handshake(
     let mut mesh = acc.stream;
     let peer = acc.from;
     let peer_short = hex::encode(&peer[..8]);
-    let lease = pool.lock().unwrap().allocate();
-    let lease = match lease {
-        Some(l) => l,
+
+    // Sticky-lease lookup. If we have an existing entry in the
+    // shared table (loaded from disk at startup or installed by
+    // a prior session that's since disconnected), reuse it. This
+    // is the whole point of the persistence layer — returning
+    // clients keep their address across exit restarts and across
+    // client TCP reconnects within a single exit lifetime.
+    //
+    // Pool was already reserved for sticky leases at startup, so
+    // we just need to make sure the table has the entry and we
+    // don't double-allocate.
+    // Two-step lookup so we never hold the MutexGuard across an
+    // await: first peek for an existing lease; if absent, allocate
+    // and insert in a fresh critical section. `None` means pool
+    // exhaustion — handled below by send_open_ack outside any lock.
+    let lookup: Option<(Lease, bool)> = {
+        let t = table.lock().unwrap();
+        t.lease_of(&peer).map(|l| (l, true))
+    };
+    let (lease, was_sticky) = match lookup {
+        Some(found) => found,
         None => {
-            warn!("egress exit: address pool exhausted for peer {peer_short}");
-            let _ = mesh.send_open_ack(0x01 /* general failure */).await;
-            return;
+            let fresh = pool.lock().unwrap().allocate();
+            match fresh {
+                Some(l) => {
+                    table.lock().unwrap().insert(peer, l);
+                    (l, false)
+                }
+                None => {
+                    warn!("egress exit: address pool exhausted for peer {peer_short}");
+                    let _ = mesh.send_open_ack(0x01 /* general failure */).await;
+                    return;
+                }
+            }
         }
     };
+
     let alloc_desc = match lease.v6 {
         Some(v6) => format!("{} + {}", lease.v4, v6),
         None => lease.v4.to_string(),
     };
-    info!("egress exit: allocated {alloc_desc} for peer {peer_short}");
+    if was_sticky {
+        info!("egress exit: sticky-resume {alloc_desc} for peer {peer_short}");
+    } else {
+        info!("egress exit: allocated {alloc_desc} for peer {peer_short}");
+        // Persist the new mapping immediately so a crash between
+        // here and the next save doesn't lose the lease (the
+        // client will already be holding it from EgressHello).
+        let save_result = {
+            let mut s = lease_store.lock().unwrap();
+            s.insert(peer, lease);
+            s.save()
+        };
+        if let Err(e) = save_result {
+            warn!(
+                "egress exit: persisting lease for {peer_short} failed: {e:#} \
+                 (lease is live in memory; will retry on next change)"
+            );
+        }
+    }
     if let Err(e) = mesh.send_open_ack(0x00).await {
         warn!("egress exit: OpenAck failed for {peer_short}: {e}");
-        pool.lock().unwrap().release(lease);
+        // OpenAck failed: we never actually got past the
+        // handshake. Roll back the in-memory state so the next
+        // attempt sees a clean slate, but leave the persistent
+        // store untouched for sticky-lease purposes — if the
+        // peer comes back later, they should still resume.
+        if !was_sticky {
+            table.lock().unwrap().remove_peer(&peer);
+            pool.lock().unwrap().release(lease);
+            lease_store.lock().unwrap().remove(&peer);
+            let _ = lease_store.lock().unwrap().save();
+        }
         return;
     }
     let hello = EgressHello {
@@ -902,19 +1061,26 @@ async fn handle_egress_handshake(
     };
     if let Err(e) = write_framed(&mut mesh, &hello.encode()).await {
         warn!("egress exit: hello send failed for {peer_short} ({alloc_desc}): {e}");
-        pool.lock().unwrap().release(lease);
+        if !was_sticky {
+            table.lock().unwrap().remove_peer(&peer);
+            pool.lock().unwrap().release(lease);
+            lease_store.lock().unwrap().remove(&peer);
+            let _ = lease_store.lock().unwrap().save();
+        }
         return;
     }
-
-    // Now the data plane is live: install the peer/lease in the
-    // shared table so the datagram fast-path can route packets to
-    // and from this client.
-    table.lock().unwrap().insert(peer, lease);
 
     // Park here until the client half-closes (or its TCP dies). The
     // mesh stream carries no further data — it's purely a session
     // lifecycle marker. read_to_end completes on graceful Close;
-    // unexpected EOF / errors also fall through and tear the lease.
+    // unexpected EOF / errors also fall through.
+    //
+    // Critically: we do NOT release the lease here. The sticky
+    // policy keeps `EgressTable` + persistence intact so the peer
+    // resumes onto the same IP on next reconnect. Without
+    // persistence the in-memory `table` would still survive the
+    // peer's TCP teardown but only until the exit restarts;
+    // persistence extends that lifetime across daemon restarts.
     let mut throwaway = Vec::new();
     let _ = mesh.read_to_end(&mut throwaway).await;
     if !throwaway.is_empty() {
@@ -926,10 +1092,9 @@ async fn handle_egress_handshake(
             peer_short, throwaway.len()
         );
     }
-
-    table.lock().unwrap().remove_peer(&peer);
-    pool.lock().unwrap().release(lease);
-    info!("egress exit: closed session for {peer_short} ({alloc_desc})");
+    info!(
+        "egress exit: client {peer_short} disconnected (lease {alloc_desc} held sticky)"
+    );
 }
 
 // ── Stream <-> TUN bridge for client role ────────────────────────────────
@@ -1228,6 +1393,7 @@ pub async fn start_exit(
     _v6_pool_base: Option<Ipv6Addr>,
     _v6_pool_prefix: u8,
     _egress_iface: String,
+    _lease_persistence_path: String,
 ) -> Result<()> {
     anyhow::bail!("egress exit requires the `tun` feature (rebuild with --features tun)")
 }
@@ -1498,7 +1664,7 @@ mod tests {
         // third can't be fully recovered. Iterator must yield the
         // first 2 cleanly and stop — not panic, not return a
         // malformed slice.
-        let pkts = vec![vec![1u8; 100], vec![2u8; 200], vec![3u8; 300]];
+        let pkts = [vec![1u8; 100], vec![2u8; 200], vec![3u8; 300]];
         let refs: Vec<&[u8]> = pkts.iter().map(|v| v.as_slice()).collect();
         let mut payload = encode_packet_batch(&refs);
         payload.truncate(payload.len() - 1);
