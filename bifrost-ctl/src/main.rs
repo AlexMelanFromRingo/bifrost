@@ -115,7 +115,7 @@ async fn run_rpc(socket: &PathBuf, req: &AdminRequest) -> Result<AdminResponse> 
         .await
         .context("response timeout (5 s)")?
         .context("reading admin response")?;
-    Ok(serde_json::from_str(line.trim()).context("parse admin response")?)
+    serde_json::from_str(line.trim()).context("parse admin response")
 }
 
 // ── renderers ────────────────────────────────────────────────────────────

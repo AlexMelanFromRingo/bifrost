@@ -287,11 +287,7 @@ impl Reliability {
         } else {
             // §2.3: weighted moving average for both SRTT and RTTVAR.
             // RTTVAR ← (1-β)·RTTVAR + β·|SRTT − R'|
-            let diff = if self.srtt > sample {
-                self.srtt - sample
-            } else {
-                sample - self.srtt
-            };
+            let diff = self.srtt.abs_diff(sample);
             self.rttvar = weighted(self.rttvar, diff, BETA_NUM, BETA_DEN);
             // SRTT ← (1-α)·SRTT + α·R'
             self.srtt = weighted(self.srtt, sample, ALPHA_NUM, ALPHA_DEN);
@@ -391,8 +387,8 @@ impl Reliability {
                     .push(RetransmitJob { seq: u.seq, data: u.data.clone() });
             }
         }
-        if let Some(c) = self.close_pending.as_mut() {
-            if now.duration_since(c.last_sent) >= self.rto {
+        if let Some(c) = self.close_pending.as_mut()
+            && now.duration_since(c.last_sent) >= self.rto {
                 if c.retries >= MAX_RETRIES {
                     return Err(c.seq);
                 }
@@ -400,7 +396,6 @@ impl Reliability {
                 c.last_sent = now;
                 due.close_job = Some(RetransmitJob { seq: c.seq, data: Vec::new() });
             }
-        }
         if !due.data_jobs.is_empty() || due.close_job.is_some() {
             // RFC 6298 §5.5: double RTO on retransmit. This is
             // independent of the SRTT estimate; the retransmit timer
@@ -551,11 +546,10 @@ impl Reliability {
             out.send_ack = true;
         }
         // Did this just close the gap to a buffered FIN?
-        if let Some(c) = self.peer_close_seq {
-            if self.expected_seq >= c && self.rx_buf.is_empty() && !self.eof_delivered {
+        if let Some(c) = self.peer_close_seq
+            && self.expected_seq >= c && self.rx_buf.is_empty() && !self.eof_delivered {
                 out.eof_ready = true;
             }
-        }
         out
     }
 
@@ -578,11 +572,10 @@ impl Reliability {
     pub fn ack_state(&self) -> (u32, u32) {
         let win = self.rx_buf_cap.saturating_sub(self.rx_buf.len() as u32);
         let mut ack = self.expected_seq;
-        if let Some(c) = self.peer_close_seq {
-            if self.expected_seq >= c {
+        if let Some(c) = self.peer_close_seq
+            && self.expected_seq >= c {
                 ack = c.wrapping_add(1);
             }
-        }
         (ack, win)
     }
 
@@ -604,12 +597,11 @@ impl Reliability {
         if self.eof_delivered {
             return true;
         }
-        if let Some(c) = self.peer_close_seq {
-            if self.expected_seq >= c && self.rx_buf.is_empty() {
+        if let Some(c) = self.peer_close_seq
+            && self.expected_seq >= c && self.rx_buf.is_empty() {
                 self.eof_delivered = true;
                 return true;
             }
-        }
         false
     }
 }

@@ -220,7 +220,7 @@ impl ScoredExitPool {
     /// Weighted random draw across the top N entries of the current
     /// snapshot. Returns None only if there are no candidates at all.
     pub fn pick(&self) -> Option<(PubKey, Option<String>)> {
-        self.pick_with(|| rand::random::<f64>())
+        self.pick_with(rand::random::<f64>)
     }
 
     /// Pick up to `n` DISTINCT candidates for parallel racing. Each

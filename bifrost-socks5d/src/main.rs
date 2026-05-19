@@ -103,13 +103,6 @@ enum ExitPicker {
 }
 
 impl ExitPicker {
-    fn pick(&self) -> Option<(PubKey, Option<String>)> {
-        match self {
-            Self::Rotator(r) => r.pick(),
-            Self::Scored(s) => s.pick(),
-        }
-    }
-
     /// Up to `n` distinct candidates for happy-eyeballs racing. The
     /// Scored variant draws weighted-random without replacement; the
     /// Rotator variant just walks N times (round-robin already gives

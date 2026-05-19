@@ -39,13 +39,13 @@ impl ExitPeer {
 
 /// Routing policy for a SOCKS5 / VPN client.
 ///
-///   * `Mesh`  — stay inside the 0200::/7 overlay, no egress.
-///   * `Exit`  — round-robin across the listed peers.
-///   * `Auto`  — same candidate list, but pick by Trust/(RTT+Penalty)
-///               with weighted-random top-N selection. The picker
-///               consumes live PeerStats refreshed from PacketConn
-///               and absorbs application-level failures as temporary
-///               RTT penalties so a sick exit drains gracefully.
+/// * `Mesh`  — stay inside the 0200::/7 overlay, no egress.
+/// * `Exit`  — round-robin across the listed peers.
+/// * `Auto`  — same candidate list, but pick by Trust/(RTT+Penalty)
+///   with weighted-random top-N selection. The picker consumes live
+///   PeerStats refreshed from PacketConn and absorbs application-
+///   level failures as temporary RTT penalties so a sick exit drains
+///   gracefully.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum EgressPolicy {

@@ -213,8 +213,8 @@ impl Drop for MeshStream {
         //   * No tokio runtime in scope = drop happens in a non-async
         //     context (shouldn't happen in practice but Drop must be
         //     infallible). Skip silently.
-        if !self.write_closed {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if !self.write_closed
+            && let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let mux = self.mux.clone();
                 let peer = self.peer;
                 let sid = self.sid;
@@ -224,7 +224,6 @@ impl Drop for MeshStream {
                         .await;
                 });
             }
-        }
         self.mux.drop_stream(&self.peer, self.sid);
     }
 }

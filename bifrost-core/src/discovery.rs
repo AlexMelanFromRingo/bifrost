@@ -136,6 +136,7 @@ fn extract_pub_key_from_resolved(svc: &ResolvedService) -> Option<PubKey> {
 /// Unit-test friendly: the test fixture uses ServiceInfo (which we
 /// build directly), production handles ResolvedService (which arrives
 /// from the mdns-sd browser).
+#[cfg(test)]
 fn extract_pub_key(info: &ServiceInfo) -> Option<PubKey> {
     let val = info.get_property_val_str(PUBKEY_TXT_KEY)?;
     decode_hex_pub_key(val)
