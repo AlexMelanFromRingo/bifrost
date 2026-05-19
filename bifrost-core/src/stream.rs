@@ -76,6 +76,11 @@ pub struct MeshStream {
     sid: StreamId,
     rx: mpsc::Receiver<StreamEvent>,
     reliability: Arc<Mutex<Reliability>>,
+    /// Mirror of `StreamEntry::has_unacked` (see mux.rs). Bumped to
+    /// `true` after each `record_sent` so the retransmit task knows
+    /// to walk us; mux's handle_ack flips it back to `false` once
+    /// `unacked_empty && !close_pending`.
+    has_unacked: Arc<std::sync::atomic::AtomicBool>,
     /// Outstanding Data-send future from poll_write. We deliberately
     /// hold exactly one — naively pipelining N futures here looked
     /// attractive (4-MB reliability window divided by ~64-KB chunks)
@@ -115,6 +120,7 @@ impl MeshStream {
         sid: StreamId,
         rx: mpsc::Receiver<StreamEvent>,
         reliability: Arc<Mutex<Reliability>>,
+        has_unacked: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             mux,
@@ -122,6 +128,7 @@ impl MeshStream {
             sid,
             rx,
             reliability,
+            has_unacked,
             write_fut: None,
             close_fut: None,
             close_registered: false,
@@ -382,6 +389,12 @@ impl AsyncWrite for MeshStream {
             } else {
                 let seq = r.allocate_seq(len as u32).expect("window check just passed");
                 r.record_sent(seq, buf[..len].to_vec(), Instant::now());
+                // Tell the mux's retransmit_tick that this stream has
+                // pending work — flipping inside the reliability mutex
+                // means handle_ack can never observe the flip ordering
+                // wrong-way (a concurrent ACK that empties the queue
+                // would already be serialised behind us on the mutex).
+                self.has_unacked.store(true, std::sync::atomic::Ordering::Relaxed);
                 Some((seq, len))
             }
         };
@@ -451,6 +464,8 @@ impl AsyncWrite for MeshStream {
                 r.record_close_sent(seq, Instant::now());
                 seq
             };
+            // The pending Close itself is retransmit-work for the mux.
+            self.has_unacked.store(true, std::sync::atomic::Ordering::Relaxed);
             let mux = self.mux.clone();
             let peer = self.peer;
             let sid = self.sid;

@@ -47,6 +47,21 @@ pub(crate) struct StreamEntry {
     pub reliability: Arc<Mutex<Reliability>>,
     pub peer: PubKey,
     pub sid: StreamId,
+    /// Lock-free hint: "this stream has at least one Data/Close frame
+    /// awaiting an ACK from the peer". The retransmit task reads this
+    /// once per stream per tick (50 ms) and skips the
+    /// `reliability.lock() + retransmit_due()` path entirely when it
+    /// reads false. Empty-stream churn at the 50 ms tick was 22 % of
+    /// user-mode CPU under load (see
+    /// `bifrost-wan-test-2026-05-18/perf-findings-iter11.md`).
+    ///
+    /// Writers flip it true on `allocate_seq + record_sent`;
+    /// the ACK handler flips it false once `unacked_empty &&
+    /// !close_pending`. False-positive is benign (we'd just do the
+    /// extra mutex acquire); false-negative is the bug we must
+    /// prevent (would never retransmit a lost frame), so flips are
+    /// always done with the reliability mutex held.
+    pub has_unacked: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Default)]
@@ -177,16 +192,20 @@ impl MeshMux {
     pub async fn open(self: &Arc<Self>, peer: PubKey, target: OpenTarget) -> Result<MeshStream> {
         let (tx, rx) = mpsc::channel(INBOUND_CHAN_DEPTH);
         let reliability = Arc::new(Mutex::new(Reliability::default()));
+        let has_unacked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let sid = {
             let mut t = self.table.lock().expect("StreamTable mutex poisoned");
             let sid = t.allocate();
             t.entries.insert(
                 (peer, sid),
-                StreamEntry { tx, reliability: reliability.clone(), peer, sid },
+                StreamEntry {
+                    tx, reliability: reliability.clone(), peer, sid,
+                    has_unacked: has_unacked.clone(),
+                },
             );
             sid
         };
-        let stream = MeshStream::new(self.clone(), peer, sid, rx, reliability);
+        let stream = MeshStream::new(self.clone(), peer, sid, rx, reliability, has_unacked);
         let frame = Frame::Open { sid, target };
         let bytes = frame.encode()?;
         if let Err(e) = write_with_session_wait(&self.conn, &peer, &bytes).await {
@@ -217,13 +236,14 @@ impl MeshMux {
         sid: StreamId,
         tx: StreamSender,
         reliability: Arc<Mutex<Reliability>>,
+        has_unacked: Arc<std::sync::atomic::AtomicBool>,
     ) -> bool {
         let mut t = self.table.lock().expect("StreamTable mutex poisoned");
         if t.entries.contains_key(&(peer, sid)) {
             return false;
         }
         t.entries
-            .insert((peer, sid), StreamEntry { tx, reliability, peer, sid });
+            .insert((peer, sid), StreamEntry { tx, reliability, peer, sid, has_unacked });
         true
     }
 
@@ -260,14 +280,15 @@ async fn read_loop(mux: Arc<MeshMux>) {
             Frame::Open { sid, target } => {
                 let (tx, rx) = mpsc::channel(INBOUND_CHAN_DEPTH);
                 let reliability = Arc::new(Mutex::new(Reliability::default()));
-                if !mux.install_inbound(peer, sid, tx, reliability.clone()) {
+                let has_unacked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                if !mux.install_inbound(peer, sid, tx, reliability.clone(), has_unacked.clone()) {
                     debug!(
                         "mux: duplicate open from {} sid={sid} — dropping",
                         hex::encode(&peer[..8])
                     );
                     continue;
                 }
-                let stream = MeshStream::new(mux.clone(), peer, sid, rx, reliability);
+                let stream = MeshStream::new(mux.clone(), peer, sid, rx, reliability, has_unacked);
                 let accepted = AcceptedStream { from: peer, target, stream };
                 if mux.accept_tx.send(accepted).await.is_err() {
                     mux.drop_stream(&peer, sid);
@@ -361,7 +382,7 @@ fn handle_data(mux: &Arc<MeshMux>, peer: PubKey, sid: StreamId, seq: u32, data: 
 
 fn handle_ack(mux: &Arc<MeshMux>, peer: PubKey, sid: StreamId, ack: u32, win: u32) {
     let Some(entry) = mux.lookup_entry(&peer, sid) else { return; };
-    let opened = {
+    let (opened, now_idle) = {
         let mut r = entry.reliability.lock().expect("Reliability mutex poisoned");
         let before_win = r.write_window_available();
         let before_close = r.close_pending();
@@ -375,8 +396,17 @@ fn handle_ack(mux: &Arc<MeshMux>, peer: PubKey, sid: StreamId, ack: u32, win: u3
             );
         }
         // Wake whenever the window grew OR the FIN got acknowledged.
-        after_win > before_win || (before_close && !after_close)
+        let opened = after_win > before_win || (before_close && !after_close);
+        // For the retransmit_tick fast-path hint: this stream has no
+        // more retransmit work iff there's nothing unacked AND no
+        // pending close. Compute under the mutex so the write to
+        // `has_unacked` can never race a concurrent allocate_seq.
+        let idle = r.unacked_empty() && !r.close_pending();
+        (opened, idle)
     };
+    if now_idle {
+        entry.has_unacked.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     if opened {
         let _ = entry.tx.try_send(StreamEvent::WakeWrite);
     }
@@ -434,6 +464,14 @@ async fn retransmit_tick(mux: Arc<MeshMux>) {
         }
         let now = Instant::now();
         for entry in entries {
+            // Fast path: skip streams whose unacked queue is empty and
+            // have no close pending. Saves the reliability mutex lock
+            // + retransmit_due walk on every idle stream — perf
+            // showed this was 22 % of user-mode CPU under load
+            // before this check.
+            if !entry.has_unacked.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
             let jobs = {
                 let mut r = entry.reliability.lock().expect("Reliability mutex poisoned");
                 r.retransmit_due(now)
