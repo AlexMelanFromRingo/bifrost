@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "bifrost-core",
+    "bifrost-ffi",
     "bifrost-socks5d",
     "bifrost-vpnd",
     "bifrost-ctl",

@@ -1,0 +1,36 @@
+[package]
+name = "bifrost-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "C ABI shim for bifrost-vpnd's client data plane — drives Android VpnService / iOS NEPacketTunnelProvider tunnels"
+
+[lib]
+# `staticlib` for iOS (the toolchain links into an `.a` rolled into
+# the .ipa) and `cdylib` for Android (cargo-ndk emits a `.so` per ABI
+# that lives in jniLibs). Both are produced by every release build;
+# downstream packaging picks the right one.
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+bifrost-core    = { path = "../bifrost-core" }
+bifrost-vpnd    = { path = "../bifrost-vpnd", default-features = false }
+norn-rs.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Platform log sinks are intentionally NOT pulled in here: the
+# tracing-android / tracing-oslog crates are unmaintained and have
+# spotty NDK / SDK compatibility. The host app is expected to
+# forward Rust log lines through its own logging pipeline by
+# capturing stderr (Android: Process.exec redirect; iOS: dup2 over
+# the os_log fd). Until that pattern proves insufficient there's
+# no reason to take the dep.

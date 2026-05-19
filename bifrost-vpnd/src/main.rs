@@ -10,18 +10,12 @@
 //             routes either the configured subnet or the full default
 //             route through that TUN.
 
-mod config;
-mod egress;
-mod lease_store;
-#[cfg(all(feature = "tun", target_os = "linux"))]
-mod tun_dev;
-mod tun_offload;
-
 use anyhow::{Context, Result};
 use bifrost_core::mux::MeshMux;
 use bifrost_core::policy::EgressPolicy;
+use bifrost_vpnd::config::{Mode, VpnConfig};
+use bifrost_vpnd::egress;
 use clap::{Parser, Subcommand};
-use config::{Mode, VpnConfig};
 use norn_rs::node::Node;
 use std::sync::Arc;
 use tracing::{info, warn};

@@ -6,6 +6,10 @@ license.workspace = true
 authors.workspace = true
 description = "TUN-based VPN daemon riding the norn-rs mesh — mesh-only or exit-routed"
 
+[lib]
+name = "bifrost_vpnd"
+path = "src/lib.rs"
+
 [[bin]]
 name = "bifrost-vpnd"
 path = "src/main.rs"

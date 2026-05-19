@@ -117,16 +117,51 @@ sudo perf script | stackcollapse-perf.pl | flamegraph.pl > vpnd-cpu.svg
 Read the SVG with browser zoom — wide horizontal stacks are
 where time goes.
 
-## 5. Mobile clients (Android NDK, iOS)
+## 5. Mobile clients (Android NDK, iOS) ✅ FFI shim landed
 
-Cross-compile bifrost-socks5d for `aarch64-linux-android` and
-`aarch64-apple-ios`. Each platform has its own TUN integration
-(`VpnService` on Android, `NEPacketTunnelProvider` on iOS), so
-this needs a thin shim FFI layer wrapping `MeshMux` +
-`bifrost-vpnd::egress::start_client`. Not a perf concern, just
-a packaging one. Tracking issue:
-<https://github.com/AlexMelanFromRingo/bifrost/issues> (not
-filed yet).
+`bifrost-ffi/` is a new workspace member producing both a
+`cdylib` (`libbifrost_ffi.so` for Android jniLibs) and a
+`staticlib` (`libbifrost_ffi.a` for iOS xcframework). The C
+surface is pinned in `bifrost-ffi/include/bifrost_ffi.h`:
+
+* `bifrost_ffi_abi_version()` — gate against
+  `BIFROST_FFI_ABI_VERSION` from the header at app launch.
+* `bifrost_client_start(tun_fd, node_config_json, exit_pub_key_hex, out_handle)`
+  — adopts a host-provided TUN fd (via `dup(2)` + CLOEXEC),
+  spins up a tokio multi-thread runtime, brings up the norn-rs
+  Node, handshakes with the exit, and runs the same coalescing
+  data plane that desktop clients use.
+* `bifrost_client_stop(handle)` — shuts the runtime down in the
+  background; null-safe.
+* `bifrost_last_error()` — thread-local string for the most
+  recent failure.
+
+To reuse the data plane without cloning ~150 LOC of subtle
+coalescing logic, `bifrost-vpnd::egress` was refactored to
+expose two new public functions:
+
+* `client_handshake(mux, exit_peer) -> (MeshStream, EgressHello)`
+* `run_client_pump<R, W>(reader, writer, mux, exit_peer, mesh)`
+
+`start_client` is now a thin wrapper that adds the `OffloadTun`
+opening + `configure_client_kernel` IP/route setup around those
+two primitives. `bifrost-ffi` calls the primitives directly with
+the host fd wrapped as a `HostTun` (plain `AsyncFd<OwnedFd>`,
+no virtio framing — `VpnService`/NEPacketTunnelProvider's
+contract is per-packet IP).
+
+`BUILD-MOBILE.md` in the repository root has the cross-compile
+recipes for `aarch64-linux-android`, `armv7-linux-androideabi`,
+`aarch64-apple-ios`, and `aarch64-apple-ios-sim`, plus minimal
+Kotlin/Swift glue snippets and `xcframework` packaging.
+
+Open work tracked in BUILD-MOBILE.md:
+
+* Plumbing virtio-net header framing onto the host fd is
+  intentionally skipped — bypassing `VpnService.Builder` disables
+  the system VPN status UI and isn't worth the throughput.
+* Platform log sinks (`tracing-android`, `tracing-oslog`) are
+  unmaintained at time of writing; hosts capture stderr instead.
 
 ## 6. Persistent crash-recovery for `bifrost-vpnd` leases ✅ done
 
