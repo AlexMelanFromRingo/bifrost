@@ -66,6 +66,85 @@ pub const EGRESS_HELLO_SIZE: usize = 50;
 /// packet.
 pub const MAX_RELAYED_PACKET: usize = 16 * 1024;
 
+/// Maximum number of IP packets coalesced into a single Datagram
+/// payload. 16 is a sweet spot on real WAN testing: small enough to
+/// keep the worst-case `tun_writer.lock()` hold time inside the
+/// receive loop bounded (~16 × 30 μs each on Linux), large enough
+/// to amortise mesh encrypt + TCP send across a typical TCP burst.
+pub const MAX_COALESCED_PACKETS: usize = 16;
+
+/// Soft budget on the *byte* size of one coalesced batch. Stops a
+/// pathological burst of jumbo-frames from queueing 256 KB before
+/// flush. Picked at 32 KiB so a full batch + length headers stays
+/// comfortably under the mux's 64 KiB chunk_size and one TCP write.
+pub const COALESCE_BYTE_BUDGET: usize = 32 * 1024;
+
+/// Window inside which `tun.read()` continuations are gathered into
+/// the same batch before flush. Picked empirically: at the
+/// ~50 Mbit/s ceiling of a typical WAN hop, IP packets arrive every
+/// ~220 μs, so a 100 μs window would miss most of them and the
+/// coalescer would be a no-op (verified on the 2026-05-19 UA↔NL
+/// bench — VPN stayed at 10 Mbit/s with the short timer). 500 μs
+/// catches the trailing packets of a typical TCP burst (cwnd ≥ 2
+/// segments) while adding bounded jitter: a *single* ping packet
+/// pays ~0.5 ms extra latency, which is in the noise of the
+/// 55 ms WAN RTT.
+pub const COALESCE_DRAIN_TIMEOUT: Duration = Duration::from_micros(500);
+
+/// Encode a non-empty slice of IP packets into one Datagram payload.
+/// Wire format: `count: u8` followed by `count` × (`len: u16 BE` +
+/// `payload bytes`). The encoder doesn't take ownership of the
+/// packets to keep the hot path zero-copy on the input side.
+pub fn encode_packet_batch(pkts: &[&[u8]]) -> Vec<u8> {
+    debug_assert!(!pkts.is_empty());
+    debug_assert!(pkts.len() <= u8::MAX as usize);
+    let total: usize = pkts.iter().map(|p| 2 + p.len()).sum::<usize>() + 1;
+    let mut out = Vec::with_capacity(total);
+    out.push(pkts.len() as u8);
+    for p in pkts {
+        out.extend_from_slice(&(p.len() as u16).to_be_bytes());
+        out.extend_from_slice(p);
+    }
+    out
+}
+
+/// Iterator over `(packet_bytes_borrowed)` items from a coalesced
+/// Datagram payload. Skips silently on any truncation — the
+/// upper-layer drops a stub end of a malformed batch rather than
+/// tearing the whole session down (a single bad batch is no reason
+/// to drop the tunnel; subsequent batches are independent).
+pub struct PacketBatchIter<'a> {
+    buf: &'a [u8],
+    remaining: u8,
+    idx: usize,
+}
+
+impl<'a> PacketBatchIter<'a> {
+    pub fn new(buf: &'a [u8]) -> Self {
+        let remaining = buf.first().copied().unwrap_or(0);
+        Self { buf, remaining, idx: 1 }
+    }
+}
+
+impl<'a> Iterator for PacketBatchIter<'a> {
+    type Item = &'a [u8];
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.remaining == 0 || self.idx + 2 > self.buf.len() {
+            return None;
+        }
+        let len = u16::from_be_bytes([self.buf[self.idx], self.buf[self.idx + 1]]) as usize;
+        self.idx += 2;
+        if len == 0 || self.idx + len > self.buf.len() || len > MAX_RELAYED_PACKET {
+            self.remaining = 0;
+            return None;
+        }
+        let pkt = &self.buf[self.idx..self.idx + len];
+        self.idx += len;
+        self.remaining -= 1;
+        Some(pkt)
+    }
+}
+
 /// Reads one length-prefixed packet from a mesh stream into `dst`.
 /// Wire format: 2-byte big-endian length, followed by that many bytes
 /// of opaque payload (an IP packet or an `EgressHello`).
@@ -624,9 +703,12 @@ pub async fn start_exit(
         .register_datagram_channel(bifrost_core::mux::DATAGRAM_CHANNEL_EGRESS, 8192)
         .context("registering egress datagram channel")?;
 
-    // datagram → TUN: client packets land here. Anti-spoof against
-    // the peer's lease, then write the raw IP packet to the egress
-    // TUN. The kernel handles NAT (MASQUERADE) + routing.
+    // datagram → TUN: client batches land here. Anti-spoof each
+    // packet against the peer's lease, then write to the egress
+    // TUN. The kernel handles NAT (MASQUERADE) + routing. We hold
+    // the TUN-writer lock across an entire batch so a 16-packet
+    // burst is one lock acquire instead of 16 — important once the
+    // sender side is coalescing aggressively.
     let table_for_in = table.clone();
     let tun_writer_in = tun_writer.clone();
     tokio::spawn(async move {
@@ -641,92 +723,105 @@ pub async fn start_exit(
                 );
                 continue;
             };
-            // Anti-spoof: reject packets whose src IP doesn't match
-            // the peer's allocated lease.
-            let version_nibble = payload[0] >> 4;
-            let spoofed = match version_nibble {
-                4 if payload.len() >= 20 => {
-                    let src = Ipv4Addr::new(payload[12], payload[13], payload[14], payload[15]);
-                    src != lease.v4
-                }
-                6 if payload.len() >= 40 => {
-                    let mut octets = [0u8; 16];
-                    octets.copy_from_slice(&payload[8..24]);
-                    let src = Ipv6Addr::from(octets);
-                    Some(src) != lease.v6
-                }
-                _ => true,
-            };
-            if spoofed {
-                if is_routable_dst(version_nibble, &payload) {
-                    debug!(
-                        "egress exit: spoofed packet from {} (ver={version_nibble}), drop",
-                        hex::encode(&from[..8])
-                    );
-                }
-                continue;
-            }
+            // Acquire the TUN writer once per batch; iterate the
+            // coalesced packets inside the lock so we never write
+            // halfway-through a packet.
             let mut w = tun_writer_in.lock().await;
-            if let Err(e) = w.write_all(&payload).await {
-                warn!("egress exit: TUN write failed: {e}");
-                break;
+            let mut batch_failed = false;
+            for pkt in PacketBatchIter::new(&payload) {
+                let version_nibble = pkt[0] >> 4;
+                let spoofed = match version_nibble {
+                    4 if pkt.len() >= 20 => {
+                        let src = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
+                        src != lease.v4
+                    }
+                    6 if pkt.len() >= 40 => {
+                        let mut octets = [0u8; 16];
+                        octets.copy_from_slice(&pkt[8..24]);
+                        let src = Ipv6Addr::from(octets);
+                        Some(src) != lease.v6
+                    }
+                    _ => true,
+                };
+                if spoofed {
+                    if is_routable_dst(version_nibble, pkt) {
+                        debug!(
+                            "egress exit: spoofed packet from {} (ver={version_nibble}), drop",
+                            hex::encode(&from[..8])
+                        );
+                    }
+                    continue;
+                }
+                if let Err(e) = w.write_all(pkt).await {
+                    warn!("egress exit: TUN write failed: {e}");
+                    batch_failed = true;
+                    break;
+                }
             }
+            if batch_failed { break; }
         }
         warn!("egress exit: datagram receiver exited");
     });
 
-    // TUN → datagram: parse v4 / v6 dst, look up the owning peer,
-    // shoot off one mesh datagram. No per-stream queue, no ARQ —
-    // the upper-layer TCP/QUIC inside the tunnel handles loss.
+    // TUN → datagram with per-peer coalescing. The TUN reader drains
+    // up to MAX_COALESCED_PACKETS / COALESCE_BYTE_BUDGET worth of
+    // packets, bucketed by destination peer, then flushes one
+    // Datagram per peer. Each batch encodes via `encode_packet_batch`
+    // and the receiver iterates with `PacketBatchIter`.
+    //
+    // Bucketing matters on the exit side because TUN packets belong
+    // to different clients; a per-peer flush keeps the wire-side
+    // batches dense without forcing cross-client ordering.
     let table_for_tun = table.clone();
     let mux_for_tun = mux.clone();
     tokio::spawn(async move {
         let mut reader = tun_reader;
         let mut buf = vec![0u8; 65536];
+        // Per-peer slot buffers + running byte total. The total
+        // covers all peers so the global budget can't be exceeded
+        // by collisions on a busy bridge.
+        let mut buckets: std::collections::HashMap<
+            bifrost_core::PubKey, Vec<Vec<u8>>
+        > = std::collections::HashMap::new();
         loop {
+            // First read in this cycle: blocking.
             let n = match reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            // tun2 may prepend a 4-byte PI header on Linux — detect by
-            // checking the version nibble of the first byte.
-            let (offset, version_nibble) = if buf[0] >> 4 == 4 || buf[0] >> 4 == 6 {
-                (0, buf[0] >> 4)
-            } else if n > 4 && (buf[4] >> 4 == 4 || buf[4] >> 4 == 6) {
-                (4, buf[4] >> 4)
-            } else {
-                continue;
-            };
-            let pkt = &buf[offset..n];
-            let dst: IpAddr = match version_nibble {
-                4 if pkt.len() >= 20 => {
-                    Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]).into()
+            buckets.clear();
+            let mut total_bytes: usize = 0;
+            push_to_bucket(&table_for_tun, &mut buckets, &mut total_bytes, &buf[..n]);
+
+            // Opportunistic drain.
+            while total_bytes < COALESCE_BYTE_BUDGET {
+                let next = tokio::time::timeout(
+                    COALESCE_DRAIN_TIMEOUT,
+                    reader.read(&mut buf),
+                ).await;
+                let n2 = match next {
+                    Ok(Ok(0)) | Ok(Err(_)) => { buckets.clear(); break; }
+                    Err(_) => break,
+                    Ok(Ok(n)) => n,
+                };
+                push_to_bucket(&table_for_tun, &mut buckets, &mut total_bytes, &buf[..n2]);
+                // Stop early if any single bucket reached the per-peer
+                // packet cap (keeps batch encode latency bounded).
+                if buckets.values().any(|v| v.len() >= MAX_COALESCED_PACKETS) {
+                    break;
                 }
-                6 if pkt.len() >= 40 => {
-                    let mut octets = [0u8; 16];
-                    octets.copy_from_slice(&pkt[24..40]);
-                    Ipv6Addr::from(octets).into()
-                }
-                _ => continue,
-            };
-            // Drop link-local / multicast chatter that has no peer
-            // behind it (IPv6 ND, MLDv2, mDNS) — keeping these off
-            // the wire saves ~5% bandwidth on a fresh interface.
-            let is_multicast = match &dst {
-                IpAddr::V4(v) => v.is_multicast(),
-                IpAddr::V6(v) => v.is_multicast(),
-            };
-            if is_multicast { continue; }
-            let peer = table_for_tun.lock().unwrap().peer_for_ip(&dst);
-            if let Some(peer) = peer {
+            }
+
+            // Flush each non-empty bucket as one Datagram.
+            for (peer, slots) in buckets.iter().filter(|(_, v)| !v.is_empty()) {
+                let refs: Vec<&[u8]> = slots.iter().map(|v| v.as_slice()).collect();
+                let payload = encode_packet_batch(&refs);
                 if let Err(e) = mux_for_tun
-                    .send_datagram(&peer, bifrost_core::mux::DATAGRAM_CHANNEL_EGRESS, pkt)
+                    .send_datagram(peer, bifrost_core::mux::DATAGRAM_CHANNEL_EGRESS, &payload)
                     .await
                 {
                     trace!("egress exit: datagram send to {} failed: {e}", hex::encode(&peer[..8]));
                 }
-            } else {
-                trace!("egress exit: drop packet to unknown peer {dst}");
             }
         }
         warn!("egress exit: tun reader exited");
@@ -936,11 +1031,13 @@ pub async fn start_client(
         .context("registering egress datagram channel")?;
 
     // datagram → TUN: write every inbound IP packet from the exit
-    // straight to the local TUN. We trust PacketConn's peer
-    // authentication — any datagram on this channel comes from a
-    // peer that authenticated to our session, so we don't need a
-    // second-layer signature here. Filter by source pub-key so
-    // unrelated peers can't shove packets at our TUN.
+    // straight to the local TUN. Each datagram carries a coalesced
+    // batch of 1..=MAX_COALESCED_PACKETS packets; we iterate the
+    // batch inside one TUN-writer lock acquire to keep the per-batch
+    // syscall count down. PacketConn authenticates the peer so we
+    // don't need a second-layer signature, but we still filter by
+    // source pub-key so unrelated peers can't shove packets at our
+    // TUN.
     let tun_writer_clone = tun_writer.clone();
     tokio::spawn(async move {
         while let Some(recv) = datagram_rx.recv().await {
@@ -952,46 +1049,81 @@ pub async fn start_client(
                 continue;
             }
             let mut w = tun_writer_clone.lock().await;
-            if let Err(e) = w.write_all(&recv.payload).await {
-                warn!("egress client: TUN write failed: {e}");
-                break;
+            let mut batch_failed = false;
+            for pkt in PacketBatchIter::new(&recv.payload) {
+                if let Err(e) = w.write_all(pkt).await {
+                    warn!("egress client: TUN write failed: {e}");
+                    batch_failed = true;
+                    break;
+                }
             }
+            if batch_failed { break; }
         }
         warn!("egress client: datagram receiver exited");
     });
 
-    // TUN → datagram: every packet from the local TUN heads straight
-    // to the exit as one datagram. No length framing (the mesh
-    // preserves message boundaries), no ARQ (CUBIC inside the tunnel
-    // handles loss). Single-fut send semantics are gone — each call
-    // to send_datagram returns once the bytes are in the kernel TCP
-    // buffer, so back-to-back TUN reads pipeline naturally.
+    // TUN → datagram with coalescing: the first packet of a batch is
+    // pulled with a blocking read; then we try to opportunistically
+    // drain more packets within COALESCE_DRAIN_TIMEOUT (≤ 100 μs) up
+    // to MAX_COALESCED_PACKETS / COALESCE_BYTE_BUDGET. Result: one
+    // mesh-frame encrypt + one TCP write per N IP packets instead of
+    // per packet. On a long-fat WAN with 1400-byte MTU, this lifts
+    // single-flow VPN throughput from ~10 Mbit/s (1 pkt/RTT-slot)
+    // toward TCP-cap because each round of CPU work moves N×
+    // more bytes per unit time.
     //
-    // Filter link-local / multicast / loopback destinations on the
-    // way out — kernel chatter (IPv6 ND, mDNS, ARP equivalents) has
-    // no peer behind it on the exit, would get rejected as spoofed,
-    // and only wastes wire bytes.
+    // The other end (start_exit's datagram receiver) iterates the
+    // batch via PacketBatchIter, anti-spoofs each packet, and writes
+    // them one-by-one to the TUN.
     let mux_for_tun = mux.clone();
     tokio::spawn(async move {
+        // Slots for one batch. `slots` keeps owned packet bytes so
+        // PacketBatchIter-style borrowing inside the loop is clean.
         let mut buf = vec![0u8; 65536];
+        let mut slots: Vec<Vec<u8>> = Vec::with_capacity(MAX_COALESCED_PACKETS);
         loop {
+            // First packet: blocking read so an idle tunnel doesn't
+            // spin.
             let n = match tun_reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            let (offset, version_nibble) = if buf[0] >> 4 == 4 || buf[0] >> 4 == 6 {
-                (0, buf[0] >> 4)
-            } else if n > 4 && (buf[4] >> 4 == 4 || buf[4] >> 4 == 6) {
-                (4, buf[4] >> 4)
-            } else {
-                continue;
-            };
-            let pkt = &buf[offset..n];
-            if !is_routable_dst(version_nibble, pkt) {
+            slots.clear();
+            if let Some(pkt) = extract_routable(&buf[..n]) {
+                slots.push(pkt.to_vec());
+            }
+
+            // Opportunistic drain: pull subsequent packets until we
+            // hit the count / byte budget OR the timeout fires
+            // (no more packets ready in the kernel TUN queue).
+            let mut bytes_acc: usize = slots.iter().map(|p| p.len() + 2).sum::<usize>() + 1;
+            while slots.len() < MAX_COALESCED_PACKETS && bytes_acc < COALESCE_BYTE_BUDGET {
+                let next = tokio::time::timeout(
+                    COALESCE_DRAIN_TIMEOUT,
+                    tun_reader.read(&mut buf),
+                ).await;
+                let n2 = match next {
+                    Ok(Ok(0)) | Ok(Err(_)) => { slots.clear(); break; } // EOF on TUN
+                    Err(_) => break, // 100 μs elapsed, no more packets
+                    Ok(Ok(n)) => n,
+                };
+                if let Some(pkt) = extract_routable(&buf[..n2]) {
+                    bytes_acc += pkt.len() + 2;
+                    slots.push(pkt.to_vec());
+                }
+            }
+
+            if slots.is_empty() {
+                // The trailing read may have produced only chatter we
+                // filtered out — wait for the next routable packet.
                 continue;
             }
+
+            // Borrowed-slice view for the encoder.
+            let refs: Vec<&[u8]> = slots.iter().map(|v| v.as_slice()).collect();
+            let payload = encode_packet_batch(&refs);
             if let Err(e) = mux_for_tun
-                .send_datagram(&exit_peer, bifrost_core::mux::DATAGRAM_CHANNEL_EGRESS, pkt)
+                .send_datagram(&exit_peer, bifrost_core::mux::DATAGRAM_CHANNEL_EGRESS, &payload)
                 .await
             {
                 trace!("egress client: datagram send failed: {e}");
@@ -1011,6 +1143,56 @@ pub async fn start_client(
     });
 
     Ok(())
+}
+
+/// Parse one TUN read, look up the destination peer in the egress
+/// table, and append the IP packet bytes to that peer's coalesce
+/// bucket. Used by the exit-side TUN reader; the client-side reader
+/// has only one destination so it doesn't bucket.
+#[cfg(feature = "tun")]
+fn push_to_bucket(
+    table: &SharedTable,
+    buckets: &mut std::collections::HashMap<bifrost_core::PubKey, Vec<Vec<u8>>>,
+    total_bytes: &mut usize,
+    raw: &[u8],
+) {
+    let Some(pkt) = extract_routable(raw) else { return; };
+    // Decode dst IP once; mirrors the matching logic in
+    // is_routable_dst but yields the address we need to route by.
+    let dst: IpAddr = if pkt[0] >> 4 == 4 && pkt.len() >= 20 {
+        Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]).into()
+    } else if pkt[0] >> 4 == 6 && pkt.len() >= 40 {
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&pkt[24..40]);
+        Ipv6Addr::from(octets).into()
+    } else {
+        return;
+    };
+    let Some(peer) = table.lock().unwrap().peer_for_ip(&dst) else {
+        trace!("egress exit: drop packet to unknown peer {dst}");
+        return;
+    };
+    *total_bytes += pkt.len() + 2;
+    buckets.entry(peer).or_default().push(pkt.to_vec());
+}
+
+/// Extract the IP payload from a raw TUN read (handling tun2's
+/// optional 4-byte PI prefix) and return it only if it has a
+/// routable destination. Used by the coalescing TUN reader as
+/// a one-shot filter so the hot path stays a couple of `?`-style
+/// returns rather than 30 lines of nested match.
+fn extract_routable(buf: &[u8]) -> Option<&[u8]> {
+    if buf.is_empty() { return None; }
+    let (offset, version_nibble) = if buf[0] >> 4 == 4 || buf[0] >> 4 == 6 {
+        (0, buf[0] >> 4)
+    } else if buf.len() > 4 && (buf[4] >> 4 == 4 || buf[4] >> 4 == 6) {
+        (4, buf[4] >> 4)
+    } else {
+        return None;
+    };
+    let pkt = &buf[offset..];
+    if !is_routable_dst(version_nibble, pkt) { return None; }
+    Some(pkt)
 }
 
 /// True if the packet's destination address is sensible to forward
@@ -1277,5 +1459,71 @@ mod tests {
     fn subnet_v6_cidr_correctly_masks() {
         assert_eq!(subnet_v6_cidr_str(v6("fd55:0:0:1::5"), 64), "fd55:0:0:1::/64");
         assert_eq!(subnet_v6_cidr_str(v6("fd55:0:0:1::5"), 48), "fd55::/48");
+    }
+
+    // ── Packet-batch encode / decode round-trips ────────────────────
+
+    #[test]
+    fn packet_batch_single_packet_roundtrip() {
+        let pkt: Vec<u8> = (0..1400).map(|i| i as u8).collect();
+        let payload = encode_packet_batch(&[&pkt]);
+        let mut iter = PacketBatchIter::new(&payload);
+        let got = iter.next().expect("one packet");
+        assert_eq!(got, &pkt[..]);
+        assert!(iter.next().is_none(), "iterator should be exhausted");
+    }
+
+    #[test]
+    fn packet_batch_many_packets_roundtrip() {
+        // Mixed-size batch — covers the typical TCP-burst shape.
+        let pkts: Vec<Vec<u8>> = vec![
+            vec![0x45u8; 60],   // small ACK
+            vec![0x46u8; 1400], // full segment
+            vec![0x47u8; 532],  // mid-size
+            vec![0x48u8; 1500], // close to MTU
+        ];
+        let refs: Vec<&[u8]> = pkts.iter().map(|v| v.as_slice()).collect();
+        let payload = encode_packet_batch(&refs);
+        // Decode and compare in order.
+        let decoded: Vec<&[u8]> = PacketBatchIter::new(&payload).collect();
+        assert_eq!(decoded.len(), pkts.len());
+        for (got, want) in decoded.iter().zip(pkts.iter()) {
+            assert_eq!(*got, &want[..]);
+        }
+    }
+
+    #[test]
+    fn packet_batch_iter_stops_on_truncated_tail() {
+        // Encode 3 packets, then chop off the last byte so the
+        // third can't be fully recovered. Iterator must yield the
+        // first 2 cleanly and stop — not panic, not return a
+        // malformed slice.
+        let pkts = vec![vec![1u8; 100], vec![2u8; 200], vec![3u8; 300]];
+        let refs: Vec<&[u8]> = pkts.iter().map(|v| v.as_slice()).collect();
+        let mut payload = encode_packet_batch(&refs);
+        payload.truncate(payload.len() - 1);
+        let decoded: Vec<&[u8]> = PacketBatchIter::new(&payload).collect();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0], &pkts[0][..]);
+        assert_eq!(decoded[1], &pkts[1][..]);
+    }
+
+    #[test]
+    fn packet_batch_iter_rejects_oversized_packet() {
+        // Hand-craft a payload whose declared length is larger than
+        // MAX_RELAYED_PACKET — iterator must stop.
+        let mut payload = vec![1u8]; // count=1
+        let huge_len = (MAX_RELAYED_PACKET as u32 + 1) as u16;
+        payload.extend_from_slice(&huge_len.to_be_bytes());
+        payload.extend_from_slice(&vec![0u8; 1000]);
+        let decoded: Vec<&[u8]> = PacketBatchIter::new(&payload).collect();
+        assert!(decoded.is_empty(),
+            "iterator should reject oversized length, got {decoded:?}");
+    }
+
+    #[test]
+    fn packet_batch_iter_rejects_empty_payload() {
+        let mut iter = PacketBatchIter::new(&[]);
+        assert!(iter.next().is_none());
     }
 }
