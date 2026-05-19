@@ -39,16 +39,29 @@ const BETA_NUM: u32 = 1;
 const BETA_DEN: u32 = 4;
 /// RFC 6298 §2.1 "K = 4" — RTO ← SRTT + K·RTTVAR
 const K: u32 = 4;
-/// Default receive-side buffer cap. Bytes beyond this trigger zero-window
-/// ACKs that pause the peer until the app drains us.
+/// Starting receive-side buffer cap. Cold streams begin here; the
+/// auto-tuner grows it toward 2×BDP as throughput is observed, up to
+/// `MAX_RX_BUF_CAP`. 256 KB is enough to saturate up to ~20 Mbit/s
+/// on a 100 ms link without any growth, so short HTTP requests
+/// never pay the autotune cost.
 pub const DEFAULT_RX_BUF_CAP: u32 = 256 * 1024;
-/// Initial assumption for the peer's receive window before any ACK arrives.
-/// Matches DEFAULT_RX_BUF_CAP so the first burst can fill the peer's full
-/// buffer instead of stalling on a conservative guess.
+/// Upper bound on the auto-tuned receive buffer per stream. Caps the
+/// memory blast radius from a runaway peer: with the default 32 MB,
+/// even 100 concurrent streams use at most 3.2 GB. Operators on
+/// memory-rich nodes can raise this with `Reliability::with_max_cap`;
+/// 32 MB × 2-safety covers BDPs up to ~1.3 Gbit/s × 100 ms or
+/// ~13 Gbit/s × 10 ms (intra-DC).
+pub const MAX_RX_BUF_CAP: u32 = 32 * 1024 * 1024;
+/// Initial assumption for the peer's receive window before any ACK
+/// arrives. Matches DEFAULT_RX_BUF_CAP so the first burst can fill
+/// the peer's full buffer instead of stalling on a conservative
+/// guess. After the first ACK, the real peer-advertised window
+/// supersedes this.
 pub const INITIAL_PEER_WINDOW: u32 = DEFAULT_RX_BUF_CAP;
 /// Largest amount the reorder buffer can hold before we start dropping
-/// (and forcing the peer to retransmit). Mirrors rx_buf_cap.
-pub const REORDER_BYTE_CAP: u32 = 256 * 1024;
+/// (and forcing the peer to retransmit). Mirrors MAX_RX_BUF_CAP so a
+/// pathological reorder pattern can't exceed our per-stream cap.
+pub const REORDER_BYTE_CAP: u32 = MAX_RX_BUF_CAP;
 
 #[derive(Debug)]
 struct UnackedFrame {
@@ -144,6 +157,20 @@ pub struct Reliability {
     /// False until the first non-retransmitted frame has been ACKed.
     /// Karn's rule: retransmits never contribute a sample.
     have_rtt_sample: bool,
+
+    // ── Receive-window auto-tuning ───────────────────────────────────────
+    /// Hard upper bound this stream is willing to grow `rx_buf_cap` to.
+    /// Defaults to `MAX_RX_BUF_CAP`.
+    max_rx_buf_cap: u32,
+    /// EWMA of bytes/sec observed on the receive side. Drives the
+    /// `2 × BDP` target the autotuner aims at.
+    recv_rate_bps_ewma: u64,
+    /// Bytes accepted from the wire since the last `recv_rate_bps_ewma`
+    /// update. The autotuner refreshes the rate roughly every srtt.
+    bytes_in_window: u64,
+    /// When `bytes_in_window` started accumulating. None until the
+    /// first byte arrives.
+    rate_window_started: Option<Instant>,
 }
 
 impl Default for Reliability {
@@ -154,6 +181,15 @@ impl Default for Reliability {
 
 impl Reliability {
     pub fn new(rx_buf_cap: u32) -> Self {
+        Self::with_max_cap(rx_buf_cap, MAX_RX_BUF_CAP)
+    }
+
+    /// Variant that pins a per-stream upper bound on the auto-tuned
+    /// receive cap. Useful for memory-constrained nodes that want a
+    /// smaller-than-default ceiling, or operators of bigger boxes who
+    /// raise it.
+    pub fn with_max_cap(initial_rx_buf_cap: u32, max_rx_buf_cap: u32) -> Self {
+        let initial = initial_rx_buf_cap.min(max_rx_buf_cap);
         Self {
             next_seq: 0,
             unacked: VecDeque::new(),
@@ -166,13 +202,77 @@ impl Reliability {
             reorder: BTreeMap::new(),
             reorder_bytes: 0,
             rx_buf: VecDeque::new(),
-            rx_buf_cap,
+            rx_buf_cap: initial,
             peer_close_seq: None,
             eof_delivered: false,
             rto: INITIAL_RTO,
             srtt: Duration::ZERO,
             rttvar: Duration::ZERO,
             have_rtt_sample: false,
+            max_rx_buf_cap,
+            recv_rate_bps_ewma: 0,
+            bytes_in_window: 0,
+            rate_window_started: None,
+        }
+    }
+
+    /// Receiver-side auto-tune: grow `rx_buf_cap` toward 2×BDP as we
+    /// observe sustained throughput. Modelled on Linux's tcp_rmem
+    /// autotuning. Called from `on_recv_data` so growth tracks actual
+    /// inbound rate without needing a separate timer.
+    ///
+    /// The new cap takes effect in the very next `ack_state()` call,
+    /// so the sender learns about it on the next ACK and is free to
+    /// open its in-flight bytes accordingly.
+    fn maybe_grow_window(&mut self, bytes: u32, now: Instant) {
+        self.bytes_in_window = self.bytes_in_window.saturating_add(bytes as u64);
+        let started = match self.rate_window_started {
+            Some(s) => s,
+            None => {
+                self.rate_window_started = Some(now);
+                return;
+            }
+        };
+        // Refresh the EWMA roughly once per srtt — that's the natural
+        // cadence at which the BDP estimate becomes meaningful. Before
+        // the first RTT sample, fall back to 100 ms so we still react
+        // on cold links.
+        let interval = if self.have_rtt_sample {
+            self.srtt.max(Duration::from_millis(50))
+        } else {
+            Duration::from_millis(100)
+        };
+        let elapsed = now.duration_since(started);
+        if elapsed < interval {
+            return;
+        }
+        let inst_bps = if elapsed.is_zero() {
+            0
+        } else {
+            (self.bytes_in_window as f64 / elapsed.as_secs_f64()) as u64
+        };
+        // EWMA: α = 1/4 — fast enough to track real bursts, slow
+        // enough to ignore single-frame noise.
+        self.recv_rate_bps_ewma = if self.recv_rate_bps_ewma == 0 {
+            inst_bps
+        } else {
+            (self.recv_rate_bps_ewma * 3 + inst_bps) / 4
+        };
+        self.bytes_in_window = 0;
+        self.rate_window_started = Some(now);
+
+        if !self.have_rtt_sample || self.recv_rate_bps_ewma == 0 {
+            return;
+        }
+        // BDP in bytes = bps × srtt(seconds). Aim for 2×BDP so the
+        // sender always has room to keep the pipe full even between
+        // ACKs.
+        let bdp_bytes = (self.recv_rate_bps_ewma as f64 * self.srtt.as_secs_f64()) as u64;
+        let target = (bdp_bytes * 2)
+            .min(self.max_rx_buf_cap as u64)
+            .max(DEFAULT_RX_BUF_CAP as u64) as u32;
+        if target > self.rx_buf_cap {
+            self.rx_buf_cap = target;
         }
     }
 
@@ -330,6 +430,19 @@ impl Reliability {
         self.peer_window.saturating_sub(self.unacked_bytes)
     }
 
+    /// Current receive buffer cap (post auto-tune). Exposed for tests
+    /// and metrics — production code reads it implicitly through the
+    /// `(_, win)` pair returned by [`ack_state`].
+    pub fn rx_buf_cap(&self) -> u32 {
+        self.rx_buf_cap
+    }
+
+    /// EWMA of observed receive throughput (bytes/sec). Returns 0
+    /// before the first rate refresh.
+    pub fn recv_rate_bps(&self) -> u64 {
+        self.recv_rate_bps_ewma
+    }
+
     pub fn unacked_bytes(&self) -> u32 {
         self.unacked_bytes
     }
@@ -376,6 +489,10 @@ impl Reliability {
             out.send_ack = true;
             return out;
         }
+        // Feed the autotuner — counts wire bytes, not just accepted, so
+        // bursts above the current cap still register as load and grow
+        // the window on the next refresh.
+        self.maybe_grow_window(len, Instant::now());
         if seq == self.expected_seq {
             // In-order — flush directly into rx_buf.
             if self.rx_buf.len() as u32 + len > self.rx_buf_cap {
@@ -763,5 +880,62 @@ mod tests {
         let mut dst = [0u8; 5];
         assert_eq!(r.rx_drain(&mut dst), 5);
         assert!(r.eof_reached());
+    }
+
+    #[test]
+    fn autotune_grows_window_to_2x_bdp() {
+        // Drive the internal maybe_grow_window with synthetic time so
+        // the test is deterministic. We bypass on_recv_data because
+        // that uses Instant::now() — call the autotuner directly.
+        let mut r = Reliability::with_max_cap(DEFAULT_RX_BUF_CAP, MAX_RX_BUF_CAP);
+        // Seed an SRTT of 50 ms by record_sent + on_recv_ack.
+        let t_sent = Instant::now();
+        let seq = r.allocate_seq(4).unwrap();
+        r.record_sent(seq, vec![0u8; 4], t_sent);
+        r.on_recv_ack(seq.wrapping_add(4), INITIAL_PEER_WINDOW,
+                      t_sent + Duration::from_millis(50));
+        assert!(r.have_rtt_sample);
+        // Pretend the receiver consumed 10 MB across 200 ms = 50 MB/s.
+        // 2 × BDP = 2 × 50 MB/s × 0.05 s = 5 MB → should drive the cap
+        // above the initial 256 KB.
+        let t0 = Instant::now();
+        r.maybe_grow_window(5_000_000, t0);
+        r.maybe_grow_window(5_000_000, t0 + Duration::from_millis(200));
+        // After two updates the EWMA has a sample and the cap should
+        // have grown well past the default.
+        assert!(
+            r.rx_buf_cap() > DEFAULT_RX_BUF_CAP * 4,
+            "rx_buf_cap did not grow: {}", r.rx_buf_cap()
+        );
+        // And never above the configured ceiling.
+        assert!(r.rx_buf_cap() <= MAX_RX_BUF_CAP);
+    }
+
+    #[test]
+    fn autotune_respects_max_cap_override() {
+        let small_max = 1_000_000u32;
+        let mut r = Reliability::with_max_cap(DEFAULT_RX_BUF_CAP, small_max);
+        let t_sent = Instant::now();
+        let seq = r.allocate_seq(4).unwrap();
+        r.record_sent(seq, vec![0u8; 4], t_sent);
+        r.on_recv_ack(seq.wrapping_add(4), INITIAL_PEER_WINDOW,
+                      t_sent + Duration::from_millis(20));
+        let t0 = Instant::now();
+        // Sustained 500 MB/s with 20 ms RTT → 2×BDP = 20 MB, but max is
+        // pinned to 1 MB so we shouldn't go above that.
+        for i in 0..10 {
+            r.maybe_grow_window(10_000_000, t0 + Duration::from_millis(20 * (i + 1)));
+        }
+        assert!(r.rx_buf_cap() <= small_max,
+            "exceeded pinned max: cap={} max={}", r.rx_buf_cap(), small_max);
+    }
+
+    #[test]
+    fn autotune_idle_stream_stays_at_default() {
+        // A stream that receives one tiny burst then sits idle must
+        // not pay for the autotune machinery.
+        let mut r = Reliability::with_max_cap(DEFAULT_RX_BUF_CAP, MAX_RX_BUF_CAP);
+        let _ = r.on_recv_data(0, bytes("hi"));
+        assert_eq!(r.rx_buf_cap(), DEFAULT_RX_BUF_CAP);
     }
 }
