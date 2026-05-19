@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Header the exit sends as the very first Data frame of every
 /// accepted egress stream. The client reads it before forwarding any
@@ -269,6 +269,10 @@ impl AddressPool {
         self.v6_prefix
     }
 
+    /// True if this pool was configured with both v4 and v6 ranges.
+    /// Used by tests; production callers infer dual-stack from
+    /// `gateway_v6().is_some()`.
+    #[cfg(test)]
     pub fn dual_stack(&self) -> bool {
         self.v6_base.is_some()
     }
@@ -315,28 +319,48 @@ impl AddressPool {
 
 // ── Reverse table ─────────────────────────────────────────────────────────
 
-/// Maps an allocated IPv4 OR IPv6 address back to the channel that
-/// delivers outgoing packets to the right client. The exit-side TUN
-/// reader looks up the dst IP of each packet (v4 or v6) in this table
-/// to find which MeshStream to write to. A dual-stack lease registers
-/// twice — once per family — so packets in either direction find their
-/// peer with a single lookup.
+/// Reverse-routing table for the egress exit role. The TUN reader
+/// looks up the destination IP here to find which peer to send the
+/// packet to; the datagram receiver looks up the source peer's
+/// allocated lease here to anti-spoof.
+///
+/// Two maps so each direction is one O(1) lookup. They are kept in
+/// sync by `handle_egress_handshake` and never go stale because the
+/// same handshake task that registers also owns the cleanup on stream
+/// close. A dual-stack lease registers two `peer_by_ip` entries
+/// (one per family) so packets in either direction route correctly.
 #[derive(Default)]
 pub struct EgressTable {
-    by_ip: std::collections::HashMap<IpAddr, mpsc::Sender<Vec<u8>>>,
+    /// allocated IP → owning peer
+    peer_by_ip: std::collections::HashMap<IpAddr, bifrost_core::PubKey>,
+    /// peer → its allocated lease (for src-spoofing validation)
+    lease_by_peer: std::collections::HashMap<bifrost_core::PubKey, Lease>,
 }
 
 impl EgressTable {
-    pub fn insert(&mut self, ip: IpAddr, tx: mpsc::Sender<Vec<u8>>) {
-        self.by_ip.insert(ip, tx);
+    pub fn insert(&mut self, peer: bifrost_core::PubKey, lease: Lease) {
+        self.peer_by_ip.insert(IpAddr::V4(lease.v4), peer);
+        if let Some(v6) = lease.v6 {
+            self.peer_by_ip.insert(IpAddr::V6(v6), peer);
+        }
+        self.lease_by_peer.insert(peer, lease);
     }
 
-    pub fn remove(&mut self, ip: &IpAddr) {
-        self.by_ip.remove(ip);
+    pub fn remove_peer(&mut self, peer: &bifrost_core::PubKey) -> Option<Lease> {
+        let lease = self.lease_by_peer.remove(peer)?;
+        self.peer_by_ip.remove(&IpAddr::V4(lease.v4));
+        if let Some(v6) = lease.v6 {
+            self.peer_by_ip.remove(&IpAddr::V6(v6));
+        }
+        Some(lease)
     }
 
-    pub fn lookup(&self, ip: &IpAddr) -> Option<mpsc::Sender<Vec<u8>>> {
-        self.by_ip.get(ip).cloned()
+    pub fn peer_for_ip(&self, ip: &IpAddr) -> Option<bifrost_core::PubKey> {
+        self.peer_by_ip.get(ip).copied()
+    }
+
+    pub fn lease_of(&self, peer: &bifrost_core::PubKey) -> Option<Lease> {
+        self.lease_by_peer.get(peer).copied()
     }
 }
 
@@ -375,7 +399,7 @@ fn ensure_rule(prog: &str, args: &[&str]) -> Result<()> {
         .iter()
         .map(|&a| if a == "-A" { "-C" } else { a })
         .collect();
-    debug_assert!(check_args.iter().any(|&a| a == "-C"),
+    debug_assert!(check_args.contains(&"-C"),
                   "ensure_rule: caller must include an -A flag to rewrite");
     let already = Command::new(prog)
         .args(&check_args)
@@ -489,6 +513,7 @@ pub fn configure_exit_kernel(
 /// Configure the client-side TUN with the assigned v4 (and v6 if the
 /// exit provided one). install_default_route, when true, replaces the
 /// system default route in BOTH stacks where applicable.
+#[allow(clippy::too_many_arguments)] // mirrors the v4+v6 lease layout
 pub fn configure_client_kernel(
     tun_name: &str,
     v4_addr: Ipv4Addr,
@@ -554,8 +579,9 @@ fn subnet_v6_cidr_str(any_in_subnet: Ipv6Addr, prefix_len: u8) -> String {
 // ── Stream <-> TUN bridge for exit role ──────────────────────────────────
 
 #[cfg(feature = "tun")]
+#[allow(clippy::too_many_arguments)] // matches the v4/v6 pool config layout
 pub async fn start_exit(
-    _mux: Arc<MeshMux>,
+    mux: Arc<MeshMux>,
     mut accept_rx: mpsc::Receiver<AcceptedStream>,
     tun_name: String,
     v4_pool_base: Ipv4Addr,
@@ -589,9 +615,71 @@ pub async fn start_exit(
     let tun_writer = Arc::new(tokio::sync::Mutex::new(tun_writer));
     let table: SharedTable = Arc::new(Mutex::new(EgressTable::default()));
 
-    // TUN → mesh: parse v4 OR v6 packets, look up dst in the table,
-    // forward to the right MeshStream.
+    // Register the IP-packet datagram channel. Each Frame::Datagram
+    // landing on DATAGRAM_CHANNEL_EGRESS is one IP packet from a
+    // client; the read loop owns lookup-by-peer + anti-spoof + TUN
+    // write. Capacity 8192 matches the per-peer write channel; on
+    // overflow the mux drops packets (best-effort by design).
+    let mut datagram_rx = mux
+        .register_datagram_channel(bifrost_core::mux::DATAGRAM_CHANNEL_EGRESS, 8192)
+        .context("registering egress datagram channel")?;
+
+    // datagram → TUN: client packets land here. Anti-spoof against
+    // the peer's lease, then write the raw IP packet to the egress
+    // TUN. The kernel handles NAT (MASQUERADE) + routing.
+    let table_for_in = table.clone();
+    let tun_writer_in = tun_writer.clone();
+    tokio::spawn(async move {
+        while let Some(recv) = datagram_rx.recv().await {
+            let bifrost_core::mux::DatagramRecv { from, payload } = recv;
+            if payload.is_empty() { continue; }
+            let lease = table_for_in.lock().unwrap().lease_of(&from);
+            let Some(lease) = lease else {
+                trace!(
+                    "egress exit: datagram from unknown peer {} (no lease) — drop",
+                    hex::encode(&from[..8])
+                );
+                continue;
+            };
+            // Anti-spoof: reject packets whose src IP doesn't match
+            // the peer's allocated lease.
+            let version_nibble = payload[0] >> 4;
+            let spoofed = match version_nibble {
+                4 if payload.len() >= 20 => {
+                    let src = Ipv4Addr::new(payload[12], payload[13], payload[14], payload[15]);
+                    src != lease.v4
+                }
+                6 if payload.len() >= 40 => {
+                    let mut octets = [0u8; 16];
+                    octets.copy_from_slice(&payload[8..24]);
+                    let src = Ipv6Addr::from(octets);
+                    Some(src) != lease.v6
+                }
+                _ => true,
+            };
+            if spoofed {
+                if is_routable_dst(version_nibble, &payload) {
+                    debug!(
+                        "egress exit: spoofed packet from {} (ver={version_nibble}), drop",
+                        hex::encode(&from[..8])
+                    );
+                }
+                continue;
+            }
+            let mut w = tun_writer_in.lock().await;
+            if let Err(e) = w.write_all(&payload).await {
+                warn!("egress exit: TUN write failed: {e}");
+                break;
+            }
+        }
+        warn!("egress exit: datagram receiver exited");
+    });
+
+    // TUN → datagram: parse v4 / v6 dst, look up the owning peer,
+    // shoot off one mesh datagram. No per-stream queue, no ARQ —
+    // the upper-layer TCP/QUIC inside the tunnel handles loss.
     let table_for_tun = table.clone();
+    let mux_for_tun = mux.clone();
     tokio::spawn(async move {
         let mut reader = tun_reader;
         let mut buf = vec![0u8; 65536];
@@ -621,38 +709,43 @@ pub async fn start_exit(
                 }
                 _ => continue,
             };
-            // Filter out link-local multicasts the kernel generates on
-            // any new IPv6 interface (router/neighbour solicitations,
-            // MLDv2 reports). They have no peer behind them and would
-            // otherwise spam debug logs at boot.
+            // Drop link-local / multicast chatter that has no peer
+            // behind it (IPv6 ND, MLDv2, mDNS) — keeping these off
+            // the wire saves ~5% bandwidth on a fresh interface.
             let is_multicast = match &dst {
                 IpAddr::V4(v) => v.is_multicast(),
                 IpAddr::V6(v) => v.is_multicast(),
             };
-            if is_multicast {
-                continue;
-            }
-            let tx = table_for_tun.lock().unwrap().lookup(&dst);
-            if let Some(tx) = tx {
-                let _ = tx.send(pkt.to_vec()).await;
+            if is_multicast { continue; }
+            let peer = table_for_tun.lock().unwrap().peer_for_ip(&dst);
+            if let Some(peer) = peer {
+                if let Err(e) = mux_for_tun
+                    .send_datagram(&peer, bifrost_core::mux::DATAGRAM_CHANNEL_EGRESS, pkt)
+                    .await
+                {
+                    trace!("egress exit: datagram send to {} failed: {e}", hex::encode(&peer[..8]));
+                }
             } else {
-                debug!("egress exit: drop packet to unknown peer {dst}");
+                trace!("egress exit: drop packet to unknown peer {dst}");
             }
         }
         warn!("egress exit: tun reader exited");
     });
 
-    // Accept loop: pair each incoming Open(Egress) with a lease.
+    // Accept loop: pair each incoming Open(Egress) with a lease. The
+    // accepted MeshStream stays alive for the session's lifetime as
+    // a control channel — its half-close on disconnect triggers
+    // lease release. No data ever flows through the stream after the
+    // handshake; the per-stream ARQ is wasted on bulk packet traffic.
     while let Some(acc) = accept_rx.recv().await {
         if !matches!(acc.target, OpenTarget::Egress) {
             continue;
         }
         let pool = pool.clone();
         let table = table.clone();
-        let tun_writer = tun_writer.clone();
         tokio::spawn(async move {
-            handle_egress_stream(
-                acc, pool, table, tun_writer,
+            handle_egress_handshake(
+                acc, pool, table,
                 gw4, prefix4, gw6, prefix6,
             ).await;
         });
@@ -661,19 +754,29 @@ pub async fn start_exit(
     Ok(())
 }
 
+/// Handshake half of the exit-side state machine. Each accepted
+/// MeshStream becomes a *control channel only* — it carries OpenAck,
+/// the framed EgressHello, and the eventual half-close that signals
+/// disconnect. IP-packet bulk traffic rides on `Frame::Datagram`
+/// over the same MeshMux, looked up via the shared `EgressTable`.
+///
+/// This decouples reliable lease lifecycle (1-shot, must arrive)
+/// from best-effort packet relay (millions of frames, retransmits
+/// already happen at the TCP/QUIC layer *inside* the tunnel — doing
+/// them again in our ARQ caps single-flow throughput at ~5 Mbit/s).
 #[cfg(feature = "tun")]
-async fn handle_egress_stream(
+async fn handle_egress_handshake(
     acc: AcceptedStream,
     pool: SharedPool,
     table: SharedTable,
-    tun_writer: Arc<tokio::sync::Mutex<tokio::io::WriteHalf<tun2::AsyncDevice>>>,
     gateway_v4: Ipv4Addr,
     v4_prefix: u8,
     gateway_v6: Option<Ipv6Addr>,
     v6_prefix: u8,
 ) {
     let mut mesh = acc.stream;
-    let peer_short = hex::encode(&acc.from[..8]);
+    let peer = acc.from;
+    let peer_short = hex::encode(&peer[..8]);
     let lease = pool.lock().unwrap().allocate();
     let lease = match lease {
         Some(l) => l,
@@ -708,95 +811,30 @@ async fn handle_egress_stream(
         return;
     }
 
-    // Register reverse-routing entries for both stacks the lease holds.
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
-    {
-        let mut t = table.lock().unwrap();
-        t.insert(IpAddr::V4(lease.v4), out_tx.clone());
-        if let Some(v6) = lease.v6 {
-            t.insert(IpAddr::V6(v6), out_tx);
-        }
+    // Now the data plane is live: install the peer/lease in the
+    // shared table so the datagram fast-path can route packets to
+    // and from this client.
+    table.lock().unwrap().insert(peer, lease);
+
+    // Park here until the client half-closes (or its TCP dies). The
+    // mesh stream carries no further data — it's purely a session
+    // lifecycle marker. read_to_end completes on graceful Close;
+    // unexpected EOF / errors also fall through and tear the lease.
+    let mut throwaway = Vec::new();
+    let _ = mesh.read_to_end(&mut throwaway).await;
+    if !throwaway.is_empty() {
+        // Old clients (pre-datagram) sent IP packets through the
+        // stream; loudly flag those so the operator can roll forward.
+        warn!(
+            "egress exit: peer {} sent {} bytes on the control stream — \
+             expected datagram-path client (post-2026-05-19 build)",
+            peer_short, throwaway.len()
+        );
     }
 
-    let (mut mesh_reader, mut mesh_writer) = tokio::io::split(mesh);
-
-    // mesh → TUN
-    let tun_writer_clone = tun_writer.clone();
-    let lease_for_in = lease;
-    let peer_short_for_in = peer_short.clone();
-    let in_handle = tokio::spawn(async move {
-        let mut buf = vec![0u8; MAX_RELAYED_PACKET];
-        loop {
-            let n = match read_framed(&mut mesh_reader, &mut buf).await {
-                Ok(Some(n)) => n,
-                Ok(None) => break,
-                Err(e) => {
-                    warn!(
-                        "egress exit: framed read failed for {}: {e}",
-                        peer_short_for_in
-                    );
-                    break;
-                }
-            };
-            // Reject anything that doesn't look like an IP packet, and
-            // anti-spoof: confirm the src address matches the lease
-            // we handed this peer.
-            let version_nibble = buf[0] >> 4;
-            let spoofed = match version_nibble {
-                4 if n >= 20 => {
-                    let src = Ipv4Addr::new(buf[12], buf[13], buf[14], buf[15]);
-                    src != lease_for_in.v4
-                }
-                6 if n >= 40 => {
-                    let mut octets = [0u8; 16];
-                    octets.copy_from_slice(&buf[8..24]);
-                    let src = Ipv6Addr::from(octets);
-                    Some(src) != lease_for_in.v6
-                }
-                _ => true,
-            };
-            if spoofed {
-                // Skip the noisy debug for obvious kernel chatter
-                // (multicast, link-local, broadcast) — only log when
-                // the src address truly doesn't match the lease.
-                if is_routable_dst(version_nibble, &buf[..n]) {
-                    debug!(
-                        "egress exit: peer {} sent spoofed packet (ver={version_nibble}), drop",
-                        peer_short_for_in
-                    );
-                }
-                continue;
-            }
-            let mut w = tun_writer_clone.lock().await;
-            if let Err(e) = w.write_all(&buf[..n]).await {
-                warn!("egress exit: TUN write failed for {}: {e}", peer_short_for_in);
-                break;
-            }
-        }
-    });
-
-    // TUN → mesh
-    let out_handle = tokio::spawn(async move {
-        while let Some(pkt) = out_rx.recv().await {
-            if let Err(e) = write_framed(&mut mesh_writer, &pkt).await {
-                debug!("egress exit: mesh write failed: {e}");
-                break;
-            }
-        }
-        let _ = mesh_writer.shutdown().await;
-    });
-
-    let _ = in_handle.await;
-    let _ = out_handle.await;
-    {
-        let mut t = table.lock().unwrap();
-        t.remove(&IpAddr::V4(lease.v4));
-        if let Some(v6) = lease.v6 {
-            t.remove(&IpAddr::V6(v6));
-        }
-    }
+    table.lock().unwrap().remove_peer(&peer);
     pool.lock().unwrap().release(lease);
-    info!("egress exit: closed stream for {peer_short} ({alloc_desc})");
+    info!("egress exit: closed session for {peer_short} ({alloc_desc})");
 }
 
 // ── Stream <-> TUN bridge for client role ────────────────────────────────
@@ -888,39 +926,54 @@ pub async fn start_client(
 
     let (mut tun_reader, tun_writer) = tokio::io::split(dev);
     let tun_writer = Arc::new(tokio::sync::Mutex::new(tun_writer));
-    let (mut mesh_reader, mut mesh_writer) = tokio::io::split(mesh);
 
-    // mesh → TUN
+    // Register the IP-packet datagram channel for inbound traffic
+    // from the exit. Same channel tag both sides use; the mux
+    // dispatches by tag, so other subsystems on the same node
+    // (bifrost-socks5d on a different stream id) don't collide.
+    let mut datagram_rx = mux
+        .register_datagram_channel(bifrost_core::mux::DATAGRAM_CHANNEL_EGRESS, 8192)
+        .context("registering egress datagram channel")?;
+
+    // datagram → TUN: write every inbound IP packet from the exit
+    // straight to the local TUN. We trust PacketConn's peer
+    // authentication — any datagram on this channel comes from a
+    // peer that authenticated to our session, so we don't need a
+    // second-layer signature here. Filter by source pub-key so
+    // unrelated peers can't shove packets at our TUN.
     let tun_writer_clone = tun_writer.clone();
     tokio::spawn(async move {
-        let mut buf = vec![0u8; MAX_RELAYED_PACKET];
-        loop {
-            let n = match read_framed(&mut mesh_reader, &mut buf).await {
-                Ok(Some(n)) => n,
-                Ok(None) => break,
-                Err(e) => {
-                    warn!("egress client: framed read failed: {e}");
-                    break;
-                }
-            };
+        while let Some(recv) = datagram_rx.recv().await {
+            if recv.from != exit_peer {
+                trace!(
+                    "egress client: dropping datagram from unexpected peer {}",
+                    hex::encode(&recv.from[..8])
+                );
+                continue;
+            }
             let mut w = tun_writer_clone.lock().await;
-            if let Err(e) = w.write_all(&buf[..n]).await {
+            if let Err(e) = w.write_all(&recv.payload).await {
                 warn!("egress client: TUN write failed: {e}");
                 break;
             }
         }
+        warn!("egress client: datagram receiver exited");
     });
 
-    // TUN → mesh (both IPv4 and IPv6).
+    // TUN → datagram: every packet from the local TUN heads straight
+    // to the exit as one datagram. No length framing (the mesh
+    // preserves message boundaries), no ARQ (CUBIC inside the tunnel
+    // handles loss). Single-fut send semantics are gone — each call
+    // to send_datagram returns once the bytes are in the kernel TCP
+    // buffer, so back-to-back TUN reads pipeline naturally.
     //
-    // We drop link-local / multicast / loopback destinations at the
-    // client side: those packets are kernel chatter (IPv6 ND, mDNS,
-    // ARP-equivalents) that have no peer on the exit, would always
-    // get rejected as spoofed, and pollute the wire. Keeping them
-    // local is also a tiny privacy win — the exit operator never
-    // sees the client's link-local solicitations.
+    // Filter link-local / multicast / loopback destinations on the
+    // way out — kernel chatter (IPv6 ND, mDNS, ARP equivalents) has
+    // no peer behind it on the exit, would get rejected as spoofed,
+    // and only wastes wire bytes.
+    let mux_for_tun = mux.clone();
     tokio::spawn(async move {
-        let mut buf = vec![0u8; MAX_RELAYED_PACKET];
+        let mut buf = vec![0u8; 65536];
         loop {
             let n = match tun_reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
@@ -937,12 +990,24 @@ pub async fn start_client(
             if !is_routable_dst(version_nibble, pkt) {
                 continue;
             }
-            if let Err(e) = write_framed(&mut mesh_writer, pkt).await {
-                debug!("egress client: mesh write failed: {e}");
-                break;
+            if let Err(e) = mux_for_tun
+                .send_datagram(&exit_peer, bifrost_core::mux::DATAGRAM_CHANNEL_EGRESS, pkt)
+                .await
+            {
+                trace!("egress client: datagram send failed: {e}");
             }
         }
-        let _ = mesh_writer.shutdown().await;
+        warn!("egress client: tun reader exited");
+    });
+
+    // Hold the control MeshStream alive in the background. Half-close
+    // by the exit on lease release surfaces as EOF here; for now we
+    // just log and let the TUN sit (process exit cleans up properly).
+    // A future revision could trigger a graceful TUN teardown.
+    tokio::spawn(async move {
+        let mut throwaway = Vec::new();
+        let _ = mesh.read_to_end(&mut throwaway).await;
+        warn!("egress client: control stream closed by exit");
     });
 
     Ok(())
