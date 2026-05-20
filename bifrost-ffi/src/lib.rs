@@ -54,12 +54,14 @@ use tokio::runtime::Runtime;
 use tracing::{error, info};
 
 mod host_tun;
+mod vhdr;
 
 /// Android JNI bridge — compiled only for `*-linux-android` targets.
 #[cfg(target_os = "android")]
 mod android;
 
 use host_tun::HostTun;
+use vhdr::VhdrTun;
 
 // ── ABI status codes ────────────────────────────────────────────
 
@@ -237,7 +239,12 @@ pub unsafe extern "C" fn bifrost_client_start(
         );
         let host = HostTun::from_owned_fd(dup_fd)
             .context("wrapping host TUN fd")?;
-        let (r, w) = tokio::io::split(host);
+        // The host TUN is plain IP; the mesh data plane is virtio-framed
+        // and may carry GSO super-segments. `VhdrTun` bridges the two —
+        // prepends the vhdr on read, segments + strips it on write — so
+        // a plain mobile TUN works without any exit-side change.
+        let framed = VhdrTun::new(host);
+        let (r, w) = tokio::io::split(framed);
         run_client_pump(r, w, mux, exit_peer, mesh)
             .await
             .context("run_client_pump")?;
