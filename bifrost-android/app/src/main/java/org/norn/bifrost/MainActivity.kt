@@ -176,7 +176,12 @@ class MainActivity : Activity() {
     private fun buildNodeConfig(): String {
         val pk = privKey.text.toString().trim()
         val peer = exitAddr.text.toString().trim().jsonEscape()
-        return """{"private_key":"$pk","listen":[],"peers":["$peer"],"tun_name":null}"""
+        // A phone client only ever talks to its configured exit: no LAN
+        // multicast / mDNS discovery, and no on-disk peer cache (the
+        // default path is a server location the app can't write).
+        return """{"private_key":"$pk","listen":[],"peers":["$peer"],""" +
+            """"tun_name":null,"multicast_enabled":false,"mdns_enabled":false,""" +
+            """"peer_cache_path":""}"""
     }
 
     private fun String.jsonEscape(): String =
