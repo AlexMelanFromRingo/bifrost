@@ -9,7 +9,9 @@ android {
 
     defaultConfig {
         applicationId = "org.norn.bifrost"
-        minSdk = 26
+        // 29 (Android 10): MediaStore.Downloads lets the app drop its
+        // log into the public Downloads folder with no permissions.
+        minSdk = 29
         targetSdk = 34
         versionCode = 1
         versionName = "0.1"

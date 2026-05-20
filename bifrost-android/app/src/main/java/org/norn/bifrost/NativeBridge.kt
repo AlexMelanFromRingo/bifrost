@@ -17,8 +17,14 @@ object NativeBridge {
      * the session ends. **Blocks for the whole session** — must be
      * called on a dedicated background thread. Returns a BifrostStatus
      * code: 0 = clean exit, non-zero = failure (see [nativeLastError]).
+     *
+     * [logPath] is a plain filesystem path the native side appends its
+     * `tracing` log to (the norn-rs connect/handshake events). Empty
+     * disables the native file log.
      */
-    external fun nativeRunClient(tunFd: Int, configJson: String, exitKeyHex: String): Int
+    external fun nativeRunClient(
+        tunFd: Int, configJson: String, exitKeyHex: String, logPath: String,
+    ): Int
 
     /** Human-readable description of the most recent native failure. */
     external fun nativeLastError(): String

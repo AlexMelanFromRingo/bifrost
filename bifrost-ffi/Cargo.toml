@@ -28,15 +28,9 @@ hex.workspace = true
 libc = "0.2"
 
 # Android-only: the JNI bridge so a Kotlin `VpnService` can drive the
-# client data plane without a hand-written C shim. Compiled only for
-# `*-linux-android` targets, so desktop / iOS builds never pull it.
+# client data plane without a hand-written C shim, plus a file-backed
+# `tracing` subscriber so the Rust-side connect/handshake logs land
+# somewhere the app can read. Compiled only for `*-linux-android`.
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
-
-# Platform log sinks are intentionally NOT pulled in here: the
-# tracing-android / tracing-oslog crates are unmaintained and have
-# spotty NDK / SDK compatibility. The host app is expected to
-# forward Rust log lines through its own logging pipeline by
-# capturing stderr (Android: Process.exec redirect; iOS: dup2 over
-# the os_log fd). Until that pattern proves insufficient there's
-# no reason to take the dep.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
