@@ -68,11 +68,21 @@ async fn main() -> Result<()> {
 }
 
 async fn run(config_path: std::path::PathBuf) -> Result<()> {
-    let cfg = DaemonConfig::load(&config_path)?;
+    let mut cfg = DaemonConfig::load(&config_path)?;
     init_logging(&cfg.node.log_level);
 
     let started_at = Instant::now();
     info!("starting bifrost-socks5d in {:?} mode", cfg.mode);
+
+    // bifrost-socks5d routes everything over MeshMux — it never wants
+    // the norn-rs L3 mesh TUN. Leaving `node.tun_name` set would spawn
+    // a second reader of `PacketConn::read_from` racing MeshMux for
+    // frames (and, run as root, needlessly create a `norn0` device).
+    // Force it off, same as `bifrost-vpnd` does for exit/client modes.
+    if let Some(t) = cfg.node.tun_name.take() {
+        warn!("socks5d: ignoring node.tun_name={t:?} — MeshMux owns the receive path");
+    }
+
     let node = Node::new(cfg.node.clone()).await.context("starting norn node")?;
     node.start().await.context("starting norn subsystems")?;
     let conn = node.conn.clone();

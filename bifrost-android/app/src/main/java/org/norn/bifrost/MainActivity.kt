@@ -145,6 +145,7 @@ class MainActivity : Activity() {
             putExtra(BifrostVpnService.EXTRA_CONFIG, buildNodeConfig())
             putExtra(BifrostVpnService.EXTRA_EXIT_KEY, exitKey.text.toString().trim())
             putExtra(BifrostVpnService.EXTRA_TUN_ADDR, tunAddr.text.toString().trim())
+            putExtra(BifrostVpnService.EXTRA_EXIT_ADDR, exitAddr.text.toString().trim())
         }
         startService(svc)
         status.text = "VPN starting — traffic now routes through the exit\n" +
