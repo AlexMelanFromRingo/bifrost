@@ -13,18 +13,23 @@ object NativeBridge {
     external fun nativeAbiVersion(): Int
 
     /**
-     * Bring up the client tunnel over [tunFd] and pump traffic until
-     * the session ends. **Blocks for the whole session** — must be
-     * called on a dedicated background thread. Returns a BifrostStatus
-     * code: 0 = clean exit, non-zero = failure (see [nativeLastError]).
+     * Bring up the client tunnel over [tunFd]. **Blocks** for the
+     * handshake (a few seconds) — call on a background thread — then
+     * returns: the data plane keeps running on the native runtime.
+     *
+     * Returns an opaque handle to the live tunnel; keep it and pass it
+     * to [nativeClientStop] to tear down. `0` means the connection
+     * failed (see [nativeLastError]).
      *
      * [logPath] is a plain filesystem path the native side appends its
-     * `tracing` log to (the norn-rs connect/handshake events). Empty
-     * disables the native file log.
+     * `tracing` log to. Empty disables the native file log.
      */
-    external fun nativeRunClient(
+    external fun nativeClientStart(
         tunFd: Int, configJson: String, exitKeyHex: String, logPath: String,
-    ): Int
+    ): Long
+
+    /** Tear down a tunnel returned by [nativeClientStart]. Null-safe (0 = no-op). */
+    external fun nativeClientStop(handle: Long)
 
     /** Human-readable description of the most recent native failure. */
     external fun nativeLastError(): String

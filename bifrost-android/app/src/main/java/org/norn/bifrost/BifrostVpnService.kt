@@ -7,26 +7,30 @@ import kotlin.concurrent.thread
 
 /**
  * The VPN tunnel service. On start it builds a TUN via
- * [VpnService.Builder], hands the file descriptor to the native client
- * pump, and lets [NativeBridge.nativeRunClient] block on a worker
- * thread for the life of the session.
+ * [VpnService.Builder] and hands the file descriptor to the native
+ * client.
+ *
+ * ## Lifecycle
+ *
+ * `NativeBridge.nativeClientStart` blocks only for the handshake, then
+ * returns a handle to a tunnel that keeps running on the native tokio
+ * runtime. The service holds that handle for the whole session and
+ * passes it to `nativeClientStop` on teardown. (An earlier version
+ * mistakenly stopped the tunnel right after start — the VPN came up
+ * for ~100 ms and dropped.)
  *
  * ## Why the routes exclude the exit IP
  *
- * A VpnService that routes `0.0.0.0/0` captures *every* socket the app
- * opens — including the native mesh transport's TCP socket to the
- * exit. That socket would then be routed into the very tunnel it is
- * building: a deadlock, no traffic at all. So instead of one
- * `0.0.0.0/0` route we install the 32 CIDR blocks covering everything
- * *except* the exit's `/32`.
- *
- * Every step is logged (see [Logger]); the session log is exported to
- * the Downloads folder when the pump exits.
+ * A VpnService routing `0.0.0.0/0` captures every socket the app
+ * opens — including the mesh transport's TCP socket to the exit, which
+ * would then loop into its own tunnel. So we route everything *except*
+ * the exit's `/32`.
  */
 class BifrostVpnService : VpnService() {
 
     @Volatile private var tun: ParcelFileDescriptor? = null
-    @Volatile private var worker: Thread? = null
+    @Volatile private var nativeHandle: Long = 0L
+    @Volatile private var stopRequested: Boolean = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Logger.init(this)
@@ -49,10 +53,11 @@ class BifrostVpnService : VpnService() {
     }
 
     private fun startTunnel(config: String, exitKey: String, tunAddr: String, exitAddr: String) {
-        if (worker != null) {
+        if (tun != null) {
             Logger.line("service: tunnel already running — ignoring start")
             return
         }
+        stopRequested = false
         Logger.startSession()
         Logger.line("service: starting tunnel — tunAddr=$tunAddr exitAddr=$exitAddr")
         Logger.line("service: exit key=${exitKey.take(16)}…")
@@ -87,30 +92,45 @@ class BifrostVpnService : VpnService() {
         }
         tun = pfd
         val fd = pfd.fd
-        Logger.line("service: TUN established, fd=$fd — starting native pump")
+        Logger.line("service: TUN established, fd=$fd — connecting (handshake may take a few s)")
 
-        worker = thread(name = "bifrost-pump", isDaemon = true) {
-            val status = try {
-                NativeBridge.nativeRunClient(fd, config, exitKey, Logger.nativeLogPath())
+        thread(name = "bifrost-connect", isDaemon = true) {
+            val handle = try {
+                NativeBridge.nativeClientStart(fd, config, exitKey, Logger.nativeLogPath())
             } catch (t: Throwable) {
-                Logger.line("service: native pump threw: ${t.javaClass.simpleName}: ${t.message}")
-                -1
+                Logger.line("service: nativeClientStart threw: ${t.javaClass.simpleName}: ${t.message}")
+                0L
             }
-            val err = try { NativeBridge.nativeLastError() } catch (_: Throwable) { "?" }
-            Logger.line("service: native pump exited — status=$status lastError=$err")
-            Logger.line("service: status meaning — 0=clean 1=bad-arg 2=tun-fd 3=node-init " +
-                "4=handshake 5=runtime")
-            val saved = Logger.exportToDownloads(this)
-            Logger.line(
-                if (saved != null) "service: session log saved to Downloads/$saved"
-                else "service: could not export log to Downloads"
-            )
-            stopTunnel()
+            if (handle == 0L) {
+                val err = try { NativeBridge.nativeLastError() } catch (_: Throwable) { "?" }
+                Logger.line("service: connect FAILED — $err")
+                exportLog()
+                stopTunnel()
+                return@thread
+            }
+            // Tunnel is up and stays up on the native runtime.
+            if (stopRequested) {
+                // Disconnected while we were still connecting — tear down now.
+                Logger.line("service: stop requested during connect — stopping fresh tunnel")
+                NativeBridge.nativeClientStop(handle)
+            } else {
+                nativeHandle = handle
+                Logger.line("service: tunnel UP — traffic now routes through the exit")
+            }
+            exportLog()
         }
     }
 
     private fun stopTunnel() {
-        worker = null
+        stopRequested = true
+        val h = nativeHandle
+        nativeHandle = 0L
+        if (h != 0L) {
+            Logger.line("service: stopping native tunnel")
+            try { NativeBridge.nativeClientStop(h) } catch (t: Throwable) {
+                Logger.line("service: nativeClientStop threw: ${t.message}")
+            }
+        }
         try {
             tun?.close()
         } catch (t: Throwable) {
@@ -118,6 +138,15 @@ class BifrostVpnService : VpnService() {
         }
         tun = null
         stopSelf()
+    }
+
+    /** Best-effort copy of the session log into Downloads. */
+    private fun exportLog() {
+        val saved = Logger.exportToDownloads(this)
+        Logger.line(
+            if (saved != null) "service: session log saved to Downloads/$saved"
+            else "service: could not export log to Downloads"
+        )
     }
 
     override fun onRevoke() {
@@ -154,8 +183,7 @@ class BifrostVpnService : VpnService() {
 
         /**
          * The 32 CIDR routes covering `0.0.0.0/0` minus the single host
-         * [excludeIp] — each the sibling subtree at one prefix length
-         * that does not contain the excluded host.
+         * [excludeIp].
          */
         fun routesExcluding(excludeIp: String): List<Pair<String, Int>> {
             val h = ipToInt(excludeIp)
