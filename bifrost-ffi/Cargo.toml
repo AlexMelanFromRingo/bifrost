@@ -27,6 +27,12 @@ hex.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Android-only: the JNI bridge so a Kotlin `VpnService` can drive the
+# client data plane without a hand-written C shim. Compiled only for
+# `*-linux-android` targets, so desktop / iOS builds never pull it.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
 # Platform log sinks are intentionally NOT pulled in here: the
 # tracing-android / tracing-oslog crates are unmaintained and have
 # spotty NDK / SDK compatibility. The host app is expected to
