@@ -3,34 +3,39 @@
 //! This module replaces the `tun2` crate dependency for
 //! `bifrost-vpnd`'s exit/client data plane. The motivation is
 //! `IFF_VNET_HDR` — `tun2` doesn't expose it, but we need the
-//! virtio framing so the kernel can hand us TCP/UDP super-segments
-//! via TSO/USO instead of one syscall per IP packet. See
-//! [`crate::tun_offload`] for the wire format and the offload-flag
-//! constants; that module already shipped the encode/decode + the
-//! `TUNSETOFFLOAD` ioctl wrapper as a foundation.
+//! virtio framing so the kernel can hand us (and accept from us)
+//! TCP/UDP super-segments via TSO/USO instead of one syscall per
+//! IP packet. See [`crate::tun_offload`] for the wire format and
+//! the offload-flag constants.
 //!
-//! ## What this commit wires in
+//! ## What it does
 //!
 //! * Open `/dev/net/tun` with `O_NONBLOCK | O_CLOEXEC`.
 //! * `TUNSETIFF` with `IFF_TUN | IFF_NO_PI | IFF_VNET_HDR`.
-//! * Best-effort `TUNSETOFFLOAD` with caller-provided flags
-//!   (default: `TUN_F_CSUM`, the safest immediate win — kernel
-//!   skips checksum computation for already-checksummed packets).
+//! * Best-effort `TUNSETOFFLOAD` with caller-provided flags.
+//!   [`OffloadTun::DEFAULT_OFFLOAD`] turns on `TUN_F_CSUM` plus
+//!   `TSO4`/`TSO6`/`USO4`; `try_enable_tun_offload` has a USO-aware
+//!   retry so kernels older than 6.0 fall back to TSO-only rather
+//!   than failing the ioctl outright.
 //! * `SIOCSIFMTU` for MTU.
 //! * `AsyncFd<OwnedFd>` for tokio integration.
-//! * [`AsyncRead`] strips the leading 12-byte `virtio_net_hdr` from
-//!   every kernel read so callers continue to see plain IP packets.
-//! * [`AsyncWrite`] prepends a zero `virtio_net_hdr` via `writev(2)`
-//!   so there's no copy on the hot send path.
+//! * [`AsyncRead`] / [`AsyncWrite`] pass the kernel's
+//!   `[virtio_net_hdr | ip_packet]` slab through *verbatim* — the
+//!   10-byte header is neither stripped on read nor synthesised on
+//!   write.
 //!
-//! ## What this commit does NOT do
+//! ## How GSO super-segments cross the mesh
 //!
-//! GSO super-segments aren't yet re-segmented before mesh forwarding.
-//! With only `TUN_F_CSUM` enabled the kernel never produces them,
-//! so the per-packet behaviour is unchanged on the wire — we just
-//! save the checksum compute on both ends. Enabling `TSO4`/`TSO6`/
-//! `USO4`/`USO6` is a follow-up (the encode/decode in
-//! `tun_offload` is ready; the re-segmenter on read isn't).
+//! With TSO/USO enabled the kernel coalesces a flow into super-
+//! segments up to ~64 KiB, each prefixed by a `virtio_net_hdr` that
+//! says how to cut it back into MTU-sized packets. Rather than
+//! re-segment in userspace before mesh forwarding, bifrost carries
+//! the `virtio_net_hdr` end-to-end: the whole `[vhdr | payload]`
+//! slab rides one `Frame::Datagram` (hence `MAX_RELAYED_PACKET` is
+//! 60 KiB) and is written to the far TUN verbatim, leaving the
+//! *exit kernel* to do the segmentation. `EgressHello` v3 negotiates
+//! the `EGRESS_CAP_VNET_HDR` capability so this framing is used only
+//! when both ends agree on it.
 //!
 //! ## Why this is Linux-only
 //!
