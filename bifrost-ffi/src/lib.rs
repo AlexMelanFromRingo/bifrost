@@ -244,6 +244,27 @@ pub unsafe extern "C" fn bifrost_client_start(
         // prepends the vhdr on read, segments + strips it on write — so
         // a plain mobile TUN works without any exit-side change.
         let framed = VhdrTun::new(host);
+        // Periodic data-plane counters — surfaces "tunnel up but no
+        // traffic" instantly: which direction (if any) carries bytes.
+        let stats = framed.stats();
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            let (mut pu, mut pd) = (0u64, 0u64);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let (up, down) =
+                    (stats.up_bytes.load(Relaxed), stats.down_bytes.load(Relaxed));
+                let (upp, downp) =
+                    (stats.up_pkts.load(Relaxed), stats.down_pkts.load(Relaxed));
+                info!(
+                    "data plane: host->exit {upp} pkt / {up} B | exit->host {downp} pkt / \
+                     {down} B (last 5s: up {} B, down {} B)",
+                    up - pu, down - pd,
+                );
+                pu = up;
+                pd = down;
+            }
+        });
         let (r, w) = tokio::io::split(framed);
         run_client_pump(r, w, mux, exit_peer, mesh)
             .await

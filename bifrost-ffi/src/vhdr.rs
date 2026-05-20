@@ -23,6 +23,8 @@
 use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bifrost_vpnd::tun_offload::{gso_type, VIRTIO_NET_HDR_LEN};
@@ -35,6 +37,18 @@ const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 
+/// Data-plane byte/packet counters, shared with a logger task so the
+/// app can see whether traffic is actually flowing each direction.
+#[derive(Default)]
+pub struct TunStats {
+    /// Plain IP packets read from the host TUN (host → mesh → exit).
+    pub up_pkts: AtomicU64,
+    pub up_bytes: AtomicU64,
+    /// Plain IP packets written to the host TUN (exit → mesh → host).
+    pub down_pkts: AtomicU64,
+    pub down_bytes: AtomicU64,
+}
+
 /// A plain host TUN presented to the mesh data plane as a
 /// virtio-framed, GSO-capable TUN.
 pub struct VhdrTun<S> {
@@ -42,11 +56,17 @@ pub struct VhdrTun<S> {
     /// Segmented packets produced from one write slot, not yet handed
     /// to `inner` (drained on the next poll_write / poll_flush).
     pending: VecDeque<Vec<u8>>,
+    stats: Arc<TunStats>,
 }
 
 impl<S> VhdrTun<S> {
     pub fn new(inner: S) -> Self {
-        Self { inner, pending: VecDeque::new() }
+        Self { inner, pending: VecDeque::new(), stats: Arc::new(TunStats::default()) }
+    }
+
+    /// A shared handle to the live byte counters (for a logger task).
+    pub fn stats(&self) -> Arc<TunStats> {
+        self.stats.clone()
     }
 }
 
@@ -73,6 +93,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for VhdrTun<S> {
                 if dst.filled().len() == before + VHDR {
                     // inner produced nothing (EOF) — undo the vhdr stub.
                     dst.set_filled(before);
+                } else {
+                    let ip_len = (dst.filled().len() - before - VHDR) as u64;
+                    me.stats.up_pkts.fetch_add(1, Ordering::Relaxed);
+                    me.stats.up_bytes.fetch_add(ip_len, Ordering::Relaxed);
                 }
                 Poll::Ready(Ok(()))
             }
@@ -143,6 +167,8 @@ impl<S: AsyncWrite + Unpin> VhdrTun<S> {
             match Pin::new(&mut self.inner).poll_write(cx, front) {
                 Poll::Ready(Ok(_)) => {
                     // A TUN write is packet-atomic — the packet is gone.
+                    self.stats.down_pkts.fetch_add(1, Ordering::Relaxed);
+                    self.stats.down_bytes.fetch_add(front.len() as u64, Ordering::Relaxed);
                     self.pending.pop_front();
                 }
                 Poll::Ready(Err(e)) => {
