@@ -37,11 +37,13 @@ toml.workspace = true
 clap.workspace = true
 hex.workspace = true
 
-# Foundation for kernel-side TUN offload (`IFF_VNET_HDR` +
-# `TUNSETOFFLOAD`). Linux-only — wraps the ioctl. The module
-# (`src/tun_offload.rs`) is unconditional so its unit tests run
-# everywhere; the actual ioctl is `#[cfg(target_os = "linux")]`.
-[target.'cfg(target_os = "linux")'.dependencies]
+# `libc` is needed on every unix target, not just Linux: `admin.rs`
+# uses `libc::umask` unconditionally, and `bifrost-ffi` compiles this
+# crate for `*-linux-android` to drive the mobile client data plane.
+# The Linux-only bits (the `TUNSETOFFLOAD` ioctl in `tun_offload.rs`,
+# the whole of `tun_dev.rs`) stay gated with `#[cfg(target_os = "linux")]`
+# inside the source.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

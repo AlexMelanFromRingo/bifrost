@@ -55,6 +55,10 @@ use tracing::{error, info};
 
 mod host_tun;
 
+/// Android JNI bridge — compiled only for `*-linux-android` targets.
+#[cfg(target_os = "android")]
+mod android;
+
 use host_tun::HostTun;
 
 // ── ABI status codes ────────────────────────────────────────────
