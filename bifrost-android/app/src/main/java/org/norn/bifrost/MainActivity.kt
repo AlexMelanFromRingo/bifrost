@@ -40,6 +40,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        Logger.init(this)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -88,6 +89,14 @@ class MainActivity : Activity() {
                 privKey.setText(randomPrivateKey())
                 save()
                 status.text = "new identity generated — the exit will lease a fresh IP"
+            }
+        })
+        root.addView(Button(this).apply {
+            text = "Save log to Downloads"
+            setOnClickListener {
+                val name = Logger.exportToDownloads(this@MainActivity)
+                status.text = if (name != null) "log saved: Downloads/$name"
+                    else "no log to save yet — connect first"
             }
         })
 
