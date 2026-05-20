@@ -47,6 +47,14 @@ pub(crate) struct StreamEntry {
     pub reliability: Arc<Mutex<Reliability>>,
     pub peer: PubKey,
     pub sid: StreamId,
+    /// Monotonic install generation. The `(peer, sid)` key is *not*
+    /// unique over time: a peer that drops and reconnects restarts its
+    /// `next_sid` sequence from 0, so its fresh `Open` collides with
+    /// the entry from the dead connection. The generation lets
+    /// `drop_stream` tell a stale stream's `Drop` apart from the live
+    /// successor that now owns the same key — without it, a retired
+    /// stream's teardown silently evicts its replacement.
+    pub generation: u64,
     /// Lock-free hint: "this stream has at least one Data/Close frame
     /// awaiting an ACK from the peer". The retransmit task reads this
     /// once per stream per tick (50 ms) and skips the
@@ -68,6 +76,7 @@ pub(crate) struct StreamEntry {
 struct StreamTable {
     entries: HashMap<(PubKey, StreamId), StreamEntry>,
     next_sid: u32,
+    next_generation: u64,
 }
 
 impl StreamTable {
@@ -75,6 +84,14 @@ impl StreamTable {
         let sid = self.next_sid;
         self.next_sid = self.next_sid.wrapping_add(1);
         sid
+    }
+
+    /// Hand out the next install generation (see `StreamEntry::generation`).
+    /// Starts at 1 so 0 is free as a "never installed" sentinel; a `u64`
+    /// counter cannot realistically wrap within a process lifetime.
+    fn allocate_generation(&mut self) -> u64 {
+        self.next_generation += 1;
+        self.next_generation
     }
 }
 
@@ -193,23 +210,25 @@ impl MeshMux {
         let (tx, rx) = mpsc::channel(INBOUND_CHAN_DEPTH);
         let reliability = Arc::new(Mutex::new(Reliability::default()));
         let has_unacked = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let sid = {
+        let (sid, generation) = {
             let mut t = self.table.lock().expect("StreamTable mutex poisoned");
             let sid = t.allocate();
+            let generation = t.allocate_generation();
             t.entries.insert(
                 (peer, sid),
                 StreamEntry {
-                    tx, reliability: reliability.clone(), peer, sid,
+                    tx, reliability: reliability.clone(), peer, sid, generation,
                     has_unacked: has_unacked.clone(),
                 },
             );
-            sid
+            (sid, generation)
         };
-        let stream = MeshStream::new(self.clone(), peer, sid, rx, reliability, has_unacked);
+        let stream =
+            MeshStream::new(self.clone(), peer, sid, generation, rx, reliability, has_unacked);
         let frame = Frame::Open { sid, target };
         let bytes = frame.encode()?;
         if let Err(e) = write_with_session_wait(&self.conn, &peer, &bytes).await {
-            self.drop_stream(&peer, sid);
+            self.drop_stream(&peer, sid, generation);
             anyhow::bail!("write_to(open): {e}");
         }
         Ok(stream)
@@ -223,13 +242,22 @@ impl MeshMux {
     }
 
     /// Forget an entry — called by MeshStream on Drop or after a Reset.
-    pub fn drop_stream(&self, peer: &PubKey, sid: StreamId) {
-        if let Ok(mut t) = self.table.lock() {
+    /// `generation` guards against a *stale* stream (one already
+    /// replaced by a reconnecting peer, see `StreamEntry::generation`)
+    /// evicting the live successor that now holds the same `(peer, sid)`.
+    pub fn drop_stream(&self, peer: &PubKey, sid: StreamId, generation: u64) {
+        if let Ok(mut t) = self.table.lock()
+            && t.entries.get(&(*peer, sid)).is_some_and(|e| e.generation == generation)
+        {
             t.entries.remove(&(*peer, sid));
         }
     }
 
-    /// Server-side accept-completion. Returns false on duplicate Open.
+    /// Server-side accept-completion. Installs the inbound stream and
+    /// returns its generation. If an entry for `(peer, sid)` already
+    /// existed it is *replaced* — the peer reconnected and re-opened
+    /// from a fresh `next_sid` sequence — and the displaced stale entry
+    /// is returned so the caller can retire its orphaned stream.
     fn install_inbound(
         &self,
         peer: PubKey,
@@ -237,14 +265,13 @@ impl MeshMux {
         tx: StreamSender,
         reliability: Arc<Mutex<Reliability>>,
         has_unacked: Arc<std::sync::atomic::AtomicBool>,
-    ) -> bool {
+    ) -> (u64, Option<StreamEntry>) {
         let mut t = self.table.lock().expect("StreamTable mutex poisoned");
-        if t.entries.contains_key(&(peer, sid)) {
-            return false;
-        }
+        let generation = t.allocate_generation();
+        let stale = t.entries.remove(&(peer, sid));
         t.entries
-            .insert((peer, sid), StreamEntry { tx, reliability, peer, sid, has_unacked });
-        true
+            .insert((peer, sid), StreamEntry { tx, reliability, peer, sid, generation, has_unacked });
+        (generation, stale)
     }
 
     fn lookup_entry(&self, peer: &PubKey, sid: StreamId) -> Option<StreamEntry> {
@@ -281,17 +308,32 @@ async fn read_loop(mux: Arc<MeshMux>) {
                 let (tx, rx) = mpsc::channel(INBOUND_CHAN_DEPTH);
                 let reliability = Arc::new(Mutex::new(Reliability::default()));
                 let has_unacked = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                if !mux.install_inbound(peer, sid, tx, reliability.clone(), has_unacked.clone()) {
+                let (generation, stale) =
+                    mux.install_inbound(peer, sid, tx, reliability.clone(), has_unacked.clone());
+                if let Some(stale) = stale {
+                    // The peer re-opened a sid that was still live on our
+                    // side: it reconnected (a restarted process resets
+                    // `next_sid` to 0) and its previous transport
+                    // connection died without a Close. Retire the
+                    // orphaned stream so its handler task unwinds and
+                    // frees whatever it held (e.g. an egress IP lease) —
+                    // otherwise every reconnect from this peer collides
+                    // here forever and never gets an OpenAck. Reset wakes
+                    // the parked handler; the stream marks itself
+                    // write-closed so its Drop won't fire a spurious
+                    // Reset frame at the now-reconnected peer.
                     debug!(
-                        "mux: duplicate open from {} sid={sid} — dropping",
+                        "mux: re-open from {} sid={sid} — peer reconnected, retiring stale stream",
                         hex::encode(&peer[..8])
                     );
-                    continue;
+                    let _ = stale.tx.try_send(StreamEvent::Reset(0x01));
                 }
-                let stream = MeshStream::new(mux.clone(), peer, sid, rx, reliability, has_unacked);
+                let stream = MeshStream::new(
+                    mux.clone(), peer, sid, generation, rx, reliability, has_unacked,
+                );
                 let accepted = AcceptedStream { from: peer, target, stream };
                 if mux.accept_tx.send(accepted).await.is_err() {
-                    mux.drop_stream(&peer, sid);
+                    mux.drop_stream(&peer, sid, generation);
                 }
             }
             Frame::OpenAck { sid, code } => {
@@ -301,8 +343,10 @@ async fn read_loop(mux: Arc<MeshMux>) {
             Frame::Ack { sid, ack, win } => handle_ack(&mux, peer, sid, ack, win),
             Frame::Close { sid, seq } => handle_close(&mux, peer, sid, seq),
             Frame::Reset { sid, code } => {
-                signal(&mux, &peer, sid, StreamEvent::Reset(code)).await;
-                mux.drop_stream(&peer, sid);
+                if let Some(entry) = mux.lookup_entry(&peer, sid) {
+                    let _ = entry.tx.send(StreamEvent::Reset(code)).await;
+                    mux.drop_stream(&peer, sid, entry.generation);
+                }
             }
             Frame::Datagram { channel, payload } => {
                 // Snapshot the handler clone with the lock held briefly
@@ -447,7 +491,7 @@ fn handle_close(mux: &Arc<MeshMux>, peer: PubKey, sid: StreamId, seq: u32) {
 async fn signal(mux: &Arc<MeshMux>, peer: &PubKey, sid: StreamId, ev: StreamEvent) {
     let Some(entry) = mux.lookup_entry(peer, sid) else { return; };
     if entry.tx.send(ev).await.is_err() {
-        mux.drop_stream(peer, sid);
+        mux.drop_stream(peer, sid, entry.generation);
     }
 }
 
@@ -493,7 +537,7 @@ async fn retransmit_tick(mux: Arc<MeshMux>) {
                             .await;
                     });
                     let _ = entry.tx.try_send(StreamEvent::Reset(0x06));
-                    mux.drop_stream(&entry.peer, entry.sid);
+                    mux.drop_stream(&entry.peer, entry.sid, entry.generation);
                 }
                 Ok(due) => {
                     for job in due.data_jobs {
@@ -562,5 +606,81 @@ where
     while let Some(acc) = rx.recv().await {
         let fut = handler(acc);
         tokio::spawn(fut);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_mux() -> Arc<MeshMux> {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let conn = Arc::new(PacketConn::new(sk));
+        MeshMux::new(conn).0
+    }
+
+    /// Spoof what `read_loop` builds for an inbound `Open`.
+    fn inbound_parts() -> (
+        StreamSender,
+        Arc<Mutex<Reliability>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let (tx, _rx) = mpsc::channel(INBOUND_CHAN_DEPTH);
+        (
+            tx,
+            Arc::new(Mutex::new(Reliability::default())),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    /// A peer that drops and reconnects re-opens the same `(peer, sid)`
+    /// from a fresh `next_sid` sequence. The mux must *replace* the stale
+    /// entry (not reject the Open as a duplicate — that deadlocked every
+    /// reconnect), and the retired stream's `Drop` — which fires
+    /// `drop_stream` with the *old* generation — must not evict the live
+    /// successor.
+    #[tokio::test]
+    async fn reopen_replaces_stale_entry_without_evicting_successor() {
+        let mux = test_mux();
+        let peer: PubKey = [0x42; 32];
+        let sid: StreamId = 0;
+
+        // First Open from this peer.
+        let (tx, r, h) = inbound_parts();
+        let (gen1, stale) = mux.install_inbound(peer, sid, tx, r, h);
+        assert!(stale.is_none(), "first open has no predecessor");
+
+        // Peer reconnects, re-opens the same sid.
+        let (tx, r, h) = inbound_parts();
+        let (gen2, stale) = mux.install_inbound(peer, sid, tx, r, h);
+        let stale = stale.expect("re-open must surface the displaced stale entry");
+        assert_eq!(stale.generation, gen1, "stale entry carries the old generation");
+        assert_ne!(gen1, gen2, "the re-opened stream gets a fresh generation");
+
+        // The orphaned stream's Drop runs with the OLD generation.
+        mux.drop_stream(&peer, sid, gen1);
+        let live = mux.lookup_entry(&peer, sid).expect("live successor survives stale Drop");
+        assert_eq!(live.generation, gen2);
+
+        // The live stream's own Drop (current generation) does evict it.
+        mux.drop_stream(&peer, sid, gen2);
+        assert!(mux.lookup_entry(&peer, sid).is_none(), "live Drop removes the entry");
+    }
+
+    /// `drop_stream` with a non-matching generation is a no-op.
+    #[tokio::test]
+    async fn drop_stream_ignores_a_stale_generation() {
+        let mux = test_mux();
+        let peer: PubKey = [0x07; 32];
+        let sid: StreamId = 3;
+
+        let (tx, r, h) = inbound_parts();
+        let (generation, _) = mux.install_inbound(peer, sid, tx, r, h);
+
+        mux.drop_stream(&peer, sid, generation.wrapping_sub(1));
+        assert!(mux.lookup_entry(&peer, sid).is_some(), "wrong-gen drop must not evict");
+
+        mux.drop_stream(&peer, sid, generation);
+        assert!(mux.lookup_entry(&peer, sid).is_none(), "matching-gen drop evicts");
     }
 }

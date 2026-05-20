@@ -74,6 +74,11 @@ pub struct MeshStream {
     mux: Arc<MeshMux>,
     peer: PubKey,
     sid: StreamId,
+    /// Install generation of our `(peer, sid)` entry in the mux's
+    /// StreamTable. Passed back to `drop_stream` so a stream retired by
+    /// a reconnecting peer can't evict its live successor. See
+    /// `mux::StreamEntry::generation`.
+    generation: u64,
     rx: mpsc::Receiver<StreamEvent>,
     reliability: Arc<Mutex<Reliability>>,
     /// Mirror of `StreamEntry::has_unacked` (see mux.rs). Bumped to
@@ -118,6 +123,7 @@ impl MeshStream {
         mux: Arc<MeshMux>,
         peer: PubKey,
         sid: StreamId,
+        generation: u64,
         rx: mpsc::Receiver<StreamEvent>,
         reliability: Arc<Mutex<Reliability>>,
         has_unacked: Arc<std::sync::atomic::AtomicBool>,
@@ -126,6 +132,7 @@ impl MeshStream {
             mux,
             peer,
             sid,
+            generation,
             rx,
             reliability,
             has_unacked,
@@ -157,6 +164,7 @@ impl MeshStream {
             match self.rx.recv().await {
                 Some(StreamEvent::OpenAck(code)) => return Ok(code),
                 Some(StreamEvent::Reset(code)) => {
+                    self.write_closed = true;
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
                         format!("stream reset (code 0x{code:02x}) before OpenAck"),
@@ -198,9 +206,10 @@ impl MeshStream {
         let mux = self.mux.clone();
         let peer = self.peer;
         let sid = self.sid;
+        let generation = self.generation;
         async move {
             let _ = mux.send_frame(&peer, Frame::Reset { sid, code }).await;
-            mux.drop_stream(&peer, sid);
+            mux.drop_stream(&peer, sid, generation);
         }
     }
 }
@@ -231,7 +240,7 @@ impl Drop for MeshStream {
                         .await;
                 });
             }
-        self.mux.drop_stream(&self.peer, self.sid);
+        self.mux.drop_stream(&self.peer, self.sid, self.generation);
     }
 }
 
@@ -280,6 +289,11 @@ impl AsyncRead for MeshStream {
     ) -> Poll<io::Result<()>> {
         loop {
             if let Some(code) = self.pending_reset.take() {
+                // A reset means the stream is dead in both directions:
+                // mark it write-closed so Drop won't fire a redundant
+                // Reset frame back (poll_write / poll_shutdown already
+                // do the same on their pending_reset paths).
+                self.write_closed = true;
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::ConnectionReset,
                     format!("peer reset (code 0x{code:02x})"),

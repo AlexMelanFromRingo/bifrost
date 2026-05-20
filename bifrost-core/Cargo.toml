@@ -22,3 +22,5 @@ rand.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "macros", "rt-multi-thread", "test-util"] }
+# Only to mint a SigningKey for a bare PacketConn in mux reconnect tests.
+ed25519-dalek.workspace = true
