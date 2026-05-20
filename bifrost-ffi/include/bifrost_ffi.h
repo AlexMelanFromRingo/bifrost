@@ -17,11 +17,11 @@
 extern "C" {
 #endif
 
-#define BIFROST_FFI_ABI_VERSION 1u
+#define BIFROST_FFI_ABI_VERSION 2u
 
 typedef struct BifrostClient BifrostClient;
 
-/* Status codes returned by bifrost_client_start. */
+/* Status codes returned by bifrost_client_connect / _run. */
 enum BifrostStatus {
     BIFROST_OK             = 0,
     BIFROST_INVALID_ARG    = 1,
@@ -35,11 +35,13 @@ enum BifrostStatus {
 uint32_t bifrost_ffi_abi_version(void);
 
 /*
- * Start a client tunnel.
+ * Phase 1 — start the node and run the egress handshake.
  *
- *   tun_fd            — caller-owned TUN file descriptor. We dup it,
- *                       so the caller is free to close their copy
- *                       on return.
+ * Bring-up is two-phase: a host like Android's VpnService must commit
+ * the TUN's IP address before it can give us the fd, yet that address
+ * is assigned by the exit during the handshake. So connect first,
+ * configure the TUN with the returned lease, then bifrost_client_run.
+ *
  *   node_config_json  — NUL-terminated JSON describing the norn-rs
  *                       NodeConfig. The `tun_name` field is forced
  *                       to null internally (the host owns the TUN).
@@ -48,15 +50,33 @@ uint32_t bifrost_ffi_abi_version(void);
  *   out_handle        — out-param. On BIFROST_OK, written with a
  *                       freshly-allocated handle pointer that must be
  *                       passed to bifrost_client_stop to release.
+ *   out_lease_v4      — out-param. On BIFROST_OK, the exit-assigned
+ *                       IPv4 address in host byte order
+ *                       (10.55.0.3 -> 0x0A370003).
+ *   out_mtu           — out-param. On BIFROST_OK, the tunnel MTU.
  *
  * Returns one of BifrostStatus. On non-zero, *out_handle is left at
  * NULL and bifrost_last_error() returns the reason string.
  */
-int32_t bifrost_client_start(
-    int32_t            tun_fd,
+int32_t bifrost_client_connect(
     const char*        node_config_json,
     const char*        exit_pub_key_hex,
-    BifrostClient**    out_handle);
+    BifrostClient**    out_handle,
+    uint32_t*          out_lease_v4,
+    uint16_t*          out_mtu);
+
+/*
+ * Phase 2 — attach the host TUN fd and start the data plane.
+ *
+ *   handle  — a handle from a successful bifrost_client_connect that
+ *             has not yet been run or stopped.
+ *   tun_fd  — caller-owned TUN file descriptor. We dup it, so the
+ *             caller is free to close their copy on return.
+ *
+ * Returns one of BifrostStatus. The handle stays owned by the caller
+ * either way and must be released with bifrost_client_stop.
+ */
+int32_t bifrost_client_run(BifrostClient* handle, int32_t tun_fd);
 
 /*
  * Stop a client tunnel. NULL is a no-op. Blocks briefly (~hundreds

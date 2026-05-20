@@ -31,7 +31,6 @@ class MainActivity : Activity() {
     private lateinit var prefs: SharedPreferences
     private lateinit var exitKey: EditText
     private lateinit var exitAddr: EditText
-    private lateinit var tunAddr: EditText
     private lateinit var privKey: EditText
     private lateinit var status: TextView
 
@@ -63,8 +62,8 @@ class MainActivity : Activity() {
             prefs.getString(K_EXIT_KEY, DEFAULT_EXIT_KEY)!!)
         exitAddr = field(root, "Exit address", "tcp://host:port",
             prefs.getString(K_EXIT_ADDR, DEFAULT_EXIT_ADDR)!!)
-        tunAddr = field(root, "TUN address", "IPv4 the exit leases you",
-            prefs.getString(K_TUN_ADDR, DEFAULT_TUN_ADDR)!!)
+        // The TUN address is no longer configured here: the exit
+        // leases it during the handshake and the service applies it.
 
         // Node identity — generated once on first launch, then reused so
         // the exit hands this device the same sticky lease every time.
@@ -126,7 +125,6 @@ class MainActivity : Activity() {
         prefs.edit()
             .putString(K_EXIT_KEY, exitKey.text.toString().trim())
             .putString(K_EXIT_ADDR, exitAddr.text.toString().trim())
-            .putString(K_TUN_ADDR, tunAddr.text.toString().trim())
             .putString(K_PRIV_KEY, privKey.text.toString().trim())
             .apply()
     }
@@ -153,7 +151,6 @@ class MainActivity : Activity() {
         val svc = Intent(this, BifrostVpnService::class.java).apply {
             putExtra(BifrostVpnService.EXTRA_CONFIG, buildNodeConfig())
             putExtra(BifrostVpnService.EXTRA_EXIT_KEY, exitKey.text.toString().trim())
-            putExtra(BifrostVpnService.EXTRA_TUN_ADDR, tunAddr.text.toString().trim())
             putExtra(BifrostVpnService.EXTRA_EXIT_ADDR, exitAddr.text.toString().trim())
         }
         startService(svc)
@@ -225,13 +222,11 @@ class MainActivity : Activity() {
         const val PREFS = "bifrost"
         const val K_EXIT_KEY = "exit_key"
         const val K_EXIT_ADDR = "exit_addr"
-        const val K_TUN_ADDR = "tun_addr"
         const val K_PRIV_KEY = "priv_key"
 
         // Defaults point at the standing Oracle exit.
         const val DEFAULT_EXIT_KEY =
             "***REMOVED***"
         const val DEFAULT_EXIT_ADDR = "tcp://***REMOVED***:9000"
-        const val DEFAULT_TUN_ADDR = "10.55.0.2"
     }
 }

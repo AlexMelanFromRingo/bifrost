@@ -25,29 +25,46 @@
 //!
 //! uint32_t bifrost_ffi_abi_version(void);
 //!
-//! int32_t bifrost_client_start(
-//!     int32_t tun_fd,
+//! int32_t bifrost_client_connect(
 //!     const char* node_config_json,
 //!     const char* exit_pub_key_hex,
-//!     BifrostClient** out_handle);
+//!     BifrostClient** out_handle,
+//!     uint32_t* out_lease_v4,
+//!     uint16_t* out_mtu);
+//!
+//! int32_t bifrost_client_run(BifrostClient* handle, int32_t tun_fd);
 //!
 //! void bifrost_client_stop(BifrostClient* handle);
 //!
 //! const char* bifrost_last_error(void);
 //! ```
 //!
-//! `bifrost_client_start` returns one of the [`BifrostStatus`]
-//! values; on `BIFROST_OK` the caller owns the handle and must
-//! pass it to `bifrost_client_stop` to release resources. On any
-//! non-OK status the handle is left as-is and the caller can pull
-//! a human-readable reason via `bifrost_last_error`.
+//! Bringing up a tunnel is **two-phase**, because a host like
+//! Android's `VpnService` must commit the TUN's IP address *before*
+//! it hands us the fd, yet the address is assigned by the exit during
+//! the handshake:
+//!
+//!  1. `bifrost_client_connect` starts the norn node and runs the
+//!     egress handshake. It writes the exit-assigned IPv4 lease to
+//!     `*out_lease_v4` and the MTU to `*out_mtu`. The host configures
+//!     its TUN with *that* address.
+//!  2. `bifrost_client_run` attaches the now-configured TUN fd and
+//!     starts the data plane.
+//!
+//! Both return one of the [`BifrostStatus`] values; on `BIFROST_OK`
+//! the caller owns the handle and must pass it to `bifrost_client_stop`
+//! to release resources — including after a failed `run`. On any
+//! non-OK status the caller can pull a human-readable reason via
+//! `bifrost_last_error`.
 
 use std::cell::RefCell;
 use std::ffi::{c_char, CStr};
 use std::ptr;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use bifrost_core::mux::MeshMux;
+use bifrost_core::stream::MeshStream;
 use bifrost_vpnd::egress::{client_handshake, run_client_pump};
 use norn_rs::{config::NodeConfig, node::Node};
 use tokio::runtime::Runtime;
@@ -65,8 +82,9 @@ use vhdr::VhdrTun;
 
 // ── ABI status codes ────────────────────────────────────────────
 
-/// One of the integer values returned by [`bifrost_client_start`].
-/// Mirrors the `BifrostStatus` enum in `include/bifrost_ffi.h`.
+/// One of the integer values returned by [`bifrost_client_connect`]
+/// / [`bifrost_client_run`]. Mirrors the `BifrostStatus` enum in
+/// `include/bifrost_ffi.h`.
 #[repr(i32)]
 #[non_exhaustive]
 pub enum BifrostStatus {
@@ -87,7 +105,9 @@ pub enum BifrostStatus {
     RuntimeErr = 5,
 }
 
-const ABI_VERSION: u32 = 1;
+/// Bumped 1 → 2 for the two-phase `connect` / `run` ABI (was the
+/// single `bifrost_client_start`).
+const ABI_VERSION: u32 = 2;
 
 // ── Last-error state ─────────────────────────────────────────────
 //
@@ -124,34 +144,46 @@ pub extern "C" fn bifrost_ffi_abi_version() -> u32 {
     ABI_VERSION
 }
 
-/// Spin up the client data plane. See the crate docs for the C
-/// signature and parameter semantics.
+/// Phase 1: start the norn node and run the egress handshake. On
+/// `BIFROST_OK` the exit-assigned IPv4 lease is written to
+/// `*out_lease_v4` (host byte order — `10.55.0.3` → `0x0A37_0003`)
+/// and the tunnel MTU to `*out_mtu`. The host must configure its TUN
+/// with *that* address before calling [`bifrost_client_run`].
+///
+/// The returned handle owns a live norn node + mesh session even
+/// before `run`; release it with [`bifrost_client_stop`] in every
+/// case (including a `run` that later fails).
 ///
 /// # Safety
 ///
 /// * `node_config_json` and `exit_pub_key_hex` must point at
 ///   NUL-terminated valid UTF-8 strings.
-/// * `out_handle` must point at writable memory for one pointer.
-/// * `tun_fd` must be a valid file descriptor (Linux/Darwin) the
-///   host is willing to share — we `dup(2)` it so the caller is
-///   free to close their copy. The host is responsible for the
-///   TUN being already configured with the lease address + routes
-///   (iOS does this in `setTunnelNetworkSettings`; Android in
-///   `VpnService.Builder` before `.establish()`).
+/// * `out_handle`, `out_lease_v4` and `out_mtu` must each point at
+///   writable storage for their respective type.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn bifrost_client_start(
-    tun_fd: i32,
+pub unsafe extern "C" fn bifrost_client_connect(
     node_config_json: *const c_char,
     exit_pub_key_hex: *const c_char,
     out_handle: *mut *mut BifrostClient,
+    out_lease_v4: *mut u32,
+    out_mtu: *mut u16,
 ) -> i32 {
-    if node_config_json.is_null() || exit_pub_key_hex.is_null() || out_handle.is_null() {
+    if node_config_json.is_null()
+        || exit_pub_key_hex.is_null()
+        || out_handle.is_null()
+        || out_lease_v4.is_null()
+        || out_mtu.is_null()
+    {
         set_last_error("null pointer argument");
         return BifrostStatus::InvalidArg as i32;
     }
-    // SAFETY: null check above; caller asserts `out_handle` points
-    // at writable memory for one pointer.
-    unsafe { *out_handle = ptr::null_mut() };
+    // SAFETY: null-checked above; caller asserts each out-param points
+    // at writable storage for its type.
+    unsafe {
+        *out_handle = ptr::null_mut();
+        *out_lease_v4 = 0;
+        *out_mtu = 0;
+    }
 
     install_log_sink_once();
 
@@ -185,24 +217,15 @@ pub unsafe extern "C" fn bifrost_client_start(
             return BifrostStatus::InvalidArg as i32;
         }
     };
-    // Force the mesh TUN off: the host owns the single tun_fd
-    // we're handed, and a second reader inside norn-rs would steal
+    // Force the mesh TUN off: the host owns the single tun_fd we're
+    // handed in `run`, and a second reader inside norn-rs would steal
     // frames from MeshMux. (Same defence bifrost-vpnd applies in
     // exit/client mode.)
     cfg.tun_name = None;
 
-    // Duplicate the host fd so the caller is free to close theirs.
-    let dup_fd = match dup_fd(tun_fd) {
-        Ok(fd) => fd,
-        Err(e) => {
-            set_last_error(format!("dup(tun_fd={tun_fd}): {e}"));
-            return BifrostStatus::TunFdErr as i32;
-        }
-    };
-
     // Build a multi-thread runtime. Mobile cores hit thermal caps
-    // fast on single-thread; tokio's work-stealing scheduler
-    // keeps the encrypt + framing work spread across cores.
+    // fast on single-thread; tokio's work-stealing scheduler keeps
+    // the encrypt + framing work spread across cores.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("bifrost-ffi")
@@ -210,35 +233,114 @@ pub unsafe extern "C" fn bifrost_client_start(
     {
         Ok(rt) => rt,
         Err(e) => {
-            // safe to close the dup since nothing's owning it yet
-            unsafe { libc::close(dup_fd) };
             set_last_error(format!("tokio runtime build: {e}"));
             return BifrostStatus::RuntimeErr as i32;
         }
     };
 
-    // SAFETY: same out_handle invariant as the earlier write. We
-    // hand the ownership of the dup'd fd into HostTun::from_owned_fd
-    // inside the runtime block_on; on the error path we close it
-    // explicitly to avoid a leak.
-    let result: Result<BifrostClientInner> = runtime.block_on(async {
+    let result: Result<(Node, PendingTunnel, u32, u16)> = runtime.block_on(async {
         let node = Node::new(cfg).await.context("Node::new")?;
         node.start().await.context("node.start")?;
         let conn = node.conn.clone();
-        info!(
-            "bifrost-ffi: node up; pub_key={}",
-            hex::encode(conn.pub_key)
-        );
+        info!("bifrost-ffi: node up; pub_key={}", hex::encode(conn.pub_key));
         let (mux, _accept_rx) = MeshMux::new(conn);
         let (mesh, hello) = client_handshake(mux.clone(), exit_peer)
             .await
             .context("client_handshake")?;
         info!(
-            "bifrost-ffi: allocated v4={} v6={:?} mtu={}",
+            "bifrost-ffi: exit leased v4={} v6={:?} mtu={}",
             hello.allocated_v4, hello.allocated_v6, hello.mtu
         );
-        let host = HostTun::from_owned_fd(dup_fd)
-            .context("wrapping host TUN fd")?;
+        let lease_v4 = u32::from(hello.allocated_v4);
+        let pending = PendingTunnel { mux, mesh, exit_peer };
+        Ok((node, pending, lease_v4, hello.mtu))
+    });
+
+    match result {
+        Ok((node, pending, lease_v4, mtu)) => {
+            // SAFETY: out-params null-checked + zeroed above.
+            unsafe {
+                *out_lease_v4 = lease_v4;
+                *out_mtu = mtu;
+            }
+            let boxed = Box::new(BifrostClient {
+                runtime: Some(runtime),
+                pending: Some(pending),
+                _node: node,
+            });
+            // SAFETY: `out_handle` was checked non-null above.
+            unsafe { *out_handle = Box::into_raw(boxed) };
+            set_last_error("ok");
+            BifrostStatus::Ok as i32
+        }
+        Err(e) => {
+            drop(runtime);
+            let msg = format!("{e:#}");
+            error!("bifrost_client_connect failed: {msg}");
+            set_last_error(msg.clone());
+            // Best-effort classification — the failing stage is
+            // identified by the literal context string attached above.
+            let code = if msg.contains("Node::new") || msg.contains("node.start") {
+                BifrostStatus::NodeInitErr
+            } else if msg.contains("client_handshake") {
+                BifrostStatus::HandshakeErr
+            } else {
+                BifrostStatus::RuntimeErr
+            };
+            code as i32
+        }
+    }
+}
+
+/// Phase 2: attach the host TUN fd and start the data plane on the
+/// session a prior [`bifrost_client_connect`] established. Returns
+/// promptly — the pump runs on the handle's runtime — and the handle
+/// stays live until [`bifrost_client_stop`].
+///
+/// # Safety
+///
+/// * `handle` must be a pointer from a successful
+///   `bifrost_client_connect` that has not yet been run or stopped.
+/// * `tun_fd` must be a valid file descriptor; we `dup(2)` it, so the
+///   caller is free to close their copy on return.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bifrost_client_run(handle: *mut BifrostClient, tun_fd: i32) -> i32 {
+    if handle.is_null() {
+        set_last_error("bifrost_client_run: null handle");
+        return BifrostStatus::InvalidArg as i32;
+    }
+    // SAFETY: caller asserts `handle` is a live `connect` handle that
+    // is not being concurrently used or stopped.
+    let client = unsafe { &mut *handle };
+    let Some(PendingTunnel { mux, mesh, exit_peer }) = client.pending.take() else {
+        set_last_error("bifrost_client_run: handle already running or not connected");
+        return BifrostStatus::InvalidArg as i32;
+    };
+    let Some(runtime) = client.runtime.as_ref() else {
+        set_last_error("bifrost_client_run: handle has no runtime");
+        return BifrostStatus::RuntimeErr as i32;
+    };
+
+    // Duplicate the host fd so the caller is free to close theirs.
+    let dup = match dup_fd(tun_fd) {
+        Ok(fd) => fd,
+        Err(e) => {
+            set_last_error(format!("dup(tun_fd={tun_fd}): {e}"));
+            return BifrostStatus::TunFdErr as i32;
+        }
+    };
+
+    let result: Result<()> = runtime.block_on(async move {
+        let host = match HostTun::from_owned_fd(dup) {
+            Ok(h) => h,
+            Err(e) => {
+                // `from_owned_fd` failed before adopting the fd — close
+                // it here so it isn't leaked. On any later error the fd
+                // is owned by `HostTun` and closed by its Drop.
+                unsafe { libc::close(dup) };
+                return Err(anyhow!("wrapping host TUN fd: {e}"));
+            }
+        };
         // The host TUN is plain IP; the mesh data plane is virtio-framed
         // and may carry GSO super-segments. `VhdrTun` bridges the two —
         // prepends the vhdr on read, segments + strips it on write — so
@@ -269,53 +371,30 @@ pub unsafe extern "C" fn bifrost_client_start(
         run_client_pump(r, w, mux, exit_peer, mesh)
             .await
             .context("run_client_pump")?;
-        Ok(BifrostClientInner { _node: node })
+        Ok(())
     });
 
     match result {
-        Ok(inner) => {
-            let boxed = Box::new(BifrostClient {
-                runtime: Some(runtime),
-                _inner: inner,
-            });
-            // SAFETY: `out_handle` was checked non-null above and
-            // the caller asserts it's writable.
-            unsafe { *out_handle = Box::into_raw(boxed) };
+        Ok(()) => {
             set_last_error("ok");
             BifrostStatus::Ok as i32
         }
         Err(e) => {
-            // close the duplicated fd so we don't leak it on error
-            // (the pump owns the AsyncFd only on the happy path)
-            // SAFETY: `dup_fd` is a kernel fd we hold exclusively.
-            unsafe { libc::close(dup_fd) };
-            drop(runtime);
             let msg = format!("{e:#}");
-            error!("bifrost_client_start failed: {msg}");
+            error!("bifrost_client_run failed: {msg}");
             set_last_error(msg);
-            // Best-effort classification — handshake errors carry
-            // the literal context string we attached above.
-            let err_str = format!("{e:#}");
-            let code = if err_str.contains("Node::new") || err_str.contains("node.start")
-            {
-                BifrostStatus::NodeInitErr
-            } else if err_str.contains("client_handshake") {
-                BifrostStatus::HandshakeErr
-            } else {
-                BifrostStatus::RuntimeErr
-            };
-            code as i32
+            BifrostStatus::RuntimeErr as i32
         }
     }
 }
 
-/// Tear down a client previously returned by
-/// [`bifrost_client_start`]. Safe to call with `NULL` (no-op).
+/// Tear down a client handle from [`bifrost_client_connect`] — whether
+/// or not [`bifrost_client_run`] was called. Safe with `NULL` (no-op).
 ///
 /// # Safety
 ///
 /// `handle` must be a pointer previously returned from a successful
-/// `bifrost_client_start`, and must not be freed twice. The call
+/// `bifrost_client_connect`, and must not be freed twice. The call
 /// blocks until the tokio runtime has shut down — usually a few
 /// hundred milliseconds.
 #[unsafe(no_mangle)]
@@ -324,7 +403,7 @@ pub unsafe extern "C" fn bifrost_client_stop(handle: *mut BifrostClient) {
         return;
     }
     // SAFETY: caller asserts `handle` came from a successful
-    // `bifrost_client_start` and hasn't been freed yet.
+    // `bifrost_client_connect` and hasn't been freed yet.
     let boxed = unsafe { Box::from_raw(handle) };
     // Drop ordering matters: Box::drop runs BifrostClient::drop
     // (which stops the runtime via shutdown_background) *then*
@@ -352,14 +431,23 @@ pub struct BifrostClient {
     /// `Option` so Drop can take it out and call `shutdown_background`
     /// in a controlled order.
     runtime: Option<Runtime>,
-    _inner: BifrostClientInner,
+    /// The post-handshake mesh session, set by `bifrost_client_connect`
+    /// and taken by `bifrost_client_run`. `None` once the data plane
+    /// is running (or if `run` was never called).
+    pending: Option<PendingTunnel>,
+    /// Held to keep the norn-rs node alive for the runtime lifetime.
+    /// Declared last so it drops *after* the runtime has wound down —
+    /// the node's PacketConn cleans up its listener sockets via Drop.
+    _node: Node,
 }
 
-struct BifrostClientInner {
-    /// Held to keep the norn-rs node alive for the runtime
-    /// lifetime. Dropping the runtime aborts all spawned tasks; the
-    /// node's PacketConn cleans up its listener sockets via Drop.
-    _node: Node,
+/// Mesh state carried between `bifrost_client_connect` (which builds
+/// it) and `bifrost_client_run` (which consumes it). Kept alive on
+/// the handle's runtime in the gap while the host configures its TUN.
+struct PendingTunnel {
+    mux: Arc<MeshMux>,
+    mesh: MeshStream,
+    exit_peer: [u8; 32],
 }
 
 impl Drop for BifrostClient {
@@ -455,7 +543,7 @@ mod tests {
         // Bump this assertion when bumping ABI_VERSION; the test
         // exists to make ABI bumps an explicit gate rather than an
         // accident.
-        assert_eq!(bifrost_ffi_abi_version(), 1);
+        assert_eq!(bifrost_ffi_abi_version(), 2);
     }
 
     #[test]
@@ -479,14 +567,17 @@ mod tests {
     }
 
     #[test]
-    fn start_rejects_null_pointers() {
+    fn connect_rejects_null_pointers() {
         let mut handle: *mut BifrostClient = ptr::null_mut();
+        let mut lease_v4: u32 = 0;
+        let mut mtu: u16 = 0;
         let status = unsafe {
-            bifrost_client_start(
-                0,
+            bifrost_client_connect(
                 ptr::null(),
                 ptr::null(),
                 &mut handle as *mut _,
+                &mut lease_v4 as *mut _,
+                &mut mtu as *mut _,
             )
         };
         assert_eq!(status, BifrostStatus::InvalidArg as i32);
@@ -494,18 +585,27 @@ mod tests {
     }
 
     #[test]
-    fn start_rejects_short_exit_key() {
+    fn connect_rejects_short_exit_key() {
         let cfg = CString::new("{}").unwrap();
         let short = CString::new("deadbeef").unwrap();
         let mut handle: *mut BifrostClient = ptr::null_mut();
+        let mut lease_v4: u32 = 0;
+        let mut mtu: u16 = 0;
         let status = unsafe {
-            bifrost_client_start(
-                0,
+            bifrost_client_connect(
                 cfg.as_ptr(),
                 short.as_ptr(),
                 &mut handle as *mut _,
+                &mut lease_v4 as *mut _,
+                &mut mtu as *mut _,
             )
         };
+        assert_eq!(status, BifrostStatus::InvalidArg as i32);
+    }
+
+    #[test]
+    fn run_rejects_null_handle() {
+        let status = unsafe { bifrost_client_run(ptr::null_mut(), 0) };
         assert_eq!(status, BifrostStatus::InvalidArg as i32);
     }
 

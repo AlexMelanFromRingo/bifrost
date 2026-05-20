@@ -13,27 +13,36 @@ object NativeBridge {
     external fun nativeAbiVersion(): Int
 
     /**
-     * Bring up the client tunnel over [tunFd]. **Blocks** for the
-     * handshake (a few seconds) — call on a background thread — then
-     * returns: the data plane keeps running on the native runtime.
+     * Phase 1 — start the node and run the egress handshake.
+     * **Blocks** for the handshake (a few seconds); call on a
+     * background thread.
      *
-     * Returns an opaque handle to the live tunnel; keep it and pass it
-     * to [nativeClientStop] to tear down. `0` means the connection
-     * failed (see [nativeLastError]).
+     * Returns a `LongArray`: `[handle, leaseV4, mtu]` on success, or
+     * `[0]` on failure (see [nativeLastError]). `leaseV4` is the
+     * exit-assigned IPv4 address in host byte order; configure the TUN
+     * with *that* address, then call [nativeClientRun].
      *
      * [logPath] is a plain filesystem path the native side appends its
      * `tracing` log to. Empty disables the native file log.
      */
-    external fun nativeClientStart(
-        tunFd: Int, configJson: String, exitKeyHex: String, logPath: String,
-    ): Long
+    external fun nativeClientConnect(
+        configJson: String, exitKeyHex: String, logPath: String,
+    ): LongArray
 
-    /** Tear down a tunnel returned by [nativeClientStart]. Null-safe (0 = no-op). */
+    /**
+     * Phase 2 — attach the established TUN [tunFd] and start the data
+     * plane on the session from [nativeClientConnect]. Returns a
+     * status code (`0` = ok). The data plane keeps running on the
+     * native runtime; keep [handle] and pass it to [nativeClientStop].
+     */
+    external fun nativeClientRun(handle: Long, tunFd: Int): Int
+
+    /** Tear down a tunnel from [nativeClientConnect]. Null-safe (0 = no-op). */
     external fun nativeClientStop(handle: Long)
 
     /** Human-readable description of the most recent native failure. */
     external fun nativeLastError(): String
 
     /** ABI version this app was compiled against; assert against the .so. */
-    const val EXPECTED_ABI_VERSION = 1
+    const val EXPECTED_ABI_VERSION = 2
 }

@@ -6,18 +6,26 @@ import android.os.ParcelFileDescriptor
 import kotlin.concurrent.thread
 
 /**
- * The VPN tunnel service. On start it builds a TUN via
- * [VpnService.Builder] and hands the file descriptor to the native
- * client.
+ * The VPN tunnel service.
  *
- * ## Lifecycle
+ * ## Lifecycle — two-phase bring-up
  *
- * `NativeBridge.nativeClientStart` blocks only for the handshake, then
- * returns a handle to a tunnel that keeps running on the native tokio
- * runtime. The service holds that handle for the whole session and
- * passes it to `nativeClientStop` on teardown. (An earlier version
- * mistakenly stopped the tunnel right after start — the VPN came up
- * for ~100 ms and dropped.)
+ * `VpnService.Builder` must commit the TUN's IP address *before* it
+ * hands us the fd, yet that address is leased by the exit during the
+ * handshake. So bring-up runs in two native phases on a background
+ * thread:
+ *
+ *  1. `NativeBridge.nativeClientConnect` — start the mesh node and run
+ *     the egress handshake; it returns the exit-assigned IPv4 lease.
+ *  2. `Builder.addAddress(lease)…establish()` — build the TUN with
+ *     *that* address.
+ *  3. `NativeBridge.nativeClientRun` — attach the fd and start the
+ *     data plane, which keeps running on the native tokio runtime.
+ *
+ * The service holds the native handle for the whole session and passes
+ * it to `nativeClientStop` on teardown. (An earlier version hardcoded
+ * the TUN address to a guess that didn't match the exit's lease, so
+ * the exit dropped every packet as spoofed.)
  *
  * ## Why the routes exclude the exit IP
  *
@@ -41,84 +49,125 @@ class BifrostVpnService : VpnService() {
         }
         val config = intent?.getStringExtra(EXTRA_CONFIG)
         val exitKey = intent?.getStringExtra(EXTRA_EXIT_KEY)
-        val tunAddr = intent?.getStringExtra(EXTRA_TUN_ADDR) ?: DEFAULT_TUN_ADDR
         val exitAddr = intent?.getStringExtra(EXTRA_EXIT_ADDR) ?: ""
         if (config.isNullOrBlank() || exitKey.isNullOrBlank()) {
             Logger.line("service: missing config or exit key — not starting")
             stopSelf()
             return START_NOT_STICKY
         }
-        startTunnel(config, exitKey, tunAddr, exitAddr)
+        startTunnel(config, exitKey, exitAddr)
         return START_STICKY
     }
 
-    private fun startTunnel(config: String, exitKey: String, tunAddr: String, exitAddr: String) {
+    private fun startTunnel(config: String, exitKey: String, exitAddr: String) {
         if (tun != null) {
             Logger.line("service: tunnel already running — ignoring start")
             return
         }
         stopRequested = false
         Logger.startSession()
-        Logger.line("service: starting tunnel — tunAddr=$tunAddr exitAddr=$exitAddr")
+        Logger.line("service: starting tunnel — exitAddr=$exitAddr")
         Logger.line("service: exit key=${exitKey.take(16)}…")
 
-        val pfd = try {
-            val b = Builder()
-                .setSession("Bifrost")
-                .addAddress(tunAddr, 32)
-                .addDnsServer("1.1.1.1")
-                .addDnsServer("8.8.8.8")
-                .setMtu(1280)
-            val exitIp = ipv4Of(exitAddr)
-            if (exitIp == null) {
-                Logger.line("service: WARNING exit '$exitAddr' is not an IPv4 literal — " +
-                    "using full 0.0.0.0/0 route (mesh transport may loop into the tunnel)")
-                b.addRoute("0.0.0.0", 0)
-            } else {
-                val routes = routesExcluding(exitIp)
-                Logger.line("service: routing 0.0.0.0/0 except exit $exitIp (${routes.size} routes)")
-                for ((addr, prefix) in routes) b.addRoute(addr, prefix)
-            }
-            Logger.line("service: calling VpnService.Builder.establish()")
-            b.establish()
-        } catch (t: Throwable) {
-            Logger.line("service: Builder/establish threw: ${t.javaClass.simpleName}: ${t.message}")
-            null
-        }
-        if (pfd == null) {
-            Logger.line("service: establish() returned null — VPN consent missing? aborting")
-            stopSelf()
-            return
-        }
-        tun = pfd
-        val fd = pfd.fd
-        Logger.line("service: TUN established, fd=$fd — connecting (handshake may take a few s)")
-
         thread(name = "bifrost-connect", isDaemon = true) {
-            val handle = try {
-                NativeBridge.nativeClientStart(fd, config, exitKey, Logger.nativeLogPath())
+            // ── Phase 1: mesh node + egress handshake ──────────────
+            Logger.line("service: connecting to mesh + egress handshake (may take a few s)")
+            val info = try {
+                NativeBridge.nativeClientConnect(config, exitKey, Logger.nativeLogPath())
             } catch (t: Throwable) {
-                Logger.line("service: nativeClientStart threw: ${t.javaClass.simpleName}: ${t.message}")
-                0L
+                Logger.line("service: nativeClientConnect threw: ${t.javaClass.simpleName}: ${t.message}")
+                LongArray(1) // [0] == failure
             }
-            if (handle == 0L) {
+            if (info.size < 3 || info[0] == 0L) {
                 val err = try { NativeBridge.nativeLastError() } catch (_: Throwable) { "?" }
                 Logger.line("service: connect FAILED — $err")
                 exportLog()
-                stopTunnel()
+                stopSelf()
                 return@thread
             }
+            val handle = info[0]
+            val leaseIp = ipv4FromHostOrder(info[1])
+            val mtu = info[2].toInt().let { if (it in 576..4080) it else 1280 }
+            Logger.line("service: exit leased $leaseIp, mtu=$mtu")
+
+            if (stopRequested) {
+                Logger.line("service: stop requested during handshake — tearing down")
+                NativeBridge.nativeClientStop(handle)
+                exportLog(); stopSelf(); return@thread
+            }
+
+            // ── Phase 2: build the TUN with the leased address ─────
+            val pfd = try {
+                val b = Builder()
+                    .setSession("Bifrost")
+                    .addAddress(leaseIp, 32)
+                    .addDnsServer("1.1.1.1")
+                    .addDnsServer("8.8.8.8")
+                    .setMtu(mtu)
+                val exitIp = ipv4Of(exitAddr)
+                if (exitIp == null) {
+                    Logger.line("service: WARNING exit '$exitAddr' is not an IPv4 literal — " +
+                        "using full 0.0.0.0/0 route (mesh transport may loop into the tunnel)")
+                    b.addRoute("0.0.0.0", 0)
+                } else {
+                    val routes = routesExcluding(exitIp)
+                    Logger.line("service: routing 0.0.0.0/0 except exit $exitIp (${routes.size} routes)")
+                    for ((addr, prefix) in routes) b.addRoute(addr, prefix)
+                }
+                Logger.line("service: calling VpnService.Builder.establish() with addr=$leaseIp")
+                b.establish()
+            } catch (t: Throwable) {
+                Logger.line("service: Builder/establish threw: ${t.javaClass.simpleName}: ${t.message}")
+                null
+            }
+            if (pfd == null) {
+                Logger.line("service: establish() returned null — VPN consent missing? aborting")
+                NativeBridge.nativeClientStop(handle)
+                exportLog(); stopSelf(); return@thread
+            }
+            tun = pfd
+            val fd = pfd.fd
+            Logger.line("service: TUN established, fd=$fd — starting data plane")
+
+            if (stopRequested) {
+                Logger.line("service: stop requested before data plane — tearing down")
+                teardown(handle, pfd)
+                exportLog(); stopSelf(); return@thread
+            }
+
+            // ── Phase 3: attach the fd + start the data plane ──────
+            val status = try {
+                NativeBridge.nativeClientRun(handle, fd)
+            } catch (t: Throwable) {
+                Logger.line("service: nativeClientRun threw: ${t.javaClass.simpleName}: ${t.message}")
+                -1
+            }
+            if (status != 0) {
+                val err = try { NativeBridge.nativeLastError() } catch (_: Throwable) { "?" }
+                Logger.line("service: data plane FAILED (status=$status) — $err")
+                teardown(handle, pfd)
+                exportLog(); stopSelf(); return@thread
+            }
+
             // Tunnel is up and stays up on the native runtime.
             if (stopRequested) {
-                // Disconnected while we were still connecting — tear down now.
-                Logger.line("service: stop requested during connect — stopping fresh tunnel")
-                NativeBridge.nativeClientStop(handle)
+                Logger.line("service: stop requested right after start — stopping fresh tunnel")
+                teardown(handle, pfd)
             } else {
                 nativeHandle = handle
-                Logger.line("service: tunnel UP — traffic now routes through the exit")
+                Logger.line("service: tunnel UP ($leaseIp) — traffic now routes through the exit")
             }
             exportLog()
         }
+    }
+
+    /** Stop a native handle and close a TUN fd — used on the failure paths. */
+    private fun teardown(handle: Long, pfd: ParcelFileDescriptor) {
+        try { NativeBridge.nativeClientStop(handle) } catch (t: Throwable) {
+            Logger.line("service: nativeClientStop threw: ${t.message}")
+        }
+        try { pfd.close() } catch (_: Throwable) {}
+        tun = null
     }
 
     private fun stopTunnel() {
@@ -163,10 +212,17 @@ class BifrostVpnService : VpnService() {
     companion object {
         const val EXTRA_CONFIG = "config"
         const val EXTRA_EXIT_KEY = "exitKey"
-        const val EXTRA_TUN_ADDR = "tunAddr"
         const val EXTRA_EXIT_ADDR = "exitAddr"
         const val ACTION_STOP = "org.norn.bifrost.STOP"
-        const val DEFAULT_TUN_ADDR = "10.55.0.2"
+
+        /**
+         * Render a host-byte-order IPv4 (as returned in
+         * `nativeClientConnect`'s `[1]` slot) as dotted-quad.
+         * `0x0A370003` → `"10.55.0.3"`.
+         */
+        fun ipv4FromHostOrder(v: Long): String =
+            "${(v ushr 24) and 0xFF}.${(v ushr 16) and 0xFF}." +
+                "${(v ushr 8) and 0xFF}.${v and 0xFF}"
 
         /**
          * Pull the IPv4 literal out of an exit address like

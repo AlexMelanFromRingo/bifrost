@@ -16,7 +16,7 @@ bifrost-android/
     java/org/norn/bifrost/
       NativeBridge.kt      — external fun declarations + System.loadLibrary
       BifrostVpnService.kt — VpnService: builds the TUN, runs the native pump
-      MainActivity.kt      — one-screen UI: exit key, TUN address, config
+      MainActivity.kt      — one-screen UI: exit key, exit address, identity
     jniLibs/<abi>/libbifrost_ffi.so   — cross-built native library
     res/values/strings.xml
     AndroidManifest.xml
@@ -60,27 +60,28 @@ with `adb install -r app/build/outputs/apk/debug/app-debug.apk`.
 
 1. **Exit node public key** — the 64-hex key of the `bifrost-vpnd`
    exit you are connecting to.
-2. **TUN address** — the IPv4 the exit leases you. With persistent
-   leases (roadmap #6) a returning client keeps the same address;
-   set this to that lease.
-3. **Node config (JSON)** — a `norn-rs` `NodeConfig`. Fill in a real
-   `private_key` (e.g. from `nornd genconfig`) and the exit's mesh
-   address under `peers`. `tun_name` is forced to `null` by the FFI —
-   the host owns the single TUN fd.
+2. **Exit address** — the exit's mesh address, `tcp://host:port`.
+3. **Your private key** — the node identity, generated on first
+   launch and reused so the exit hands this device the same sticky
+   lease every time.
+
+The TUN address is **not** configured by hand: the exit leases it
+during the handshake and the service applies it (see below).
 
 "Connect" asks for the system VPN consent, then starts the tunnel.
 Native logs land in logcat under the tag `BifrostVpn`.
 
+## Two-phase bring-up
+
+`VpnService.Builder` must commit the TUN's IP address before it hands
+the app the fd, yet that address is leased by the exit *during* the
+handshake. So `BifrostVpnService` brings the tunnel up in two native
+phases (`bifrost-ffi`'s `bifrost_client_connect` then
+`bifrost_client_run`): connect + handshake first, then `establish()`
+with the leased address, then attach the fd and start the data plane.
+
 ## Known limitations (this is a test client)
 
-* **`nativeRunClient` blocks for the whole session.** The Kotlin side
-  runs it on a worker thread; "Disconnect" closes the TUN, which makes
-  the native pump's reads fail and unwinds the call. A non-blocking
-  start / explicit stop signal would need an FFI change.
-* **The TUN address is entered by hand.** `VpnService.Builder` needs
-  the address before `.establish()`, but the exit allocates it during
-  the handshake. A production client would split handshake from
-  establish; here the user supplies the lease address directly.
 * No foreground-service notification, no auto-reconnect, no DNS
   beyond a hardcoded resolver — all intentionally out of scope for a
   test harness.
