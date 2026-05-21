@@ -776,4 +776,65 @@ mod tests {
         let _client = writer.await.unwrap();
         assert_eq!(got, msg, "the wss byte pipe must round-trip losslessly");
     }
+
+    /// End-to-end: two real norn nodes, one running a `wss://` listener
+    /// and the other dialling it. The full TLS 1.3 + WebSocket + NRN1
+    /// chain must link them. Mirrors `quic.rs`'s `end_to_end_quic_handshake`.
+    #[tokio::test]
+    async fn wss_links_two_real_nodes() {
+        use norn_rs::config::NodeConfig;
+        use norn_rs::node::Node;
+
+        fn cfg(key_hex: &str) -> NodeConfig {
+            // Minimal config — empty listen/peers (the wss transport is
+            // driven by hand below), no TUN, admin socket disabled.
+            serde_json::from_str(&format!(
+                r#"{{"private_key":"{key_hex}","listen":[],"peers":[],"tun_name":null,
+                    "multicast_enabled":false,"mdns_enabled":false,"peer_cache_path":"",
+                    "admin_socket":""}}"#
+            ))
+            .expect("minimal NodeConfig must deserialize")
+        }
+
+        let mut ka = [0u8; 32];
+        let mut kb = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut ka);
+        rand::rngs::OsRng.fill_bytes(&mut kb);
+        let node_a = Node::new(cfg(&hex::encode(ka))).await.expect("node A");
+        let node_b = Node::new(cfg(&hex::encode(kb))).await.expect("node B");
+        node_a.start().await.expect("node A start");
+        node_b.start().await.expect("node B start");
+        let pub_b = node_b.conn.pub_key;
+
+        // Random high port so parallel test runs don't collide.
+        let port = 34000 + (rand::random::<u16>() % 4000);
+        let uri = format!("wss://127.0.0.1:{port}");
+
+        let conn_a = node_a.conn.clone();
+        let listen_uri = uri.clone();
+        let listener = tokio::spawn(async move {
+            let _ = listen(&listen_uri, conn_a, None).await;
+        });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let conn_b = node_b.conn.clone();
+        let dialer = tokio::spawn(async move {
+            dial(&uri, conn_b, None).await;
+        });
+
+        // Up to ~6s for the TLS + WebSocket + NRN1 handshakes to land.
+        let mut linked = false;
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let a_sees = node_a.conn.get_peer_stats().iter().any(|p| p.key == pub_b);
+            let b_sees = !node_b.conn.get_peer_stats().is_empty();
+            if a_sees && b_sees {
+                linked = true;
+                break;
+            }
+        }
+        listener.abort();
+        dialer.abort();
+        assert!(linked, "wss:// transport must link the two nodes within ~6s");
+    }
 }
