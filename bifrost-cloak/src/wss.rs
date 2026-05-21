@@ -40,6 +40,69 @@ const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// malicious peer must not be able to make us buffer unbounded memory.
 const MAX_WS_FRAME: usize = 16 * 1024 * 1024;
 
+// ── Traffic shaping (Phase 2) ─────────────────────────────────────────────
+
+/// Traffic-shaping parameters for outbound frames. Sender-local: the
+/// receiver strips padding unconditionally, so the two ends need not
+/// agree and there is no wire negotiation.
+#[derive(Clone)]
+struct ShapeConfig {
+    /// Ascending WS-frame-payload size buckets. An outbound frame is
+    /// padded up to the smallest bucket that fits it; a frame larger
+    /// than every bucket is left as-is. Empty = no padding.
+    pad_buckets: Vec<usize>,
+}
+
+impl ShapeConfig {
+    /// No shaping — frames go out at their natural size (still carrying
+    /// the 4-byte inner length prefix, which is unconditional).
+    fn off() -> Self {
+        ShapeConfig { pad_buckets: Vec::new() }
+    }
+
+    /// A modest default bucket set: small / control frames round up to a
+    /// handful of discrete sizes; bulk frames (already large) are left
+    /// alone, so steady throughput is barely affected.
+    fn padded() -> Self {
+        ShapeConfig { pad_buckets: vec![256, 512, 1024, 2048, 4096, 8192, 16384] }
+    }
+
+    /// Smallest bucket ≥ `len`, or `len` itself if it exceeds every bucket.
+    fn bucket_for(&self, len: usize) -> usize {
+        self.pad_buckets.iter().copied().find(|&b| b >= len).unwrap_or(len)
+    }
+
+    /// Wrap `data` as an inner record `[real_len: u32 BE][data][pad]`,
+    /// padding the record up to a size bucket. The 4-byte length prefix
+    /// is always present — it is how the receiver finds the real data;
+    /// `pad` is empty when shaping is off.
+    fn wrap(&self, data: &[u8]) -> Vec<u8> {
+        let body = 4 + data.len();
+        let target = self.bucket_for(body);
+        let mut out = Vec::with_capacity(target);
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(data);
+        if target > body {
+            let pad_start = out.len();
+            out.resize(target, 0);
+            rand::rngs::OsRng.fill_bytes(&mut out[pad_start..]);
+        }
+        out
+    }
+}
+
+/// Traffic-shaping mode from the environment. `BIFROST_WSS_SHAPE=1`
+/// turns on size-bucket padding for outbound frames — a deliberate
+/// opt-in that trades a little bandwidth for a less VPN-shaped frame
+/// size distribution. Unset (the default) → no shaping. A proper config
+/// field will eventually replace the env var.
+fn shape_from_env() -> ShapeConfig {
+    match std::env::var("BIFROST_WSS_SHAPE") {
+        Ok(v) if !v.is_empty() && v != "0" => ShapeConfig::padded(),
+        _ => ShapeConfig::off(),
+    }
+}
+
 /// Parse a `wss://host:port` URI to its bare `host:port`.
 pub fn parse_wss_uri(uri: &str) -> Result<String> {
     uri.strip_prefix("wss://")
@@ -212,6 +275,10 @@ pub async fn listen(uri: &str, conn: Arc<PacketConn>, psk: Option<[u8; 32]>) -> 
         );
     }
     info!("wss listener on {}", addr);
+    let shape = shape_from_env();
+    if !shape.pad_buckets.is_empty() {
+        info!("wss: outbound size-padding (traffic shaping) enabled");
+    }
 
     // One shared link-count map for the per-peer cap within this listener.
     let connected: ConnectedPeers = Arc::new(Mutex::new(HashMap::new()));
@@ -228,8 +295,11 @@ pub async fn listen(uri: &str, conn: Arc<PacketConn>, psk: Option<[u8; 32]>) -> 
         let conn = conn.clone();
         let connected = connected.clone();
         let path = path.clone();
+        let shape = shape.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_one(tcp, peer, acceptor, conn, connected, path).await {
+            if let Err(e) =
+                serve_one(tcp, peer, acceptor, conn, connected, path, shape).await
+            {
                 debug!("wss serve from {}: {:#}", peer, e);
             }
         });
@@ -243,6 +313,7 @@ async fn serve_one(
     conn: Arc<PacketConn>,
     connected: ConnectedPeers,
     mesh_path: String,
+    shape: ShapeConfig,
 ) -> Result<()> {
     let _ = tcp.set_nodelay(true);
     // TLS handshake + HTTP head, under the handshake budget.
@@ -274,7 +345,7 @@ async fn serve_one(
     tls.flush().await.context("wss 101 flush")?;
 
     // Established — the server role does not mask outgoing frames.
-    let (r, w) = tokio::io::split(WsStream::new(tls, false));
+    let (r, w) = tokio::io::split(WsStream::new(tls, false, shape));
     serve_authenticated_link(conn, connected, peer.to_string(), Box::new(r), Box::new(w)).await;
     Ok(())
 }
@@ -313,11 +384,15 @@ pub async fn dial(uri: &str, conn: Arc<PacketConn>, psk: Option<[u8; 32]>) {
         }
     };
     let path = mesh_path(psk);
+    let shape = shape_from_env();
+    if !shape.pad_buckets.is_empty() {
+        info!("wss: outbound size-padding (traffic shaping) enabled");
+    }
     let connected: ConnectedPeers = Arc::new(Mutex::new(HashMap::new()));
 
     let mut delay = Duration::from_secs(1);
     loop {
-        match dial_once(&addr, &connector, &path, &conn, &connected).await {
+        match dial_once(&addr, &connector, &path, &conn, &connected, &shape).await {
             Ok(()) => delay = Duration::from_secs(5),
             Err(e) => debug!("wss dial {}: {:#}", addr, e),
         }
@@ -368,6 +443,7 @@ async fn dial_once(
     path: &str,
     conn: &Arc<PacketConn>,
     connected: &ConnectedPeers,
+    shape: &ShapeConfig,
 ) -> Result<()> {
     // host for the SNI / Host header — strip the port and IPv6 brackets.
     let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
@@ -402,7 +478,7 @@ async fn dial_once(
         if !head.starts_with(b"HTTP/1.1 101") {
             bail!("peer did not upgrade (served a page? wrong mesh path / PSK)");
         }
-        Ok::<_, anyhow::Error>(WsStream::new(tls, true))
+        Ok::<_, anyhow::Error>(WsStream::new(tls, true, shape.clone()))
     })
     .await
     .map_err(|_| anyhow!("wss handshake timed out"))??;
@@ -522,6 +598,7 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<WsFrame>> {
 struct WsStream<S> {
     inner: S,
     mask_tx: bool,
+    shape: ShapeConfig,
     in_raw: Vec<u8>,
     in_data: Vec<u8>,
     in_pos: usize,
@@ -531,10 +608,11 @@ struct WsStream<S> {
 }
 
 impl<S> WsStream<S> {
-    fn new(inner: S, mask_tx: bool) -> Self {
+    fn new(inner: S, mask_tx: bool, shape: ShapeConfig) -> Self {
         WsStream {
             inner,
             mask_tx,
+            shape,
             in_raw: Vec::new(),
             in_data: Vec::new(),
             in_pos: 0,
@@ -591,9 +669,24 @@ impl<S: AsyncRead + Unpin> AsyncRead for WsStream<S> {
                 Ok(Some(frame)) => {
                     match frame.opcode {
                         0x0..=0x2 => {
-                            // data frame (continuation/text/binary) — take payload
-                            if !frame.payload.is_empty() {
+                            // data frame: payload is [real_len: u32 BE][data][pad].
+                            let p = &frame.payload;
+                            if p.len() < 4 {
+                                return Poll::Ready(Err(io::Error::other(
+                                    "wss: data frame shorter than its length prefix",
+                                )));
+                            }
+                            let real_len =
+                                u32::from_be_bytes([p[0], p[1], p[2], p[3]]) as usize;
+                            if 4 + real_len > p.len() {
+                                return Poll::Ready(Err(io::Error::other(
+                                    "wss: inner length exceeds the frame",
+                                )));
+                            }
+                            if real_len > 0 {
                                 me.in_data = frame.payload;
+                                me.in_data.truncate(4 + real_len);
+                                me.in_pos = 4; // skip the length prefix
                             }
                             continue;
                         }
@@ -644,7 +737,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WsStream<S> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        encode_frame(0x2, buf, me.mask_tx, &mut me.out_buf);
+        // Wrap as an inner record [real_len][data][pad], then frame it.
+        let payload = me.shape.wrap(buf);
+        encode_frame(0x2, &payload, me.mask_tx, &mut me.out_buf);
         // Best-effort flush; whatever doesn't go now drains on the next call.
         if let Poll::Ready(Err(e)) = me.drain_out(cx) {
             return Poll::Ready(Err(e));
@@ -774,8 +869,8 @@ mod tests {
         // A client-role WsStream and a server-role WsStream over an
         // in-memory duplex — exercises the real poll_read / poll_write.
         let (a, b) = tokio::io::duplex(64 * 1024);
-        let mut client = WsStream::new(a, true); // masks
-        let mut server = WsStream::new(b, false); // does not mask
+        let mut client = WsStream::new(a, true, ShapeConfig::off()); // masks
+        let mut server = WsStream::new(b, false, ShapeConfig::off()); // does not mask
 
         let msg = b"NRN1 ... a chunk of mesh bytes crossing frame sizes ".repeat(40);
         let sent = msg.clone();
@@ -887,8 +982,8 @@ mod tests {
         // Read the decoded payload out in buffers smaller than the
         // message — exercises the in_pos advance across poll_reads.
         let (a, b) = tokio::io::duplex(64 * 1024);
-        let mut client = WsStream::new(a, true);
-        let mut server = WsStream::new(b, false);
+        let mut client = WsStream::new(a, true, ShapeConfig::off());
+        let mut server = WsStream::new(b, false, ShapeConfig::off());
         let msg = vec![0x41u8; 5000];
         let sent = msg.clone();
         let writer = tokio::spawn(async move {
@@ -916,10 +1011,45 @@ mod tests {
         encode_frame(0x8, b"", false, &mut close);
         raw.write_all(&close).await.unwrap();
         raw.flush().await.unwrap();
-        let mut ws = WsStream::new(inner, false);
+        let mut ws = WsStream::new(inner, false, ShapeConfig::off());
         let mut buf = [0u8; 16];
         let r = tokio::time::timeout(Duration::from_secs(2), ws.read(&mut buf)).await;
         assert!(matches!(r, Ok(Ok(0))), "a Close frame must surface as EOF");
         drop(raw);
+    }
+
+    #[test]
+    fn shape_config_pads_to_buckets() {
+        // off: just the 4-byte length prefix, no pad.
+        assert_eq!(ShapeConfig::off().wrap(b"hello").len(), 4 + 5);
+        let on = ShapeConfig::padded();
+        // a small payload rounds up to the first bucket.
+        let small = on.wrap(b"hi");
+        assert_eq!(small.len(), 256, "small frame padded to the 256-byte bucket");
+        // the declared inner length is still the real 2 bytes.
+        assert_eq!(u32::from_be_bytes([small[0], small[1], small[2], small[3]]), 2);
+        // a payload larger than every bucket is left unpadded.
+        let big = on.wrap(&[0u8; 40_000]);
+        assert_eq!(big.len(), 4 + 40_000, "oversize frame is not padded");
+    }
+
+    #[tokio::test]
+    async fn wsstream_round_trips_with_padding() {
+        // Padding is sender-local: a padded client and an unpadded
+        // server still round-trip — the receiver strips it regardless.
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let mut client = WsStream::new(a, true, ShapeConfig::padded());
+        let mut server = WsStream::new(b, false, ShapeConfig::off());
+        let msg = b"a short control-sized message ".repeat(4);
+        let sent = msg.clone();
+        let writer = tokio::spawn(async move {
+            client.write_all(&sent).await.unwrap();
+            client.flush().await.unwrap();
+            client
+        });
+        let mut got = vec![0u8; msg.len()];
+        server.read_exact(&mut got).await.unwrap();
+        let _ = writer.await.unwrap();
+        assert_eq!(got, msg, "padded frames must round-trip losslessly");
     }
 }
