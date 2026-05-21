@@ -51,25 +51,54 @@ struct ShapeConfig {
     /// padded up to the smallest bucket that fits it; a frame larger
     /// than every bucket is left as-is. Empty = no padding.
     pad_buckets: Vec<usize>,
+    /// When `Some((min, max))` the write pump slips an opcode-0x3 cover
+    /// frame onto the wire after a random write-idle gap in `[min, max]`,
+    /// so the link never has the "bulk then dead silence" shape of a VPN.
+    /// `None` = no cover traffic.
+    cover: Option<(Duration, Duration)>,
 }
 
 impl ShapeConfig {
     /// No shaping — frames go out at their natural size (still carrying
-    /// the 4-byte inner length prefix, which is unconditional).
+    /// the 4-byte inner length prefix, which is unconditional) and there
+    /// is no cover traffic.
     fn off() -> Self {
-        ShapeConfig { pad_buckets: Vec::new() }
+        ShapeConfig { pad_buckets: Vec::new(), cover: None }
     }
 
-    /// A modest default bucket set: small / control frames round up to a
-    /// handful of discrete sizes; bulk frames (already large) are left
-    /// alone, so steady throughput is barely affected.
+    /// Full Phase-2 shaping: size-bucket padding plus idle cover traffic.
+    /// Small / control frames round up to a handful of discrete sizes;
+    /// bulk frames (already large) are left alone, so steady throughput
+    /// is barely affected.
     fn padded() -> Self {
-        ShapeConfig { pad_buckets: vec![256, 512, 1024, 2048, 4096, 8192, 16384] }
+        ShapeConfig {
+            pad_buckets: vec![256, 512, 1024, 2048, 4096, 8192, 16384],
+            cover: Some((Duration::from_secs(15), Duration::from_secs(45))),
+        }
     }
 
     /// Smallest bucket ≥ `len`, or `len` itself if it exceeds every bucket.
     fn bucket_for(&self, len: usize) -> usize {
         self.pad_buckets.iter().copied().find(|&b| b >= len).unwrap_or(len)
+    }
+
+    /// A random delay within the cover-idle range, re-rolled per fire so
+    /// a long idle never produces metronomic cover frames.
+    fn next_cover_delay(&self) -> Duration {
+        let (min, max) = self
+            .cover
+            .unwrap_or((Duration::from_secs(20), Duration::from_secs(20)));
+        min + max.saturating_sub(min).mul_f64(rand::random::<f64>())
+    }
+
+    /// A cover frame's payload: random bytes of a randomised small size,
+    /// roughly keepalive-shaped. The peer drops opcode 0x3 outright, so
+    /// the content does not matter.
+    fn cover_payload(&self) -> Vec<u8> {
+        let len = 32 + (rand::random::<u32>() as usize % 480); // 32..=511 bytes
+        let mut v = vec![0u8; len];
+        rand::rngs::OsRng.fill_bytes(&mut v);
+        v
     }
 
     /// Wrap `data` as an inner record `[real_len: u32 BE][data][pad]`,
@@ -276,8 +305,8 @@ pub async fn listen(uri: &str, conn: Arc<PacketConn>, psk: Option<[u8; 32]>) -> 
     }
     info!("wss listener on {}", addr);
     let shape = shape_from_env();
-    if !shape.pad_buckets.is_empty() {
-        info!("wss: outbound size-padding (traffic shaping) enabled");
+    if shape.cover.is_some() {
+        info!("wss: traffic shaping ON — size-bucket padding + idle cover traffic");
     }
 
     // One shared link-count map for the per-peer cap within this listener.
@@ -345,8 +374,26 @@ async fn serve_one(
     tls.flush().await.context("wss 101 flush")?;
 
     // Established — the server role does not mask outgoing frames.
-    let (r, w) = tokio::io::split(WsStream::new(tls, false, shape));
-    serve_authenticated_link(conn, connected, peer.to_string(), Box::new(r), Box::new(w)).await;
+    if shape.cover.is_some() {
+        // Cover traffic on: a write pump owns the TLS write side so it
+        // can slip cover frames in during idle; norn writes to a duplex.
+        let (tls_r, tls_w) = tokio::io::split(tls);
+        let reader = WsStream::new(tls_r, false, ShapeConfig::off());
+        let (norn_side, pump_side) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(write_pump(pump_side, tls_w, false, shape));
+        serve_authenticated_link(
+            conn,
+            connected,
+            peer.to_string(),
+            Box::new(reader),
+            Box::new(norn_side),
+        )
+        .await;
+    } else {
+        let (r, w) = tokio::io::split(WsStream::new(tls, false, shape));
+        serve_authenticated_link(conn, connected, peer.to_string(), Box::new(r), Box::new(w))
+            .await;
+    }
     Ok(())
 }
 
@@ -385,8 +432,8 @@ pub async fn dial(uri: &str, conn: Arc<PacketConn>, psk: Option<[u8; 32]>) {
     };
     let path = mesh_path(psk);
     let shape = shape_from_env();
-    if !shape.pad_buckets.is_empty() {
-        info!("wss: outbound size-padding (traffic shaping) enabled");
+    if shape.cover.is_some() {
+        info!("wss: traffic shaping ON — size-bucket padding + idle cover traffic");
     }
     let connected: ConnectedPeers = Arc::new(Mutex::new(HashMap::new()));
 
@@ -449,7 +496,7 @@ async fn dial_once(
     let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
     let host = host.trim_start_matches('[').trim_end_matches(']');
 
-    let ws = timeout(WSS_HANDSHAKE_TIMEOUT, async {
+    let tls = timeout(WSS_HANDSHAKE_TIMEOUT, async {
         let tcp = TcpStream::connect(addr).await.context("wss TCP connect")?;
         let _ = tcp.set_nodelay(true);
         // `ServerName::try_from` on an IP literal yields the IpAddress
@@ -478,22 +525,77 @@ async fn dial_once(
         if !head.starts_with(b"HTTP/1.1 101") {
             bail!("peer did not upgrade (served a page? wrong mesh path / PSK)");
         }
-        Ok::<_, anyhow::Error>(WsStream::new(tls, true, shape.clone()))
+        Ok::<_, anyhow::Error>(tls)
     })
     .await
     .map_err(|_| anyhow!("wss handshake timed out"))??;
 
     // The client role masks outgoing frames (RFC 6455).
-    let (r, w) = tokio::io::split(ws);
-    serve_authenticated_link(
-        conn.clone(),
-        connected.clone(),
-        addr.to_string(),
-        Box::new(r),
-        Box::new(w),
-    )
-    .await;
+    if shape.cover.is_some() {
+        let (tls_r, tls_w) = tokio::io::split(tls);
+        let reader = WsStream::new(tls_r, false, ShapeConfig::off());
+        let (norn_side, pump_side) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(write_pump(pump_side, tls_w, true, shape.clone()));
+        serve_authenticated_link(
+            conn.clone(),
+            connected.clone(),
+            addr.to_string(),
+            Box::new(reader),
+            Box::new(norn_side),
+        )
+        .await;
+    } else {
+        let (r, w) = tokio::io::split(WsStream::new(tls, true, shape.clone()));
+        serve_authenticated_link(
+            conn.clone(),
+            connected.clone(),
+            addr.to_string(),
+            Box::new(r),
+            Box::new(w),
+        )
+        .await;
+    }
     Ok(())
+}
+
+/// Drive the write side when cover traffic is on: frame norn's byte
+/// stream into WebSocket data frames and, in write-idle gaps, slip in
+/// opcode-0x3 cover frames the peer silently drops — so the link never
+/// shows the "bulk then dead silence" shape of a VPN. Runs as its own
+/// task; ends when norn closes its side or a TLS write fails.
+async fn write_pump<R, W>(mut from_norn: R, mut tls_w: W, mask_tx: bool, shape: ShapeConfig)
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 32 * 1024];
+    let mut frame = Vec::new();
+    loop {
+        tokio::select! {
+            biased;
+            // Real data takes priority — it is never delayed for cover.
+            r = from_norn.read(&mut buf) => {
+                let n = match r {
+                    Ok(0) | Err(_) => break, // norn closed its side / pipe error
+                    Ok(n) => n,
+                };
+                frame.clear();
+                encode_frame(0x2, &shape.wrap(&buf[..n]), mask_tx, &mut frame);
+                if tls_w.write_all(&frame).await.is_err() || tls_w.flush().await.is_err() {
+                    break;
+                }
+            }
+            // Write-idle for a randomised gap → emit one cover frame.
+            _ = tokio::time::sleep(shape.next_cover_delay()) => {
+                frame.clear();
+                encode_frame(0x3, &shape.cover_payload(), mask_tx, &mut frame);
+                if tls_w.write_all(&frame).await.is_err() || tls_w.flush().await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = tls_w.shutdown().await;
 }
 
 // ── WebSocket framing ─────────────────────────────────────────────────────
@@ -1051,5 +1153,70 @@ mod tests {
         server.read_exact(&mut got).await.unwrap();
         let _ = writer.await.unwrap();
         assert_eq!(got, msg, "padded frames must round-trip losslessly");
+    }
+
+    #[tokio::test]
+    async fn write_pump_frames_data_and_injects_cover() {
+        // Tiny cover-idle range so cover frames appear within the test.
+        let shape = ShapeConfig {
+            pad_buckets: Vec::new(),
+            cover: Some((Duration::from_millis(30), Duration::from_millis(60))),
+        };
+        let (mut norn_side, pump_side) = tokio::io::duplex(64 * 1024);
+        let (tls_side, mut wire) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(write_pump(pump_side, tls_side, false, shape));
+
+        norn_side.write_all(b"hello mesh").await.unwrap();
+        norn_side.flush().await.unwrap();
+
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let mut data_ok = false;
+        let mut cover_ok = false;
+        for _ in 0..40 {
+            if data_ok && cover_ok {
+                break;
+            }
+            if let Ok(Ok(n)) =
+                tokio::time::timeout(Duration::from_millis(50), wire.read(&mut chunk)).await
+            {
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&chunk[..n]);
+            }
+            while let Some(frame) = try_parse_frame(&mut raw).unwrap() {
+                match frame.opcode {
+                    0x2 => {
+                        let p = &frame.payload;
+                        let real = u32::from_be_bytes([p[0], p[1], p[2], p[3]]) as usize;
+                        if &p[4..4 + real] == b"hello mesh" {
+                            data_ok = true;
+                        }
+                    }
+                    0x3 => cover_ok = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(data_ok, "norn's bytes must arrive as an 0x2 data frame");
+        assert!(cover_ok, "an idle pump must emit 0x3 cover frames");
+    }
+
+    #[tokio::test]
+    async fn wsstream_drops_cover_frames() {
+        // An opcode-0x3 cover frame between data frames is silently
+        // dropped — it must never reach norn's byte stream.
+        let (mut raw, inner) = tokio::io::duplex(8192);
+        let mut wire = Vec::new();
+        encode_frame(0x3, b"cover padding bytes", false, &mut wire);
+        encode_frame(0x2, &ShapeConfig::off().wrap(b"real"), false, &mut wire);
+        raw.write_all(&wire).await.unwrap();
+        raw.flush().await.unwrap();
+        let mut ws = WsStream::new(inner, false, ShapeConfig::off());
+        let mut got = [0u8; 4];
+        ws.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"real", "cover frames must not reach the byte stream");
+        drop(raw);
     }
 }
