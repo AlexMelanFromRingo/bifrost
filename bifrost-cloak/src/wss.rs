@@ -715,11 +715,17 @@ mod tests {
 
     #[test]
     fn frame_round_trips_unmasked_and_masked() {
-        let mid = [0xABu8; 130]; // crosses the 7-bit length boundary
-        let big = vec![0x5Au8; 70_000]; // crosses the 16-bit length boundary
+        let edge = [0xCDu8; 126]; // exactly the 7-bit → 16-bit length boundary
+        let mid = [0xABu8; 130];
+        let big = vec![0x5Au8; 70_000]; // crosses the 16-bit → 64-bit boundary
         for mask in [false, true] {
-            for payload in [b"".as_slice(), b"hello".as_slice(), mid.as_slice(), big.as_slice()]
-            {
+            for payload in [
+                b"".as_slice(),
+                b"hello".as_slice(),
+                edge.as_slice(),
+                mid.as_slice(),
+                big.as_slice(),
+            ] {
                 let mut buf = Vec::new();
                 encode_frame(0x2, payload, mask, &mut buf);
                 let frame = try_parse_frame(&mut buf).unwrap().unwrap();
