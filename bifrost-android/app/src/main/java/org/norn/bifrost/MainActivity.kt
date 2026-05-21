@@ -1,5 +1,7 @@
 package org.norn.bifrost
 
+import android.animation.AnimatorSet
+import android.animation.ObjectAnimator
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.BroadcastReceiver
@@ -55,6 +57,12 @@ class MainActivity : Activity() {
 
     /** Colour palette, resolved per-onCreate against the day/night theme. */
     private var pal = Palette.light()
+
+    /** Previous banner state — gates the connect "bounce" so it fires
+     *  only on a real transition, not on the onResume seed. */
+    private var prevState: String? = null
+    /** Running "connecting" pulse animator, cancelled on any other state. */
+    private var pulse: ObjectAnimator? = null
 
     /** Receives BifrostVpnService.ACTION_STATE while the screen is foreground. */
     private val stateReceiver = object : BroadcastReceiver() {
@@ -185,6 +193,7 @@ class MainActivity : Activity() {
     override fun onPause() {
         super.onPause()
         save()
+        pulse?.cancel()
         try { unregisterReceiver(stateReceiver) } catch (_: Throwable) {}
     }
 
@@ -300,6 +309,38 @@ class MainActivity : Activity() {
             BifrostVpnService.STATE_CONNECTING -> "Mesh handshake in progress…"
             BifrostVpnService.STATE_FAILED -> detail.take(140)
             else -> "Tap Connect to route traffic through the exit"
+        }
+        animateDot(state)
+        prevState = state
+    }
+
+    /** Pulse the status dot while connecting; a small bounce on connect. */
+    private fun animateDot(state: String) {
+        pulse?.cancel()
+        pulse = null
+        dot.alpha = 1f
+        dot.scaleX = 1f
+        dot.scaleY = 1f
+        when {
+            state == BifrostVpnService.STATE_CONNECTING -> {
+                pulse = ObjectAnimator.ofFloat(dot, "alpha", 1f, 0.25f).apply {
+                    duration = 650L
+                    repeatMode = ObjectAnimator.REVERSE
+                    repeatCount = ObjectAnimator.INFINITE
+                    start()
+                }
+            }
+            state == BifrostVpnService.STATE_CONNECTED &&
+                prevState != null && prevState != BifrostVpnService.STATE_CONNECTED -> {
+                AnimatorSet().apply {
+                    playTogether(
+                        ObjectAnimator.ofFloat(dot, "scaleX", 1f, 1.5f, 1f),
+                        ObjectAnimator.ofFloat(dot, "scaleY", 1f, 1.5f, 1f),
+                    )
+                    duration = 380L
+                    start()
+                }
+            }
         }
     }
 

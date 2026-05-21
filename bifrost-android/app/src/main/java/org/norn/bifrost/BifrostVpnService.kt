@@ -5,10 +5,13 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.graphics.drawable.Icon
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
+import android.os.VibrationEffect
+import android.os.Vibrator
 import kotlin.concurrent.thread
 
 /**
@@ -252,12 +255,13 @@ class BifrostVpnService : VpnService() {
 
     // ── Connection-state publishing ──────────────────────────────────
 
-    /** Record + publish a state transition: refresh the FGS notification
-     *  and broadcast it (app-internal) so a foreground MainActivity can
-     *  reflect it in its UI. */
+    /** Record + publish a state transition: refresh the FGS notification,
+     *  give a short haptic cue, and broadcast it (app-internal) so a
+     *  foreground MainActivity can reflect it in its UI. */
     private fun broadcastState(state: String, detail: String = "") {
         currentState = state
         currentDetail = detail
+        val showStop = state == STATE_CONNECTING || state == STATE_CONNECTED
         updateNotification(
             when (state) {
                 STATE_CONNECTING -> "Connecting…"
@@ -265,14 +269,32 @@ class BifrostVpnService : VpnService() {
                     if (detail.isNotEmpty()) "Connected — $detail" else "Connected"
                 STATE_FAILED -> "Disconnected — connection failed"
                 else -> "Disconnected"
-            }
+            },
+            showStop,
         )
+        vibrateFor(state)
         sendBroadcast(
             Intent(ACTION_STATE)
                 .setPackage(packageName)
                 .putExtra(EXTRA_STATE, state)
                 .putExtra(EXTRA_DETAIL, detail)
         )
+    }
+
+    /** A short, distinct haptic cue on a real connect / disconnect /
+     *  failure transition. CONNECTING is silent — the cue is for the
+     *  outcome, not the attempt. */
+    private fun vibrateFor(state: String) {
+        val pattern = when (state) {
+            STATE_CONNECTED -> longArrayOf(0, 45, 90, 45) // double tap — up
+            STATE_FAILED -> longArrayOf(0, 250)           // one long — failed
+            STATE_DISCONNECTED -> longArrayOf(0, 70)      // one short — off
+            else -> return
+        }
+        try {
+            val v = getSystemService(Vibrator::class.java) ?: return
+            v.vibrate(VibrationEffect.createWaveform(pattern, -1))
+        } catch (_: Throwable) {}
     }
 
     // ── Roaming: follow the default network ──────────────────────────
@@ -334,33 +356,49 @@ class BifrostVpnService : VpnService() {
                     NOTIF_CHANNEL, "Bifrost VPN", NotificationManager.IMPORTANCE_LOW,
                 ).apply { description = "Ongoing mesh VPN tunnel status" }
             )
-            startForeground(NOTIF_ID, buildNotification("Connecting…"))
+            startForeground(NOTIF_ID, buildNotification("Connecting…", showStop = true))
         } catch (t: Throwable) {
             Logger.line("service: startForeground failed: ${t.message}")
         }
     }
 
     /** Update the ongoing-notification text without changing FGS state. */
-    private fun updateNotification(text: String) {
+    private fun updateNotification(text: String, showStop: Boolean) {
         try {
             getSystemService(NotificationManager::class.java)
-                ?.notify(NOTIF_ID, buildNotification(text))
+                ?.notify(NOTIF_ID, buildNotification(text, showStop))
         } catch (_: Throwable) {}
     }
 
-    private fun buildNotification(text: String): Notification {
+    /** Build the ongoing tunnel notification — with a Disconnect action
+     *  (music-player style) while the tunnel is up or coming up. */
+    private fun buildNotification(text: String, showStop: Boolean): Notification {
         val tap = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE,
         )
-        return Notification.Builder(this, NOTIF_CHANNEL)
+        val b = Notification.Builder(this, NOTIF_CHANNEL)
             .setContentTitle("Bifrost VPN")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setOngoing(true)
+            .setShowWhen(false)
             .setContentIntent(tap)
-            .build()
+        if (showStop) {
+            val stop = PendingIntent.getService(
+                this, 1,
+                Intent(this, BifrostVpnService::class.java).setAction(ACTION_STOP),
+                PendingIntent.FLAG_IMMUTABLE,
+            )
+            b.addAction(
+                Notification.Action.Builder(
+                    Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
+                    "Disconnect", stop,
+                ).build()
+            )
+        }
+        return b.build()
     }
 
     companion object {
