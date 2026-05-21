@@ -1,3 +1,5 @@
 /target
+# cargo-mutants writes its run output here — never commit it.
+/mutants.out*
 # Cargo.lock IS committed: this workspace ships two binaries
 # (bifrost-socks5d, bifrost-vpnd) and reproducible builds matter.
