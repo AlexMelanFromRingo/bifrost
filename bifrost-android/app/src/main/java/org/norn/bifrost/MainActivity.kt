@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.drawable.GradientDrawable
 import android.net.VpnService
@@ -54,6 +55,7 @@ class MainActivity : Activity() {
 
     private val reqConnect = 1001
     private val reqScan = 1002
+    private val reqNotif = 1003
 
     /** Colour palette, resolved per-onCreate against the day/night theme. */
     private var pal = Palette.light()
@@ -79,6 +81,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         Logger.init(this)
+        maybeRequestNotifications()
         pal = if (isNight()) Palette.dark() else Palette.light()
 
         val root = LinearLayout(this).apply {
@@ -347,6 +350,27 @@ class MainActivity : Activity() {
     /** Show a one-line transient note in the footer status line. */
     private fun note(msg: String) {
         if (::status.isInitialized) status.text = msg
+    }
+
+    /** Android 13+: the foreground-service notification is suppressed
+     *  until POST_NOTIFICATIONS is granted, so ask for it up front. */
+    private fun maybeRequestNotifications() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(
+                arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), reqNotif)
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == reqNotif &&
+            grantResults.firstOrNull() != PackageManager.PERMISSION_GRANTED) {
+            note("Notifications off — the tunnel still works, but the shade card won't show")
+        }
     }
 
     /**
