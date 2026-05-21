@@ -90,10 +90,47 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
         cfg.egress.as_ref().map(describe_egress).unwrap_or_else(|| "mesh".into()),
     );
 
-    let node = Node::new(cfg.node.clone()).await.context("starting norn node")?;
+    // Anti-DPI: norn-rs owns tcp:// / quic://; bifrost-cloak owns
+    // wss://. Split the URI lists so norn-rs never tries TCP on a
+    // wss:// URI — the wss ones are driven separately, below.
+    let mut node_cfg = cfg.node.clone();
+    let wss_listen: Vec<String> = node_cfg
+        .listen
+        .iter()
+        .filter(|u| u.starts_with("wss://"))
+        .cloned()
+        .collect();
+    let wss_peers: Vec<String> = node_cfg
+        .peers
+        .iter()
+        .filter(|u| u.starts_with("wss://"))
+        .cloned()
+        .collect();
+    node_cfg.listen.retain(|u| !u.starts_with("wss://"));
+    node_cfg.peers.retain(|u| !u.starts_with("wss://"));
+
+    let node = Node::new(node_cfg).await.context("starting norn node")?;
     node.start().await.context("starting norn subsystems")?;
     let conn = node.conn.clone();
     info!("norn node up; our pub_key={}", hex::encode(conn.pub_key));
+
+    if !wss_listen.is_empty() || !wss_peers.is_empty() {
+        #[cfg(feature = "anti-dpi")]
+        {
+            let psk = norn_rs::obfs::derive_psk_key(&cfg.node.obfuscation_psk);
+            info!(
+                "anti-dpi: bifrost-cloak driving {} wss listener(s), {} wss peer(s)",
+                wss_listen.len(),
+                wss_peers.len(),
+            );
+            bifrost_cloak::spawn_wss(conn.clone(), wss_listen, wss_peers, psk);
+        }
+        #[cfg(not(feature = "anti-dpi"))]
+        warn!(
+            "config has {} wss:// URI(s) but this build lacks --features anti-dpi — ignored",
+            wss_listen.len() + wss_peers.len(),
+        );
+    }
 
     let (mux, accept_rx) = MeshMux::new(conn);
 

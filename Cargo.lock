@@ -165,6 +165,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bifrost-cloak"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake2",
+ "hex",
+ "norn-rs",
+ "rand 0.8.6",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "sha1",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
 name = "bifrost-core"
 version = "0.1.0"
 dependencies = [
@@ -199,6 +217,7 @@ name = "bifrost-ffi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bifrost-cloak",
  "bifrost-core",
  "bifrost-vpnd",
  "hex",
@@ -236,6 +255,7 @@ name = "bifrost-vpnd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bifrost-cloak",
  "bifrost-core",
  "clap",
  "ed25519-dalek",
@@ -1819,6 +1839,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2100,6 +2131,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tokio-rustls"
+version = "0.26.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
+dependencies = [
+ "rustls",
+ "tokio",
 ]
 
 [[package]]

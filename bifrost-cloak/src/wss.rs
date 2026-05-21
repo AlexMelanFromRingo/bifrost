@@ -328,6 +328,40 @@ pub async fn dial(uri: &str, conn: Arc<PacketConn>, psk: Option<[u8; 32]>) {
     }
 }
 
+/// Spawn a cloak transport task for each given URI: `listen_uris`
+/// become `wss://` listeners, `peer_uris` become `wss://` dialers, all
+/// bound to `conn`. Non-`wss://` URIs are skipped (norn-rs owns those),
+/// so a caller may pass its full lists. Must be called from within a
+/// Tokio runtime. This is the single entry point a consuming binary
+/// (bifrost-vpnd / bifrost-ffi) calls after `node.start()`.
+pub fn spawn_wss(
+    conn: Arc<PacketConn>,
+    listen_uris: Vec<String>,
+    peer_uris: Vec<String>,
+    psk: Option<[u8; 32]>,
+) {
+    for uri in listen_uris {
+        if !uri.starts_with("wss://") {
+            continue;
+        }
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            if let Err(e) = listen(&uri, conn, psk).await {
+                tracing::error!("wss listener {}: {:#}", uri, e);
+            }
+        });
+    }
+    for uri in peer_uris {
+        if !uri.starts_with("wss://") {
+            continue;
+        }
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            dial(&uri, conn, psk).await;
+        });
+    }
+}
+
 async fn dial_once(
     addr: &str,
     connector: &TlsConnector,

@@ -18,4 +18,4 @@
 mod tls;
 pub mod wss;
 
-pub use wss::{dial, listen, parse_wss_uri};
+pub use wss::{dial, listen, parse_wss_uri, spawn_wss};

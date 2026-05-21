@@ -13,9 +13,16 @@ description = "C ABI shim for bifrost-vpnd's client data plane — drives Androi
 # downstream packaging picks the right one.
 crate-type = ["staticlib", "cdylib"]
 
+[features]
+# `anti-dpi` pulls in bifrost-cloak (the wss:// transport) for the
+# mobile client. Off by default; enable for builds shipped into
+# censored networks: `cargo ndk … build -p bifrost-ffi --features anti-dpi`.
+anti-dpi = ["dep:bifrost-cloak"]
+
 [dependencies]
 bifrost-core    = { path = "../bifrost-core" }
 bifrost-vpnd    = { path = "../bifrost-vpnd", default-features = false }
+bifrost-cloak   = { path = "../bifrost-cloak", optional = true }
 norn-rs.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

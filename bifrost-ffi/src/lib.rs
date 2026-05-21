@@ -223,6 +223,27 @@ pub unsafe extern "C" fn bifrost_client_connect(
     // exit/client mode.)
     cfg.tun_name = None;
 
+    // Anti-DPI: norn-rs owns tcp:// / quic://; bifrost-cloak owns
+    // wss://. Pull wss:// peers out before norn-rs sees the config —
+    // norn-rs must never try a plain TCP dial on a wss:// URI.
+    let wss_peers: Vec<String> = cfg
+        .peers
+        .iter()
+        .filter(|u| u.starts_with("wss://"))
+        .cloned()
+        .collect();
+    cfg.peers.retain(|u| !u.starts_with("wss://"));
+    #[cfg(feature = "anti-dpi")]
+    let wss_psk = norn_rs::obfs::derive_psk_key(&cfg.obfuscation_psk);
+    #[cfg(not(feature = "anti-dpi"))]
+    if !wss_peers.is_empty() {
+        set_last_error(
+            "node config has a wss:// peer but bifrost-ffi was built \
+             without --features anti-dpi",
+        );
+        return BifrostStatus::InvalidArg as i32;
+    }
+
     // Build a multi-thread runtime. Mobile cores hit thermal caps
     // fast on single-thread; tokio's work-stealing scheduler keeps
     // the encrypt + framing work spread across cores.
@@ -243,6 +264,11 @@ pub unsafe extern "C" fn bifrost_client_connect(
         node.start().await.context("node.start")?;
         let conn = node.conn.clone();
         info!("bifrost-ffi: node up; pub_key={}", hex::encode(conn.pub_key));
+        #[cfg(feature = "anti-dpi")]
+        if !wss_peers.is_empty() {
+            info!("anti-dpi: bifrost-cloak driving {} wss peer(s)", wss_peers.len());
+            bifrost_cloak::spawn_wss(conn.clone(), Vec::new(), wss_peers, wss_psk);
+        }
         let (mux, _accept_rx) = MeshMux::new(conn);
         let (mesh, hello) = client_handshake(mux.clone(), exit_peer)
             .await

@@ -22,9 +22,13 @@ default = ["tun"]
 # CAP_NET_ADMIN at runtime to bring up the device and rewrite the
 # nat table — we don't try to fall back gracefully).
 tun = ["norn-rs/tun-support"]
+# `anti-dpi` pulls in the bifrost-cloak crate (the wss:// transport).
+# Off by default — the default build stays the lightweight daemon.
+anti-dpi = ["dep:bifrost-cloak"]
 
 [dependencies]
 bifrost-core    = { path = "../bifrost-core" }
+bifrost-cloak   = { path = "../bifrost-cloak", optional = true }
 norn-rs.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
