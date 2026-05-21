@@ -754,6 +754,13 @@ mod tests {
 
         let plain = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
         assert!(!parse_request(plain).unwrap().ws_upgrade);
+
+        // Both `Upgrade: websocket` AND `Connection: Upgrade` are
+        // required — one header alone is not a WebSocket upgrade.
+        let no_conn = b"GET /ws HTTP/1.1\r\nUpgrade: websocket\r\nSec-WebSocket-Key: k\r\n\r\n";
+        assert!(!parse_request(no_conn).unwrap().ws_upgrade);
+        let no_upg = b"GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nSec-WebSocket-Key: k\r\n\r\n";
+        assert!(!parse_request(no_upg).unwrap().ws_upgrade);
     }
 
     #[tokio::test]
@@ -836,5 +843,77 @@ mod tests {
         listener.abort();
         dialer.abort();
         assert!(linked, "wss:// transport must link the two nodes within ~6s");
+    }
+
+    #[test]
+    fn encode_frame_uses_minimal_length_field() {
+        // A <126-byte payload must use the 7-bit length form (2-byte
+        // header), not a needlessly-wide extended length.
+        let mut small = Vec::new();
+        encode_frame(0x2, b"hello", false, &mut small);
+        assert_eq!(small.len(), 2 + 5, "small payload → 7-bit length header");
+        // 126..=65535 → the 16-bit length form (4-byte header).
+        let mut mid = Vec::new();
+        encode_frame(0x2, &[0u8; 200], false, &mut mid);
+        assert_eq!(mid.len(), 4 + 200, "mid payload → 16-bit length header");
+        // A masked frame carries the extra 4-byte masking key.
+        let mut masked = Vec::new();
+        encode_frame(0x2, b"hello", true, &mut masked);
+        assert_eq!(masked.len(), 2 + 4 + 5, "masked frame includes the 4-byte key");
+    }
+
+    #[test]
+    fn try_parse_frame_partial_lengths_and_oversize() {
+        // A 16-bit-length frame with the length field cut short → need more.
+        let mut p16 = vec![0x82u8, 126, 0x00];
+        assert!(try_parse_frame(&mut p16).unwrap().is_none());
+        // A 64-bit-length frame with the length field cut short → need more.
+        let mut p64 = vec![0x82u8, 127, 0, 0, 0];
+        assert!(try_parse_frame(&mut p64).unwrap().is_none());
+        // A 64-bit length claiming more than MAX_WS_FRAME → hard error.
+        let mut huge = vec![0x82u8, 127];
+        huge.extend_from_slice(&(MAX_WS_FRAME as u64 + 1).to_be_bytes());
+        assert!(try_parse_frame(&mut huge).is_err(), "oversize frame must error");
+    }
+
+    #[tokio::test]
+    async fn wsstream_delivers_payload_across_small_reads() {
+        // Read the decoded payload out in buffers smaller than the
+        // message — exercises the in_pos advance across poll_reads.
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let mut client = WsStream::new(a, true);
+        let mut server = WsStream::new(b, false);
+        let msg = vec![0x41u8; 5000];
+        let sent = msg.clone();
+        let writer = tokio::spawn(async move {
+            client.write_all(&sent).await.unwrap();
+            client.flush().await.unwrap();
+            client
+        });
+        let mut got = Vec::new();
+        let mut chunk = [0u8; 64];
+        while got.len() < msg.len() {
+            let n = server.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "unexpected EOF before the message completed");
+            got.extend_from_slice(&chunk[..n]);
+        }
+        let _ = writer.await.unwrap();
+        assert_eq!(got, msg);
+    }
+
+    #[tokio::test]
+    async fn wsstream_close_frame_surfaces_as_eof() {
+        // A Close frame ends the read stream even while the underlying
+        // socket stays open (i.e. it is the Close, not a socket EOF).
+        let (mut raw, inner) = tokio::io::duplex(4096);
+        let mut close = Vec::new();
+        encode_frame(0x8, b"", false, &mut close);
+        raw.write_all(&close).await.unwrap();
+        raw.flush().await.unwrap();
+        let mut ws = WsStream::new(inner, false);
+        let mut buf = [0u8; 16];
+        let r = tokio::time::timeout(Duration::from_secs(2), ws.read(&mut buf)).await;
+        assert!(matches!(r, Ok(Ok(0))), "a Close frame must surface as EOF");
+        drop(raw);
     }
 }
