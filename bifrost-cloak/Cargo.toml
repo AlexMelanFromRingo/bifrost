@@ -1,0 +1,23 @@
+[package]
+name = "bifrost-cloak"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Anti-DPI mesh transport (wss://) for the Bifrost VPN — opt-in, separate from the norn-rs core"
+
+[dependencies]
+norn-rs.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+rand.workspace = true
+hex.workspace = true
+# TLS-over-TCP + the WebSocket handshake hash — the "heavy" anti-DPI
+# dependencies live here, in this opt-in crate, not in the norn-rs core.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+sha1 = "0.10"
+blake2 = "0.10"
