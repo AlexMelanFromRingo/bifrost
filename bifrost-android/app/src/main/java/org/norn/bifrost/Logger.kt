@@ -33,34 +33,58 @@ object Logger {
     private const val LOG_PORT = 5599
 
     /** Build marker — bump every build so a log identifies its APK. */
-    const val BUILD = "2026-05-20 mux-reopen+two-phase-lease"
+    const val BUILD = "2026-05-21 roaming+privacy+optlogs"
 
     @Volatile private var file: File? = null
     @Volatile private var serverUp = false
+    /** When false, [line] / [startSession] skip all file writes and the
+     *  live-tail server is not started — diagnostics off. */
+    @Volatile private var fileLogging = true
     private val stamp = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
-    /** Bind the session file + start the live-log TCP server. Idempotent. */
+    /** Bind the session file + start the live-log TCP server. Idempotent.
+     *  Reads the user's diagnostic-logging preference; when off, the
+     *  file path is still bound (so a later toggle-on works) but nothing
+     *  is written and the live-tail server stays down. */
     fun init(ctx: Context) {
+        // "bifrost" mirrors MainActivity.PREFS — the diagnostic-logging
+        // toggle is persisted there.
+        fileLogging = ctx.getSharedPreferences("bifrost", Context.MODE_PRIVATE)
+            .getBoolean("logging_enabled", true)
         if (file == null) {
             file = File(ctx.getExternalFilesDir(null), SESSION_FILE)
         }
-        startServer()
+        if (fileLogging) startServer()
     }
 
-    /** Absolute path of the session log — passed to the native layer. */
-    fun nativeLogPath(): String = file?.absolutePath ?: ""
+    /** Flip diagnostic file logging at runtime (the caller persists the
+     *  preference). Turning it on lazily starts the live-tail server. */
+    fun setFileLogging(enabled: Boolean) {
+        fileLogging = enabled
+        if (enabled) startServer()
+    }
 
-    /** Truncate the log — call at the start of each connection attempt. */
+    /** Absolute path of the session log — passed to the native layer.
+     *  Empty when diagnostic logging is off, which disables the native
+     *  file log too. */
+    fun nativeLogPath(): String =
+        if (fileLogging) file?.absolutePath ?: "" else ""
+
+    /** Truncate the log — call at the start of each connection attempt.
+     *  A no-op when diagnostic logging is off. */
     fun startSession() {
+        if (!fileLogging) return
         try { file?.writeText("") } catch (_: Throwable) {}
         val now = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
         line("===== session start $now =====")
         line("build=$BUILD  native-abi=${runCatching { NativeBridge.nativeAbiVersion() }.getOrDefault(-1)}")
     }
 
-    /** Append one app-side line (also mirrored to logcat). */
+    /** Append one app-side line (always mirrored to logcat; the on-disk
+     *  session file is written only when diagnostic logging is on). */
     fun line(msg: String) {
         Log.i(TAG, msg)
+        if (!fileLogging) return
         try {
             file?.appendText("${stamp.format(Date())} [app]  $msg\n")
         } catch (_: Throwable) {}

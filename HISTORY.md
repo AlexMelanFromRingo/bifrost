@@ -15,7 +15,7 @@ iteration live alongside this file under
 * **Client:** WSL2 Ubuntu 24.04 on a residential UA ISP
   (188.163.47.11, ~250 Mbit/s downlink to nearby PoPs).
 * **Exit:** Oracle Cloud Ubuntu 24.04 in Amsterdam
-  (***REMOVED***, single 2-vCPU box, public ens3 interface).
+  (a single 2-vCPU cloud box, public interface).
 * **WAN RTT:** ~55 ms, ~50 Mbit/s aggregate TCP cap regardless of
   parallelism — `iperf3 -c oracle -P 8` confirms 50 Mbit/s
   total, the same number that single-flow CUBIC reaches.

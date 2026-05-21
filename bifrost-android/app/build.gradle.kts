@@ -1,6 +1,17 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+}
+
+// Exit-server defaults are injected from a gitignored `exit.properties`
+// at the project root, so the committed source never carries a real
+// server address. Absent file → blank defaults (the user types the
+// address once; it then persists in SharedPreferences).
+val exitProps = Properties().apply {
+    val f = rootProject.file("exit.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
 }
 
 android {
@@ -15,6 +26,21 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "0.1"
+
+        // Server defaults from exit.properties (see top of file).
+        buildConfigField(
+            "String", "DEFAULT_EXIT_KEY",
+            "\"${exitProps.getProperty("exit.key", "")}\"",
+        )
+        buildConfigField(
+            "String", "DEFAULT_EXIT_ADDR",
+            "\"${exitProps.getProperty("exit.addr", "")}\"",
+        )
+    }
+
+    buildFeatures {
+        // Required for the custom buildConfigField()s above.
+        buildConfig = true
     }
 
     buildTypes {

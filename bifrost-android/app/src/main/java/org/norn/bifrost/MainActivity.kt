@@ -12,6 +12,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import java.security.SecureRandom
 
@@ -96,6 +97,20 @@ class MainActivity : Activity() {
                 val name = Logger.exportToDownloads(this@MainActivity)
                 status.text = if (name != null) "log saved: Downloads/$name"
                     else "no log to save yet — connect first"
+            }
+        })
+
+        // Diagnostic logging toggle — off keeps the session file (and
+        // its live-tail server) from being written at all, so a
+        // long-running tunnel doesn't accumulate a log on disk.
+        root.addView(Switch(this).apply {
+            text = "Diagnostic logging"
+            isChecked = prefs.getBoolean(K_LOGGING, true)
+            setOnCheckedChangeListener { _, checked ->
+                prefs.edit().putBoolean(K_LOGGING, checked).apply()
+                Logger.setFileLogging(checked)
+                status.text = if (checked) "diagnostic logging on"
+                    else "diagnostic logging off — no session file written"
             }
         })
 
@@ -223,10 +238,13 @@ class MainActivity : Activity() {
         const val K_EXIT_KEY = "exit_key"
         const val K_EXIT_ADDR = "exit_addr"
         const val K_PRIV_KEY = "priv_key"
+        const val K_LOGGING = "logging_enabled"
 
-        // Defaults point at the standing Oracle exit.
-        const val DEFAULT_EXIT_KEY =
-            "***REMOVED***"
-        const val DEFAULT_EXIT_ADDR = "tcp://***REMOVED***:9000"
+        // Exit defaults are injected at build time from the gitignored
+        // `exit.properties` via BuildConfig — the repo never carries a
+        // real server address. Blank when the file is absent; the user
+        // types the address once and it persists to SharedPreferences.
+        val DEFAULT_EXIT_KEY: String = BuildConfig.DEFAULT_EXIT_KEY
+        val DEFAULT_EXIT_ADDR: String = BuildConfig.DEFAULT_EXIT_ADDR
     }
 }

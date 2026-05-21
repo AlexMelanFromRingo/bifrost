@@ -2,6 +2,9 @@
 build/
 app/build/
 local.properties
+# Exit-server address/key injected into BuildConfig at build time —
+# never commit a real server address.
+exit.properties
 *.iml
 .idea/
 # The native library is a build artefact — regenerate with cargo-ndk
