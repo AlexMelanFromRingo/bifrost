@@ -252,7 +252,12 @@ pub unsafe extern "C" fn bifrost_client_connect(
             hello.allocated_v4, hello.allocated_v6, hello.mtu
         );
         let lease_v4 = u32::from(hello.allocated_v4);
-        let pending = PendingTunnel { mux, mesh, exit_peer };
+        let pending = PendingTunnel {
+            mux,
+            mesh,
+            exit_peer,
+            lease_v4: hello.allocated_v4,
+        };
         Ok((node, pending, lease_v4, hello.mtu))
     });
 
@@ -312,7 +317,7 @@ pub unsafe extern "C" fn bifrost_client_run(handle: *mut BifrostClient, tun_fd: 
     // SAFETY: caller asserts `handle` is a live `connect` handle that
     // is not being concurrently used or stopped.
     let client = unsafe { &mut *handle };
-    let Some(PendingTunnel { mux, mesh, exit_peer }) = client.pending.take() else {
+    let Some(PendingTunnel { mux, mesh, exit_peer, lease_v4 }) = client.pending.take() else {
         set_last_error("bifrost_client_run: handle already running or not connected");
         return BifrostStatus::InvalidArg as i32;
     };
@@ -368,7 +373,7 @@ pub unsafe extern "C" fn bifrost_client_run(handle: *mut BifrostClient, tun_fd: 
             }
         });
         let (r, w) = tokio::io::split(framed);
-        run_client_pump(r, w, mux, exit_peer, mesh)
+        run_client_pump(r, w, mux, exit_peer, lease_v4, mesh)
             .await
             .context("run_client_pump")?;
         Ok(())
@@ -448,6 +453,10 @@ struct PendingTunnel {
     mux: Arc<MeshMux>,
     mesh: MeshStream,
     exit_peer: [u8; 32],
+    /// The exit-leased IPv4 the host pins its TUN to. Carried so the
+    /// data plane's reconnect supervisor can verify a re-lease after a
+    /// transport drop still matches what the host's TUN is bound to.
+    lease_v4: std::net::Ipv4Addr,
 }
 
 impl Drop for BifrostClient {

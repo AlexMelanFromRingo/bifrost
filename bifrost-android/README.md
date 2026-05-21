@@ -80,8 +80,25 @@ phases (`bifrost-ffi`'s `bifrost_client_connect` then
 `bifrost_client_run`): connect + handshake first, then `establish()`
 with the leased address, then attach the fd and start the data plane.
 
+## Roaming & auto-reconnect
+
+The tunnel is built to survive a network change (Wi-Fi ↔ LTE) without
+the user reconnecting by hand:
+
+* The native data plane (`run_client_pump`) runs a supervisor that
+  re-handshakes the exit whenever the control stream drops. The
+  address lease is sticky by public key, so the TUN never has to be
+  re-established.
+* The service runs in the foreground with an ongoing notification, so
+  the OS won't reclaim it during the roam window.
+* A default-network callback re-pins the VPN underlay
+  (`setUnderlyingNetworks`) on every roam.
+
 ## Known limitations (this is a test client)
 
-* No foreground-service notification, no auto-reconnect, no DNS
-  beyond a hardcoded resolver — all intentionally out of scope for a
-  test harness.
+* DNS is a hardcoded pair of public resolvers; there's no split-tunnel
+  UI and no IPv6 inside the tunnel — out of scope for a test harness.
+* The mesh transport socket is kept off the tunnel by a route
+  exclusion rather than `VpnService.protect()`. Correct in practice; a
+  native `protect()` hook would be marginally more robust on exotic
+  roams.

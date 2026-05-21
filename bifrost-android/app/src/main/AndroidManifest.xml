@@ -3,6 +3,14 @@
 
     <!-- The mesh transport dials TCP peers over the internet. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Watch the default network so the tunnel can follow Wi-Fi↔LTE roams. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Run the data plane as a foreground service so the OS keeps it
+         alive across a network roam / Doze nap. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Android 13+: show the ongoing-tunnel notification. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:label="@string/app_name"
@@ -18,11 +26,18 @@
             </intent-filter>
         </activity>
 
-        <!-- VpnService: the system binds it; BIND_VPN_SERVICE gates that. -->
+        <!-- VpnService: the system binds it; BIND_VPN_SERVICE gates that.
+             foregroundServiceType=specialUse — a VPN data plane has no
+             dedicated FGS type; specialUse is the documented catch-all and
+             needs no Play review for a sideloaded build. -->
         <service
             android:name=".BifrostVpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"
+            android:foregroundServiceType="specialUse"
             android:exported="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="mesh VPN tunnel data plane" />
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>

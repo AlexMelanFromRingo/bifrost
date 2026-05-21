@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Header the exit sends as the very first Data frame of every
 /// accepted egress stream. The client reads it before forwarding any
@@ -1208,7 +1208,7 @@ pub async fn start_client(
         install_default_route,
     )?;
     let (tun_reader, tun_writer) = tokio::io::split(dev);
-    run_client_pump(tun_reader, tun_writer, mux, exit_peer, mesh).await
+    run_client_pump(tun_reader, tun_writer, mux, exit_peer, hello.allocated_v4, mesh).await
 }
 
 /// Run the client → exit handshake: wait for the peer to be
@@ -1291,8 +1291,13 @@ pub async fn client_handshake(
 /// `start_client` (with an `OffloadTun`) and by `bifrost-ffi`
 /// (with the host-provided VpnService / NEPacketTunnelProvider fd).
 ///
-/// `mesh` is the control stream from `client_handshake`; we hold
-/// it open in a background task and surface its EOF as a log line.
+/// `mesh` is the control stream from `client_handshake`; a
+/// supervisor task holds it open and, whenever it dies, re-runs the
+/// handshake so the tunnel survives transport drops (Wi-Fi↔LTE
+/// roams, laptop sleep, flaky uplinks) without the caller noticing.
+/// `lease_v4` is the address the host has already pinned its TUN to —
+/// the supervisor verifies every re-lease still matches it.
+///
 /// The two real data tasks are spawned and own the tunnel from here
 /// on — this function returns once they're scheduled.
 pub async fn run_client_pump<R, W>(
@@ -1300,6 +1305,7 @@ pub async fn run_client_pump<R, W>(
     tun_writer: W,
     mux: Arc<MeshMux>,
     exit_peer: bifrost_core::PubKey,
+    lease_v4: Ipv4Addr,
     mesh: bifrost_core::stream::MeshStream,
 ) -> Result<()>
 where
@@ -1405,15 +1411,64 @@ where
         warn!("egress client: tun reader exited");
     });
 
-    // Hold the control MeshStream alive in the background. Half-close
-    // by the exit on lease release surfaces as EOF here; for now we
-    // just log and let the TUN sit (process exit cleans up properly).
-    // A future revision could trigger a graceful TUN teardown.
+    // ── Auto-reconnect supervisor ────────────────────────────────────
+    //
+    // The two datagram pump tasks above are transport-agnostic: they
+    // ride the long-lived mux datagram channel, which norn re-attaches
+    // on its own once `dial()` re-establishes the peer link after a
+    // drop (a Wi-Fi↔LTE roam, laptop sleep, a flaky uplink). What does
+    // NOT survive a drop is the egress *control* stream and, with it,
+    // the exit-side session + address lease: the exit stops routing
+    // datagrams to a client whose `Open(Egress)` stream has reset.
+    //
+    // So this supervisor holds the control stream and, whenever it
+    // dies, re-runs `client_handshake` to rebuild the exit-side
+    // session. `client_handshake` itself waits (up to 60s) for the
+    // peer to be reachable again, so it naturally rides out the
+    // transport reconnect without us polling here. The address lease
+    // is sticky by pub-key, so the host's already-configured TUN
+    // address stays valid across the reconnect — verified below.
     tokio::spawn(async move {
         let mut mesh = mesh;
-        let mut throwaway = Vec::new();
-        let _ = mesh.read_to_end(&mut throwaway).await;
-        warn!("egress client: control stream closed by exit");
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            // Block until the current control stream dies. Both EOF
+            // (exit released the lease) and reset (peer-reconnect
+            // retired a stale stream) end the read here.
+            let mut throwaway = Vec::new();
+            let _ = mesh.read_to_end(&mut throwaway).await;
+            warn!("egress client: control stream down — rebuilding tunnel");
+
+            match client_handshake(mux.clone(), exit_peer).await {
+                Ok((new_mesh, hello)) => {
+                    if hello.allocated_v4 != lease_v4 {
+                        // The host committed its TUN to `lease_v4` and
+                        // cannot re-address it without a full restart.
+                        // Sticky-by-pubkey leases should make this
+                        // impossible; shout if the invariant breaks.
+                        error!(
+                            "egress client: exit re-leased {} but the TUN is pinned to \
+                             {lease_v4} — traffic will black-hole until a restart",
+                            hello.allocated_v4
+                        );
+                    } else {
+                        info!(
+                            "egress client: tunnel rebuilt — lease {lease_v4} still valid"
+                        );
+                    }
+                    mesh = new_mesh;
+                    backoff = Duration::from_secs(1);
+                }
+                Err(e) => {
+                    warn!("egress client: tunnel rebuild failed: {e:#} — retry in {backoff:?}");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    // `mesh` is still the dead stream; its `read_to_end`
+                    // at the top of the loop returns at once, so we go
+                    // straight back into another handshake attempt.
+                }
+            }
+        }
     });
 
     Ok(())

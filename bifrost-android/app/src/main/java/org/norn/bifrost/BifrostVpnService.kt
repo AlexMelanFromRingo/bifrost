@@ -1,6 +1,12 @@
 package org.norn.bifrost
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import kotlin.concurrent.thread
@@ -27,6 +33,20 @@ import kotlin.concurrent.thread
  * the TUN address to a guess that didn't match the exit's lease, so
  * the exit dropped every packet as spoofed.)
  *
+ * ## Surviving a network roam (Wi-Fi ↔ LTE)
+ *
+ * Two things keep the tunnel up when the phone changes networks:
+ *
+ *  * **Foreground service** — without it the OS may kill the service
+ *    during the roam window. We `startForeground()` with an ongoing
+ *    notification for the whole session.
+ *  * **Default-network callback** — on every roam we re-pin the VPN's
+ *    underlay with `setUnderlyingNetworks()`. The native data plane
+ *    has its own reconnect supervisor (`run_client_pump`): once the
+ *    transport re-dials the exit on the new network it rebuilds the
+ *    egress session automatically, and the address lease is sticky so
+ *    the TUN never has to be re-established.
+ *
  * ## Why the routes exclude the exit IP
  *
  * A VpnService routing `0.0.0.0/0` captures every socket the app
@@ -39,6 +59,9 @@ class BifrostVpnService : VpnService() {
     @Volatile private var tun: ParcelFileDescriptor? = null
     @Volatile private var nativeHandle: Long = 0L
     @Volatile private var stopRequested: Boolean = false
+
+    /** Default-network watcher — non-null only while a tunnel is up. */
+    @Volatile private var netCallback: ConnectivityManager.NetworkCallback? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Logger.init(this)
@@ -55,6 +78,9 @@ class BifrostVpnService : VpnService() {
             stopSelf()
             return START_NOT_STICKY
         }
+        // Become a foreground service before any slow work so the OS
+        // can't reclaim us mid-handshake or mid-roam.
+        goForeground("Connecting…")
         startTunnel(config, exitKey, exitAddr)
         return START_STICKY
     }
@@ -155,6 +181,11 @@ class BifrostVpnService : VpnService() {
                 teardown(handle, pfd)
             } else {
                 nativeHandle = handle
+                // Start watching the default network so the tunnel rides
+                // Wi-Fi↔LTE roams; the native supervisor rebuilds the
+                // egress session once the transport re-dials.
+                registerNetCallback()
+                updateNotification("Connected — $leaseIp")
                 Logger.line("service: tunnel UP ($leaseIp) — traffic now routes through the exit")
             }
             exportLog()
@@ -163,6 +194,7 @@ class BifrostVpnService : VpnService() {
 
     /** Stop a native handle and close a TUN fd — used on the failure paths. */
     private fun teardown(handle: Long, pfd: ParcelFileDescriptor) {
+        unregisterNetCallback()
         try { NativeBridge.nativeClientStop(handle) } catch (t: Throwable) {
             Logger.line("service: nativeClientStop threw: ${t.message}")
         }
@@ -172,6 +204,7 @@ class BifrostVpnService : VpnService() {
 
     private fun stopTunnel() {
         stopRequested = true
+        unregisterNetCallback()
         val h = nativeHandle
         nativeHandle = 0L
         if (h != 0L) {
@@ -186,6 +219,7 @@ class BifrostVpnService : VpnService() {
             Logger.line("service: error closing TUN fd: ${t.message}")
         }
         tun = null
+        stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
@@ -209,11 +243,102 @@ class BifrostVpnService : VpnService() {
         super.onDestroy()
     }
 
+    // ── Roaming: follow the default network ──────────────────────────
+    //
+    // `registerDefaultNetworkCallback` fires `onAvailable` with the
+    // current default network right after registration, and again on
+    // every roam. Each time we re-pin the VPN underlay so the system
+    // keeps the tunnel "connected" and routes the (route-excluded)
+    // mesh transport socket onto the live network. The native data
+    // plane notices the old socket die and re-dials on its own.
+
+    private fun registerNetCallback() {
+        if (netCallback != null) return
+        val cm = getSystemService(ConnectivityManager::class.java) ?: run {
+            Logger.line("net: no ConnectivityManager — roaming support disabled")
+            return
+        }
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                Logger.line("net: default network → $network — re-pinning VPN underlay")
+                try {
+                    setUnderlyingNetworks(arrayOf(network))
+                } catch (t: Throwable) {
+                    Logger.line("net: setUnderlyingNetworks failed: ${t.message}")
+                }
+            }
+
+            override fun onLost(network: Network) {
+                Logger.line("net: default network $network lost — awaiting roam")
+            }
+        }
+        try {
+            cm.registerDefaultNetworkCallback(cb)
+            netCallback = cb
+            Logger.line("net: default-network callback registered (roaming support on)")
+        } catch (t: Throwable) {
+            Logger.line("net: could not register network callback: ${t.message}")
+        }
+    }
+
+    private fun unregisterNetCallback() {
+        val cb = netCallback ?: return
+        netCallback = null
+        try {
+            getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb)
+        } catch (t: Throwable) {
+            Logger.line("net: unregister callback failed: ${t.message}")
+        }
+    }
+
+    // ── Foreground-service notification ──────────────────────────────
+
+    /** Create the notification channel (idempotent) and go foreground. */
+    private fun goForeground(text: String) {
+        try {
+            val nm = getSystemService(NotificationManager::class.java)
+            nm?.createNotificationChannel(
+                NotificationChannel(
+                    NOTIF_CHANNEL, "Bifrost VPN", NotificationManager.IMPORTANCE_LOW,
+                ).apply { description = "Ongoing mesh VPN tunnel status" }
+            )
+            startForeground(NOTIF_ID, buildNotification(text))
+        } catch (t: Throwable) {
+            Logger.line("service: startForeground failed: ${t.message}")
+        }
+    }
+
+    /** Update the ongoing-notification text without changing FGS state. */
+    private fun updateNotification(text: String) {
+        try {
+            getSystemService(NotificationManager::class.java)
+                ?.notify(NOTIF_ID, buildNotification(text))
+        } catch (_: Throwable) {}
+    }
+
+    private fun buildNotification(text: String): Notification {
+        val tap = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE,
+        )
+        return Notification.Builder(this, NOTIF_CHANNEL)
+            .setContentTitle("Bifrost VPN")
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setOngoing(true)
+            .setContentIntent(tap)
+            .build()
+    }
+
     companion object {
         const val EXTRA_CONFIG = "config"
         const val EXTRA_EXIT_KEY = "exitKey"
         const val EXTRA_EXIT_ADDR = "exitAddr"
         const val ACTION_STOP = "org.norn.bifrost.STOP"
+
+        private const val NOTIF_CHANNEL = "bifrost-vpn"
+        private const val NOTIF_ID = 1
 
         /**
          * Render a host-byte-order IPv4 (as returned in
@@ -226,7 +351,7 @@ class BifrostVpnService : VpnService() {
 
         /**
          * Pull the IPv4 literal out of an exit address like
-         * `tcp://***REMOVED***:9000`. Returns null for a hostname.
+         * `tcp://203.0.113.10:9000`. Returns null for a hostname.
          */
         fun ipv4Of(exitAddr: String): String? {
             val hostPort = exitAddr.substringAfter("://", exitAddr)
