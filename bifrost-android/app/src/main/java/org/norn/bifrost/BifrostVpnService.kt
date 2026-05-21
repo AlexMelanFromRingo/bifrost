@@ -29,30 +29,32 @@ import kotlin.concurrent.thread
  *     data plane, which keeps running on the native tokio runtime.
  *
  * The service holds the native handle for the whole session and passes
- * it to `nativeClientStop` on teardown. (An earlier version hardcoded
- * the TUN address to a guess that didn't match the exit's lease, so
- * the exit dropped every packet as spoofed.)
+ * it to `nativeClientStop` on teardown.
+ *
+ * ## Connection state
+ *
+ * Each transition (connecting / connected / failed / disconnected) is
+ * published two ways: the foreground-service notification text, and an
+ * app-internal [ACTION_STATE] broadcast that `MainActivity` renders in
+ * its status banner. The last state is also kept in [currentState] so a
+ * reopened activity can seed its banner immediately.
  *
  * ## Surviving a network roam (Wi-Fi ↔ LTE)
  *
- * Two things keep the tunnel up when the phone changes networks:
- *
  *  * **Foreground service** — without it the OS may kill the service
- *    during the roam window. We `startForeground()` with an ongoing
- *    notification for the whole session.
- *  * **Default-network callback** — on every roam we re-pin the VPN's
- *    underlay with `setUnderlyingNetworks()`. The native data plane
- *    has its own reconnect supervisor (`run_client_pump`): once the
- *    transport re-dials the exit on the new network it rebuilds the
- *    egress session automatically, and the address lease is sticky so
- *    the TUN never has to be re-established.
+ *    during the roam window. We `startForeground()` for the session.
+ *  * **Default-network callback** — on every roam we re-pin the VPN
+ *    underlay with `setUnderlyingNetworks()`. The native data plane has
+ *    its own reconnect supervisor (`run_client_pump`): once the
+ *    transport re-dials the exit it rebuilds the egress session, and
+ *    the address lease is sticky so the TUN is never re-established.
  *
  * ## Why the routes exclude the exit IP
  *
- * A VpnService routing `0.0.0.0/0` captures every socket the app
- * opens — including the mesh transport's TCP socket to the exit, which
- * would then loop into its own tunnel. So we route everything *except*
- * the exit's `/32`.
+ * A VpnService routing `0.0.0.0/0` captures every socket the app opens
+ * — including the mesh transport's TCP socket to the exit, which would
+ * then loop into its own tunnel. So we route everything *except* the
+ * exit's `/32`.
  */
 class BifrostVpnService : VpnService() {
 
@@ -80,7 +82,7 @@ class BifrostVpnService : VpnService() {
         }
         // Become a foreground service before any slow work so the OS
         // can't reclaim us mid-handshake or mid-roam.
-        goForeground("Connecting…")
+        goForeground()
         startTunnel(config, exitKey, exitAddr)
         return START_STICKY
     }
@@ -94,6 +96,7 @@ class BifrostVpnService : VpnService() {
         Logger.startSession()
         Logger.line("service: starting tunnel — exitAddr=$exitAddr")
         Logger.line("service: exit key=${exitKey.take(16)}…")
+        broadcastState(STATE_CONNECTING)
 
         thread(name = "bifrost-connect", isDaemon = true) {
             // ── Phase 1: mesh node + egress handshake ──────────────
@@ -107,6 +110,7 @@ class BifrostVpnService : VpnService() {
             if (info.size < 3 || info[0] == 0L) {
                 val err = try { NativeBridge.nativeLastError() } catch (_: Throwable) { "?" }
                 Logger.line("service: connect FAILED — $err")
+                broadcastState(STATE_FAILED, err)
                 exportLog()
                 stopSelf()
                 return@thread
@@ -148,6 +152,7 @@ class BifrostVpnService : VpnService() {
             }
             if (pfd == null) {
                 Logger.line("service: establish() returned null — VPN consent missing? aborting")
+                broadcastState(STATE_FAILED, "VPN interface could not be established")
                 NativeBridge.nativeClientStop(handle)
                 exportLog(); stopSelf(); return@thread
             }
@@ -171,6 +176,7 @@ class BifrostVpnService : VpnService() {
             if (status != 0) {
                 val err = try { NativeBridge.nativeLastError() } catch (_: Throwable) { "?" }
                 Logger.line("service: data plane FAILED (status=$status) — $err")
+                broadcastState(STATE_FAILED, err)
                 teardown(handle, pfd)
                 exportLog(); stopSelf(); return@thread
             }
@@ -182,10 +188,10 @@ class BifrostVpnService : VpnService() {
             } else {
                 nativeHandle = handle
                 // Start watching the default network so the tunnel rides
-                // Wi-Fi↔LTE roams; the native supervisor rebuilds the
+                // Wi-Fi/LTE roams; the native supervisor rebuilds the
                 // egress session once the transport re-dials.
                 registerNetCallback()
-                updateNotification("Connected — $leaseIp")
+                broadcastState(STATE_CONNECTED, leaseIp)
                 Logger.line("service: tunnel UP ($leaseIp) — traffic now routes through the exit")
             }
             exportLog()
@@ -204,6 +210,7 @@ class BifrostVpnService : VpnService() {
 
     private fun stopTunnel() {
         stopRequested = true
+        broadcastState(STATE_DISCONNECTED)
         unregisterNetCallback()
         val h = nativeHandle
         nativeHandle = 0L
@@ -243,14 +250,39 @@ class BifrostVpnService : VpnService() {
         super.onDestroy()
     }
 
+    // ── Connection-state publishing ──────────────────────────────────
+
+    /** Record + publish a state transition: refresh the FGS notification
+     *  and broadcast it (app-internal) so a foreground MainActivity can
+     *  reflect it in its UI. */
+    private fun broadcastState(state: String, detail: String = "") {
+        currentState = state
+        currentDetail = detail
+        updateNotification(
+            when (state) {
+                STATE_CONNECTING -> "Connecting…"
+                STATE_CONNECTED ->
+                    if (detail.isNotEmpty()) "Connected — $detail" else "Connected"
+                STATE_FAILED -> "Disconnected — connection failed"
+                else -> "Disconnected"
+            }
+        )
+        sendBroadcast(
+            Intent(ACTION_STATE)
+                .setPackage(packageName)
+                .putExtra(EXTRA_STATE, state)
+                .putExtra(EXTRA_DETAIL, detail)
+        )
+    }
+
     // ── Roaming: follow the default network ──────────────────────────
     //
     // `registerDefaultNetworkCallback` fires `onAvailable` with the
     // current default network right after registration, and again on
     // every roam. Each time we re-pin the VPN underlay so the system
-    // keeps the tunnel "connected" and routes the (route-excluded)
-    // mesh transport socket onto the live network. The native data
-    // plane notices the old socket die and re-dials on its own.
+    // keeps the tunnel "connected" and routes the (route-excluded) mesh
+    // transport socket onto the live network. The native data plane
+    // notices the old socket die and re-dials on its own.
 
     private fun registerNetCallback() {
         if (netCallback != null) return
@@ -294,7 +326,7 @@ class BifrostVpnService : VpnService() {
     // ── Foreground-service notification ──────────────────────────────
 
     /** Create the notification channel (idempotent) and go foreground. */
-    private fun goForeground(text: String) {
+    private fun goForeground() {
         try {
             val nm = getSystemService(NotificationManager::class.java)
             nm?.createNotificationChannel(
@@ -302,7 +334,7 @@ class BifrostVpnService : VpnService() {
                     NOTIF_CHANNEL, "Bifrost VPN", NotificationManager.IMPORTANCE_LOW,
                 ).apply { description = "Ongoing mesh VPN tunnel status" }
             )
-            startForeground(NOTIF_ID, buildNotification(text))
+            startForeground(NOTIF_ID, buildNotification("Connecting…"))
         } catch (t: Throwable) {
             Logger.line("service: startForeground failed: ${t.message}")
         }
@@ -336,6 +368,26 @@ class BifrostVpnService : VpnService() {
         const val EXTRA_EXIT_KEY = "exitKey"
         const val EXTRA_EXIT_ADDR = "exitAddr"
         const val ACTION_STOP = "org.norn.bifrost.STOP"
+
+        // App-internal broadcast carrying the live connection state to a
+        // foreground MainActivity.
+        const val ACTION_STATE = "org.norn.bifrost.STATE"
+        const val EXTRA_STATE = "state"
+        const val EXTRA_DETAIL = "detail"
+        const val STATE_DISCONNECTED = "DISCONNECTED"
+        const val STATE_CONNECTING = "CONNECTING"
+        const val STATE_CONNECTED = "CONNECTED"
+        const val STATE_FAILED = "FAILED"
+
+        /** Last published state — lets a reopened MainActivity seed its
+         *  banner without waiting for the next transition. */
+        @Volatile
+        var currentState: String = STATE_DISCONNECTED
+            private set
+
+        @Volatile
+        var currentDetail: String = ""
+            private set
 
         private const val NOTIF_CHANNEL = "bifrost-vpn"
         private const val NOTIF_ID = 1

@@ -33,7 +33,7 @@ object Logger {
     private const val LOG_PORT = 5599
 
     /** Build marker — bump every build so a log identifies its APK. */
-    const val BUILD = "2026-05-21 roaming+privacy+optlogs"
+    const val BUILD = "2026-05-21 ui-polish+conn-state"
 
     @Volatile private var file: File? = null
     @Volatile private var serverUp = false
