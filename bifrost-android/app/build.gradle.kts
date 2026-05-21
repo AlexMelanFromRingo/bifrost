@@ -66,3 +66,9 @@ android {
     // src/main/jniLibs/<abi>/libbifrost_ffi.so — AGP just packages it.
     // No externalNativeBuild / CMake step.
 }
+
+dependencies {
+    // Pure-Java QR codec (no AndroidX) — encode for "Show QR for
+    // sharing", decode for the camera scanner. See Qr / QrScanActivity.
+    implementation("com.google.zxing:core:3.5.3")
+}

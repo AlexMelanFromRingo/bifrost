@@ -1,6 +1,7 @@
 package org.norn.bifrost
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -16,6 +17,7 @@ import android.view.Gravity
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Switch
@@ -49,6 +51,7 @@ class MainActivity : Activity() {
     private lateinit var stateDetail: TextView
 
     private val reqConnect = 1001
+    private val reqScan = 1002
 
     /** Colour palette, resolved per-onCreate against the day/night theme. */
     private var pal = Palette.light()
@@ -94,8 +97,10 @@ class MainActivity : Activity() {
         card(root, "Exit server").let { c ->
             exitKey = field(c, "Public key", "64 hex characters",
                 prefs.getString(K_EXIT_KEY, DEFAULT_EXIT_KEY)!!)
-            exitAddr = field(c, "Address", "tcp://host:port",
+            exitAddr = field(c, "Address", "tcp:// or quic://host:port",
                 prefs.getString(K_EXIT_ADDR, DEFAULT_EXIT_ADDR)!!)
+            flatButton(c, "Scan QR", pal.accent) { startQrScan() }
+            flatButton(c, "Show QR for sharing", pal.accent) { showQrDialog() }
         }
 
         // ── Identity ─────────────────────────────────────────────────
@@ -209,23 +214,74 @@ class MainActivity : Activity() {
     @Deprecated("startActivityForResult — fine for a single-screen app")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != reqConnect) return
-        if (resultCode != RESULT_OK) {
-            note("VPN consent denied")
-            return
+        when (requestCode) {
+            reqConnect -> {
+                if (resultCode != RESULT_OK) {
+                    note("VPN consent denied")
+                    return
+                }
+                startService(Intent(this, BifrostVpnService::class.java).apply {
+                    putExtra(BifrostVpnService.EXTRA_CONFIG, buildNodeConfig())
+                    putExtra(BifrostVpnService.EXTRA_EXIT_KEY, exitKey.text.toString().trim())
+                    putExtra(BifrostVpnService.EXTRA_EXIT_ADDR, exitAddr.text.toString().trim())
+                })
+                // The banner updates itself from the service's state broadcasts.
+            }
+            reqScan -> {
+                if (resultCode == RESULT_OK) {
+                    val parsed = data?.getStringExtra(QrScanActivity.EXTRA_RESULT)
+                        ?.let { Qr.parse(it) }
+                    if (parsed != null) {
+                        exitKey.setText(parsed.first)
+                        exitAddr.setText(parsed.second)
+                        save()
+                        note("Exit config imported from QR")
+                    } else {
+                        note("That QR is not a Bifrost config code")
+                    }
+                } else {
+                    note(data?.getStringExtra(QrScanActivity.EXTRA_ERROR) ?: "QR scan cancelled")
+                }
+            }
         }
-        startService(Intent(this, BifrostVpnService::class.java).apply {
-            putExtra(BifrostVpnService.EXTRA_CONFIG, buildNodeConfig())
-            putExtra(BifrostVpnService.EXTRA_EXIT_KEY, exitKey.text.toString().trim())
-            putExtra(BifrostVpnService.EXTRA_EXIT_ADDR, exitAddr.text.toString().trim())
-        })
-        // The banner now updates itself from the service's state broadcasts.
     }
 
     private fun onDisconnect() {
         startService(Intent(this, BifrostVpnService::class.java).apply {
             action = BifrostVpnService.ACTION_STOP
         })
+    }
+
+    /** Launch the camera QR scanner; the result lands in onActivityResult. */
+    private fun startQrScan() {
+        startActivityForResult(Intent(this, QrScanActivity::class.java), reqScan)
+    }
+
+    /** Show the current exit key + address as a QR for another device. */
+    private fun showQrDialog() {
+        val key = exitKey.text.toString().trim()
+        val addr = exitAddr.text.toString().trim()
+        if (key.length != 64 || addr.isEmpty()) {
+            note("Fill in the exit key and address first")
+            return
+        }
+        val bmp = try {
+            Qr.encode(Qr.pack(key, addr), dp(260))
+        } catch (t: Throwable) {
+            note("QR generation failed: ${t.message}")
+            return
+        }
+        val img = ImageView(this).apply {
+            setImageBitmap(bmp)
+            val p = dp(18)
+            setPadding(p, p, p, p)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Exit config QR")
+            .setMessage("Scan this from another device to import the exit key + address.")
+            .setView(img)
+            .setPositiveButton("Close", null)
+            .show()
     }
 
     /** Render a connection state into the status banner. */
