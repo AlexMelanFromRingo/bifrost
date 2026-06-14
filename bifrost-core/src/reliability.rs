@@ -63,6 +63,23 @@ pub const INITIAL_PEER_WINDOW: u32 = DEFAULT_RX_BUF_CAP;
 /// pathological reorder pattern can't exceed our per-stream cap.
 pub const REORDER_BYTE_CAP: u32 = MAX_RX_BUF_CAP;
 
+// ── Serial-number arithmetic (RFC 1982) for the 32-bit byte sequence space ──
+//
+// `seq` counts bytes and wraps at 2^32 — only ~4 GiB, which a single
+// long-lived stream (a large download over the VPN/proxy) reaches in normal
+// use. Naive `<`/`>` comparisons misclassify frames once the window straddles
+// the wrap: the receiver drops a post-wrap frame as "already seen" and the
+// sender pops a still-unacked straddling frame as "acked" — silent data loss.
+// These compare by the SIGN of the wrapping difference, which is correct as
+// long as the two values are within 2^31 of each other (our in-flight +
+// reorder window is ≤ 32 MiB, far below that bound).
+#[inline]
+fn seq_le(a: u32, b: u32) -> bool { (a.wrapping_sub(b) as i32) <= 0 }
+#[inline]
+fn seq_gt(a: u32, b: u32) -> bool { (a.wrapping_sub(b) as i32) > 0 }
+#[inline]
+fn seq_ge(a: u32, b: u32) -> bool { (a.wrapping_sub(b) as i32) >= 0 }
+
 #[derive(Debug)]
 struct UnackedFrame {
     /// Sequence number of the FIRST byte in `data`.
@@ -341,9 +358,11 @@ impl Reliability {
         let mut sampled_rtt: Option<Duration> = None;
         while let Some(front) = self.unacked.front() {
             let end = front.seq.wrapping_add(front.data.len() as u32);
-            // No wrap handling: streams are short enough that 4 GB never
-            // accumulates between an ACK roundtrip. Documented assumption.
-            if end <= ack {
+            // Cumulative ACK compared with serial-number arithmetic (see
+            // seq_le): `ack` and the frame seqs wrap at 4 GiB over a stream's
+            // lifetime, so a naive `end <= ack` would pop a still-unacked frame
+            // straddling the wrap and stop retransmitting it — silent loss.
+            if seq_le(end, ack) {
                 // Karn: a frame that's been retransmitted at least once
                 // is ambiguous — the ACK could answer any of the copies,
                 // so its elapsed time is not a valid RTT. Sample only
@@ -361,7 +380,7 @@ impl Reliability {
         if let Some(c) = self.close_pending.as_ref() {
             // Receiver acks `local_close_seq + 1` once Close has been
             // delivered — see ack_state() on the receiver side.
-            if ack > c.seq {
+            if seq_gt(ack, c.seq) {
                 self.close_pending = None;
             }
         }
@@ -462,7 +481,7 @@ impl Reliability {
 
     pub fn local_close_acked(&self) -> bool {
         self.local_close_seq
-            .map(|s| self.unacked.is_empty() && self.next_seq >= s)
+            .map(|s| self.unacked.is_empty() && seq_ge(self.next_seq, s))
             .unwrap_or(false)
     }
 
@@ -480,7 +499,7 @@ impl Reliability {
             return out;
         }
         // Already-received bytes: ack so the peer stops retransmitting.
-        if seq.wrapping_add(len) <= self.expected_seq {
+        if seq_le(seq.wrapping_add(len), self.expected_seq) {
             out.send_ack = true;
             return out;
         }
@@ -517,7 +536,7 @@ impl Reliability {
                 }
             }
             out.send_ack = true;
-        } else if seq > self.expected_seq {
+        } else if seq_gt(seq, self.expected_seq) {
             // Out of order — buffer if cap permits.
             if self.reorder_bytes + len > REORDER_BYTE_CAP {
                 // Drop; peer will retransmit. Still ACK to push the peer
@@ -547,7 +566,7 @@ impl Reliability {
         }
         // Did this just close the gap to a buffered FIN?
         if let Some(c) = self.peer_close_seq
-            && self.expected_seq >= c && self.rx_buf.is_empty() && !self.eof_delivered {
+            && seq_ge(self.expected_seq, c) && self.rx_buf.is_empty() && !self.eof_delivered {
                 out.eof_ready = true;
             }
         out
@@ -558,7 +577,7 @@ impl Reliability {
         let mut out = RecvOutcome::default();
         self.peer_close_seq = Some(seq);
         out.send_ack = true;
-        if self.expected_seq >= seq && self.rx_buf.is_empty() && !self.eof_delivered {
+        if seq_ge(self.expected_seq, seq) && self.rx_buf.is_empty() && !self.eof_delivered {
             out.eof_ready = true;
         }
         out
@@ -573,7 +592,7 @@ impl Reliability {
         let win = self.rx_buf_cap.saturating_sub(self.rx_buf.len() as u32);
         let mut ack = self.expected_seq;
         if let Some(c) = self.peer_close_seq
-            && self.expected_seq >= c {
+            && seq_ge(self.expected_seq, c) {
                 ack = c.wrapping_add(1);
             }
         (ack, win)
@@ -598,7 +617,7 @@ impl Reliability {
             return true;
         }
         if let Some(c) = self.peer_close_seq
-            && self.expected_seq >= c && self.rx_buf.is_empty() {
+            && seq_ge(self.expected_seq, c) && self.rx_buf.is_empty() {
                 self.eof_delivered = true;
                 return true;
             }
@@ -929,5 +948,52 @@ mod tests {
         let mut r = Reliability::with_max_cap(DEFAULT_RX_BUF_CAP, MAX_RX_BUF_CAP);
         let _ = r.on_recv_data(0, bytes("hi"));
         assert_eq!(r.rx_buf_cap(), DEFAULT_RX_BUF_CAP);
+    }
+
+    // ── Sequence-number wrap (4 GiB) regression ──────────────────────────
+
+    #[test]
+    fn recv_post_wrap_future_frame_is_buffered_not_dropped() {
+        // Receiver near the 4 GiB byte-seq wrap. A future (out-of-order) frame
+        // whose seq has just passed the wrap must be buffered for reordering.
+        // The old naive `seq + len <= expected_seq` classified it as
+        // already-seen and silently dropped it.
+        let mut r = Reliability::new(DEFAULT_RX_BUF_CAP);
+        r.expected_seq = 0xFFFF_FF00;
+        let out = r.on_recv_data(0x0000_0100, vec![0u8; 16]);
+        assert!(!out.rx_buf_grew, "out-of-order frame must not deliver yet");
+        assert!(
+            r.reorder.contains_key(&0x0000_0100u32),
+            "post-wrap future frame must be buffered, not dropped as already-seen"
+        );
+    }
+
+    #[test]
+    fn recv_in_order_delivery_survives_the_wrap() {
+        let mut r = Reliability::new(1 << 20);
+        r.expected_seq = 0xFFFF_FF80;
+        assert!(r.on_recv_data(0xFFFF_FF80, vec![1u8; 0x80]).rx_buf_grew);
+        assert_eq!(r.expected_seq, 0x0000_0000, "expected_seq wraps via wrapping_add");
+        assert!(r.on_recv_data(0x0000_0000, vec![2u8; 0x40]).rx_buf_grew);
+        assert_eq!(r.expected_seq, 0x0000_0040);
+    }
+
+    #[test]
+    fn sender_does_not_pop_unacked_frame_straddling_the_wrap() {
+        // A frame whose [seq, seq+len) straddles the wrap (seq=0xFFFF_FF00,
+        // end=0x100) must stay unacked when the cumulative ack only reaches
+        // its start. The old naive `end <= ack` popped it → silent loss.
+        let mut r = Reliability::new(1 << 20);
+        r.peer_window = 1 << 20;
+        r.next_seq = 0xFFFF_FF00;
+        let seq = r.allocate_seq(0x100).expect("window has room");
+        assert_eq!(seq, 0xFFFF_FF00);
+        r.record_sent(seq, vec![0u8; 0x100], std::time::Instant::now());
+        // Cumulative ack of the frame's START only — frame is NOT yet acked.
+        r.on_recv_ack(0xFFFF_FF00, 1 << 20, std::time::Instant::now());
+        assert_eq!(r.unacked.len(), 1, "frame straddling the wrap must stay unacked");
+        // Ack past the frame's end (wraps to 0x100) — now acked and popped.
+        r.on_recv_ack(0x0000_0100, 1 << 20, std::time::Instant::now());
+        assert!(r.unacked.is_empty(), "frame popped once ack passes its end");
     }
 }
