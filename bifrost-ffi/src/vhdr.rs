@@ -217,7 +217,20 @@ fn desegment(slot: &[u8]) -> Vec<Vec<u8>> {
     } else {
         40
     };
-    if ihl < 20 || ihl > hdr_len {
+    // The per-segment L4 fixups below index into the prepended `headers`
+    // region (e.g. TCP flags at ihl+13, seq at ihl+4..8). A hostile or
+    // buggy vhdr can claim a GSO type whose L4 header does NOT fit within
+    // `hdr_len` — then those indexes land past the end of a short segment
+    // and panic (with panic=abort, that kills the whole client; the slot
+    // arrives from the exit, an untrusted party for a VPN). Require the
+    // headers to actually contain the L4 header the gso type implies;
+    // otherwise degrade to pass-through exactly like the `ihl` check.
+    let l4_min = match gtype {
+        gso_type::TCPV4 | gso_type::TCPV6 => 20,
+        gso_type::UDP | gso_type::UDP_L4 => 8,
+        _ => 0,
+    };
+    if ihl < 20 || ihl > hdr_len || hdr_len < ihl + l4_min {
         let mut pkt = payload.to_vec();
         fix_checksums(&mut pkt);
         return vec![pkt];
@@ -488,5 +501,26 @@ mod tests {
             let ulen = u16::from_be_bytes([seg[24], seg[25]]) as usize;
             assert_eq!(ulen, seg.len() - 20, "seg {i}: UDP length");
         }
+    }
+
+    #[test]
+    fn desegment_hostile_gso_truncated_l4_header_does_not_panic() {
+        // Regression: a vhdr claims a TCP GSO super-segment but hdr_len only
+        // covers the 20-byte IP header (no TCP header), with a tiny gso_size so
+        // segments are shorter than the L4 fixup offsets (pkt[ihl+13]). The old
+        // code indexed past the segment → panic (→ abort kills the VPN client).
+        // The slot originates from the exit, which a VPN client must not trust
+        // to be well-formed. Must degrade to pass-through, never panic.
+        let hdr_len = 20usize; // IP only — no TCP header in `headers`
+        let gso_size = 8usize; // tiny segments
+        let mut slot = vec![0u8; VHDR];
+        slot[1] = gso_type::TCPV4;
+        slot[2..4].copy_from_slice(&(hdr_len as u16).to_le_bytes());
+        slot[4..6].copy_from_slice(&(gso_size as u16).to_le_bytes());
+        let mut ip = ipv4_hdr(PROTO_TCP, hdr_len + 20);
+        ip.extend_from_slice(&vec![0xAB_u8; 20]); // 20 "data" bytes after IP hdr
+        slot.extend_from_slice(&ip);
+        let segs = desegment(&slot); // must not panic
+        assert!(!segs.is_empty(), "hostile GSO must degrade to pass-through");
     }
 }
