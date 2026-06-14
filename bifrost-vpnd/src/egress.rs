@@ -887,25 +887,16 @@ pub async fn start_exit(
                 // kernel sees the same `gso_type` the sender's
                 // kernel produced.
                 let ip = match ip_part(slot) { Some(p) => p, None => continue };
-                let version_nibble = ip[0] >> 4;
-                let spoofed = match version_nibble {
-                    4 if ip.len() >= 20 => {
-                        let src = Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]);
-                        src != lease.v4
-                    }
-                    6 if ip.len() >= 40 => {
-                        let mut octets = [0u8; 16];
-                        octets.copy_from_slice(&ip[8..24]);
-                        let src = Ipv6Addr::from(octets);
-                        Some(src) != lease.v6
-                    }
-                    _ => true,
-                };
-                if spoofed {
-                    if is_routable_dst(version_nibble, ip) {
+                // `ip` can be empty: a vhdr-only (10-byte) slot yields a
+                // zero-length IP part. src_is_spoofed handles that without
+                // indexing; the routable-dst log below is guarded too, so a
+                // hostile short packet from a leased client can't panic the
+                // exit (which, under panic=abort, would drop every client).
+                if src_is_spoofed(ip, &lease) {
+                    if !ip.is_empty() && is_routable_dst(ip[0] >> 4, ip) {
                         debug!(
-                            "egress exit: spoofed packet from {} (ver={version_nibble}), drop",
-                            hex::encode(&from[..8])
+                            "egress exit: spoofed packet from {} (ver={}), drop",
+                            hex::encode(&from[..8]), ip[0] >> 4
                         );
                     }
                     continue;
@@ -1531,6 +1522,27 @@ fn extract_routable(buf: &[u8]) -> Option<&[u8]> {
     Some(buf)
 }
 
+/// Anti-spoof check for one slot's IP bytes against the sender's lease.
+///
+/// Returns true (= drop) for anything we cannot positively validate as
+/// belonging to `lease`: a source address that doesn't match, an unknown IP
+/// version, or a packet too short to hold the source field. **Fail-closed.**
+///
+/// `ip` may be empty (a vhdr-only slot yields a zero-length IP part); we use
+/// `ip.first()` rather than `ip[0]` so a hostile short packet is dropped, not
+/// a panic.
+fn src_is_spoofed(ip: &[u8], lease: &Lease) -> bool {
+    match ip.first().map(|b| b >> 4) {
+        Some(4) if ip.len() >= 20 => Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]) != lease.v4,
+        Some(6) if ip.len() >= 40 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&ip[8..24]);
+            Some(Ipv6Addr::from(octets)) != lease.v6
+        }
+        _ => true,
+    }
+}
+
 /// True if the packet's destination address is sensible to forward
 /// across the egress tunnel. Filters out multicast, link-local, and
 /// loopback — those belong on the local link and would be dropped
@@ -1602,6 +1614,34 @@ mod tests {
     use tokio::io::duplex;
 
     fn v6(s: &str) -> Ipv6Addr { s.parse().unwrap() }
+
+    #[test]
+    fn antispoof_drops_vhdr_only_slot_without_panic() {
+        // Regression: a 10-byte slot (vhdr only, zero IP bytes) reaches the
+        // exit ingress loop as `Some(&[])` from `ip_part`. The old code did
+        // `ip[0] >> 4` and panicked — under panic=abort that kills the exit
+        // and drops every client, and any leased peer could trigger it.
+        let lease = Lease { v4: Ipv4Addr::new(10, 55, 0, 2), v6: None };
+        let slot = [0u8; crate::tun_offload::VIRTIO_NET_HDR_LEN];
+        let ip = ip_part(&slot).expect("10-byte slot has a (zero-length) ip part");
+        assert!(ip.is_empty(), "vhdr-only slot has empty IP part");
+        assert!(src_is_spoofed(ip, &lease), "empty IP must fail closed (drop)");
+    }
+
+    #[test]
+    fn antispoof_accepts_matching_src_rejects_mismatch_and_truncation() {
+        let lease = Lease { v4: Ipv4Addr::new(10, 55, 0, 7), v6: None };
+        // Minimal 20-byte IPv4 header; src at [12..16], dst at [16..20].
+        let mut ip: [u8; 20] = [
+            0x45, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            10, 55, 0, 7, // src == lease.v4
+            8, 8, 8, 8,   // dst
+        ];
+        assert!(!src_is_spoofed(&ip, &lease), "matching src must pass");
+        ip[15] = 9; // src → 10.55.0.9, no longer the leased address
+        assert!(src_is_spoofed(&ip, &lease), "mismatched src must be dropped");
+        assert!(src_is_spoofed(&ip[..19], &lease), "short IPv4 must fail closed");
+    }
 
     // ── Length-prefix framing round-trips ───────────────────────────
 
