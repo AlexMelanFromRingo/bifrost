@@ -518,7 +518,7 @@ mod tests {
         slot[2..4].copy_from_slice(&(hdr_len as u16).to_le_bytes());
         slot[4..6].copy_from_slice(&(gso_size as u16).to_le_bytes());
         let mut ip = ipv4_hdr(PROTO_TCP, hdr_len + 20);
-        ip.extend_from_slice(&vec![0xAB_u8; 20]); // 20 "data" bytes after IP hdr
+        ip.extend_from_slice(&[0xAB_u8; 20]); // 20 "data" bytes after IP hdr
         slot.extend_from_slice(&ip);
         let segs = desegment(&slot); // must not panic
         assert!(!segs.is_empty(), "hostile GSO must degrade to pass-through");
