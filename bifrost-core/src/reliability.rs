@@ -62,6 +62,12 @@ pub const INITIAL_PEER_WINDOW: u32 = DEFAULT_RX_BUF_CAP;
 /// (and forcing the peer to retransmit). Mirrors MAX_RX_BUF_CAP so a
 /// pathological reorder pattern can't exceed our per-stream cap.
 pub const REORDER_BYTE_CAP: u32 = MAX_RX_BUF_CAP;
+/// Upper bound on locally-buffered unacked (in-flight) bytes, independent of
+/// the peer's advertised window. `peer_window` is set from inbound ACKs and is
+/// attacker-controlled (a peer can advertise up to `u32::MAX`); without this cap
+/// a peer advertising a huge window could make us hold gigabytes of unacked data
+/// (one large upload's worth) in `unacked`. Mirrors `MAX_RX_BUF_CAP`.
+pub const MAX_SEND_BUF: u32 = MAX_RX_BUF_CAP;
 
 // ── Serial-number arithmetic (RFC 1982) for the 32-bit byte sequence space ──
 //
@@ -334,7 +340,12 @@ impl Reliability {
         if self.write_finished {
             return None;
         }
-        if self.unacked_bytes.saturating_add(len) > self.peer_window {
+        // Gate on the peer's advertised window AND a local send-buffer cap.
+        // `peer_window` is attacker-controlled (an inbound ACK can advertise up
+        // to u32::MAX); `MAX_SEND_BUF` bounds locally-held unacked data so a
+        // peer can't make us buffer multiple GiB regardless of what it advertises.
+        let effective_window = self.peer_window.min(MAX_SEND_BUF);
+        if self.unacked_bytes.saturating_add(len) > effective_window {
             return None;
         }
         let seq = self.next_seq;
@@ -441,7 +452,9 @@ impl Reliability {
         if self.write_finished {
             return 0;
         }
-        self.peer_window.saturating_sub(self.unacked_bytes)
+        // Bounded by the same local send cap as allocate_seq, so the stream
+        // layer never chunks against a window we won't actually grant.
+        self.peer_window.min(MAX_SEND_BUF).saturating_sub(self.unacked_bytes)
     }
 
     /// Current receive buffer cap (post auto-tune). Exposed for tests
@@ -517,23 +530,25 @@ impl Reliability {
             self.rx_buf.extend(data.iter().copied());
             self.expected_seq = self.expected_seq.wrapping_add(len);
             out.rx_buf_grew = true;
-            // Drain any reorder entries the gap just closed for.
-            while let Some((&next_seq, _)) = self.reorder.iter().next() {
-                if next_seq == self.expected_seq {
-                    let bytes = self.reorder.remove(&next_seq).unwrap();
-                    if self.rx_buf.len() as u32 + bytes.len() as u32 > self.rx_buf_cap {
-                        // Re-insert and stop; window forced us to spill.
-                        self.reorder.insert(next_seq, bytes);
-                        break;
-                    }
-                    self.reorder_bytes =
-                        self.reorder_bytes.saturating_sub(bytes.len() as u32);
-                    self.expected_seq =
-                        self.expected_seq.wrapping_add(bytes.len() as u32);
-                    self.rx_buf.extend(bytes.iter().copied());
-                } else {
+            // Drain any reorder entries the gap just closed for. Look the
+            // next-expected seq up by EXACT key — NOT `reorder.iter().next()`,
+            // whose numerically-smallest BTreeMap<u32> key is the WRONG entry
+            // once the 32-bit byte-seq space wraps: the serial-next key is then
+            // numerically larger than a buffered post-wrap entry, so the old
+            // `iter().next() + == expected_seq` left the contiguous frame stuck
+            // until the peer retransmitted it (throughput/latency glitch +
+            // lingering reorder memory at every 4 GiB boundary under reorder).
+            while let Some(bytes) = self.reorder.remove(&self.expected_seq) {
+                if self.rx_buf.len() as u32 + bytes.len() as u32 > self.rx_buf_cap {
+                    // Re-insert and stop; window forced us to spill.
+                    self.reorder.insert(self.expected_seq, bytes);
                     break;
                 }
+                self.reorder_bytes =
+                    self.reorder_bytes.saturating_sub(bytes.len() as u32);
+                self.expected_seq =
+                    self.expected_seq.wrapping_add(bytes.len() as u32);
+                self.rx_buf.extend(bytes.iter().copied());
             }
             out.send_ack = true;
         } else if seq_gt(seq, self.expected_seq) {
@@ -995,5 +1010,53 @@ mod tests {
         // Ack past the frame's end (wraps to 0x100) — now acked and popped.
         r.on_recv_ack(0x0000_0100, 1 << 20, std::time::Instant::now());
         assert!(r.unacked.is_empty(), "frame popped once ack passes its end");
+    }
+
+    #[test]
+    fn reorder_drain_survives_wrap_with_lower_numbered_entry_buffered() {
+        // Regression for the reorder-drain wrap bug (sibling of the #8 wrap
+        // fixes): a buffered out-of-order frame that becomes contiguous ACROSS
+        // the 4 GiB wrap must drain even when a numerically-smaller (post-wrap)
+        // entry also sits in the reorder map. The old
+        // `reorder.iter().next() + == expected_seq` returned the
+        // numerically-smallest key (the far-future post-wrap entry), failed the
+        // `==`, and left the contiguous frame stuck until a retransmit.
+        let mut r = Reliability::new(1 << 20);
+        r.expected_seq = 0xFFFF_FF00;
+        // Buffer the CONTIGUOUS-NEXT frame [0xFFFF_FF80, wrap→0) out of order,
+        // plus a FAR-FUTURE post-wrap frame at 0x40 whose key sorts first
+        // numerically in the BTreeMap (the trap for iter().next()).
+        assert!(!r.on_recv_data(0xFFFF_FF80, vec![1u8; 0x80]).rx_buf_grew);
+        assert!(!r.on_recv_data(0x0000_0040, vec![2u8; 0x40]).rx_buf_grew);
+        // Deliver the in-order frame closing the gap to 0xFFFF_FF80.
+        assert!(r.on_recv_data(0xFFFF_FF00, vec![0u8; 0x80]).rx_buf_grew);
+        // The buffered 0xFFFF_FF80 frame must have drained across the wrap:
+        // expected_seq advances 0xFFFF_FF00 → 0xFFFF_FF80 → 0x0000_0000.
+        assert_eq!(
+            r.expected_seq, 0x0000_0000,
+            "contiguous reorder entry must drain across the wrap (old code stuck at 0xFFFF_FF80)"
+        );
+        // The 0x40 far-future entry is still buffered (gap [0, 0x40) missing).
+        assert!(r.reorder.contains_key(&0x0000_0040u32));
+    }
+
+    #[test]
+    fn allocate_seq_refuses_above_send_cap_despite_huge_peer_window() {
+        let mut r = Reliability::default();
+        // Hostile peer advertises a 4 GiB window via an ACK (no unacked yet).
+        r.on_recv_ack(0, u32::MAX, Instant::now());
+        // A single request above the local send-buffer cap is refused even
+        // though peer_window would "allow" it — the cap is the binding limit.
+        if MAX_SEND_BUF < u32::MAX {
+            assert!(
+                r.allocate_seq(MAX_SEND_BUF.saturating_add(1)).is_none(),
+                "send-buffer cap must bind below an attacker's advertised window"
+            );
+        }
+        // Allocations up to the cap still succeed (no regression for honest peers).
+        assert!(
+            r.allocate_seq(MAX_SEND_BUF).is_some(),
+            "allocations up to MAX_SEND_BUF must still succeed"
+        );
     }
 }

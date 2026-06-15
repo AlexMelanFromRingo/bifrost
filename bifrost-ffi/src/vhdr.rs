@@ -37,6 +37,14 @@ const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 
+/// Upper bound on segments produced from one GSO super-segment slot. A real
+/// super-segment is at most ~64 KiB / min-MSS ≈ 122 segments; cap above that.
+/// A hostile or buggy vhdr can claim `gso_size = 1` with a large payload, which
+/// would explode one slot into tens of thousands of output packets (memory +
+/// per-packet TUN-write amplification on the client, which receives this slot
+/// from an untrusted exit). Beyond the cap we degrade to a single pass-through.
+const MAX_GSO_SEGMENTS: usize = 128;
+
 /// Data-plane byte/packet counters, shared with a logger task so the
 /// app can see whether traffic is actually flowing each direction.
 #[derive(Default)]
@@ -237,6 +245,15 @@ fn desegment(slot: &[u8]) -> Vec<Vec<u8>> {
     }
 
     let n = data.len().div_ceil(gso_size);
+    // Bound the amplification: a tiny attacker-chosen gso_size would turn one
+    // slot into a flood of output packets. Above the cap, degrade to a single
+    // pass-through (the kernel drops an oversized packet — the right outcome for
+    // a malformed slot) instead of allocating + writing thousands of segments.
+    if n > MAX_GSO_SEGMENTS {
+        let mut pkt = payload.to_vec();
+        fix_checksums(&mut pkt);
+        return vec![pkt];
+    }
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let off = i * gso_size;
@@ -501,6 +518,26 @@ mod tests {
             let ulen = u16::from_be_bytes([seg[24], seg[25]]) as usize;
             assert_eq!(ulen, seg.len() - 20, "seg {i}: UDP length");
         }
+    }
+
+    #[test]
+    fn desegment_caps_segment_count_against_tiny_gso_size() {
+        // Hostile/buggy vhdr: TCPv4 GSO claiming gso_size=1 with a large
+        // payload would explode into thousands of segments. Must degrade to a
+        // single pass-through packet (amplification bounded by MAX_GSO_SEGMENTS).
+        let hdr_len = 40usize;
+        let gso_size = 1usize;
+        let data_len = 4096usize; // 4096 segments if uncapped
+        let mut slot = vec![0u8; VHDR];
+        slot[1] = gso_type::TCPV4;
+        slot[2..4].copy_from_slice(&(hdr_len as u16).to_le_bytes());
+        slot[4..6].copy_from_slice(&(gso_size as u16).to_le_bytes());
+        let mut ip = ipv4_hdr(PROTO_TCP, hdr_len + data_len);
+        ip.extend_from_slice(&[0u8; 20]); // 20-byte TCP header
+        ip.extend_from_slice(&vec![0xAB_u8; data_len]);
+        slot.extend_from_slice(&ip);
+        let segs = desegment(&slot);
+        assert_eq!(segs.len(), 1, "tiny gso_size must degrade to pass-through, not amplify");
     }
 
     #[test]

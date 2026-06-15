@@ -304,6 +304,37 @@ impl EgressHello {
             capabilities,
         })
     }
+
+    /// Sanity-check an exit-supplied hello before it configures the client's
+    /// kernel TUN + routes. The exit is untrusted to a VPN client (it chooses
+    /// the lease), so reject values that would otherwise reach `ip` / the
+    /// `subnet_*_cidr_str` shift math as garbage (e.g. a v4 prefix > 32).
+    pub fn validate(&self) -> Result<()> {
+        if !(16..=30).contains(&self.v4_prefix) {
+            anyhow::bail!("egress hello: v4 prefix /{} out of range [16,30]", self.v4_prefix);
+        }
+        if self.allocated_v4.is_unspecified()
+            || self.allocated_v4.is_loopback()
+            || self.allocated_v4.is_multicast()
+            || self.allocated_v4.is_broadcast()
+        {
+            anyhow::bail!("egress hello: bogus allocated v4 {}", self.allocated_v4);
+        }
+        if self.allocated_v6.is_some() && !(64..=126).contains(&self.v6_prefix) {
+            anyhow::bail!("egress hello: v6 prefix /{} out of range [64,126]", self.v6_prefix);
+        }
+        if let Some(v6) = self.allocated_v6
+            && (v6.is_unspecified() || v6.is_loopback() || v6.is_multicast())
+        {
+            anyhow::bail!("egress hello: bogus allocated v6 {v6}");
+        }
+        // MTU is decoded as buf[48]*16 (so ≤ 4080); require at least a minimal
+        // IPv4 datagram so the client never set_mtu's a 0/degenerate value.
+        if !(576..=4080).contains(&self.mtu) {
+            anyhow::bail!("egress hello: implausible mtu {}", self.mtu);
+        }
+        Ok(())
+    }
 }
 
 // ── Address allocator ─────────────────────────────────────────────────────
@@ -1283,6 +1314,10 @@ pub async fn client_handshake(
         );
     }
     let hello = EgressHello::decode(&hello_buf[..EGRESS_HELLO_SIZE])?;
+    // The exit is untrusted to a VPN client: validate the announced lease/MTU
+    // before feeding it to kernel TUN/route config. Out-of-range values
+    // (e.g. v4_prefix > 32) otherwise reach `subnet_v4_cidr_str`'s shift math.
+    hello.validate()?;
     let v6_desc = hello
         .allocated_v6
         .map(|v6| format!(" + {v6}/{}", hello.v6_prefix))
@@ -1800,6 +1835,33 @@ mod tests {
         .encode();
         bytes[0] = b'X';
         assert!(EgressHello::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn egress_hello_validate_rejects_bogus_exit_values() {
+        let good = EgressHello {
+            allocated_v4: Ipv4Addr::new(10, 55, 0, 2),
+            gateway_v4: Ipv4Addr::new(10, 55, 0, 1),
+            v4_prefix: 24,
+            allocated_v6: None,
+            gateway_v6: None,
+            v6_prefix: 0,
+            mtu: 1392,
+            capabilities: 0,
+        };
+        assert!(good.validate().is_ok(), "a normal exit hello must validate");
+        // Out-of-range v4 prefix — the subnet_v4_cidr_str shift hazard.
+        let mut bad = good;
+        bad.v4_prefix = 200;
+        assert!(bad.validate().is_err(), "v4 prefix > 32 must be rejected");
+        // Bogus allocated address.
+        let mut bad = good;
+        bad.allocated_v4 = Ipv4Addr::UNSPECIFIED;
+        assert!(bad.validate().is_err(), "0.0.0.0 lease must be rejected");
+        // Degenerate MTU.
+        let mut bad = good;
+        bad.mtu = 0;
+        assert!(bad.validate().is_err(), "mtu 0 must be rejected");
     }
 
     #[test]

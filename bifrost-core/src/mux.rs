@@ -17,7 +17,7 @@ use norn_rs::PacketConn;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, trace, warn};
 
 use crate::frame::{Frame, OpenTarget};
@@ -38,6 +38,22 @@ const SESSION_WAIT_INTERVAL: Duration = Duration::from_millis(100);
 /// How often the retransmit task scans all live streams. 50 ms gives
 /// sub-second response to losses without thrashing on idle muxes.
 const RETRANSMIT_TICK: Duration = Duration::from_millis(50);
+
+/// Max concurrent live streams a single peer may have open at once. An
+/// authenticated peer flooding `Open` frames would otherwise grow the stream
+/// table + spawn a handler per Open without bound. Past the cap we refuse new
+/// Opens with a `Reset` (drop gracefully — bifrost's documented posture). Set
+/// high enough that no legitimate client (a busy browser opens a few hundred
+/// concurrent CONNECTs; a VPN egress uses exactly one) ever hits it.
+const MAX_STREAMS_PER_PEER: u32 = 1024;
+
+/// Bounds concurrent fire-and-forget control-frame sends (ACK / Reset). Without
+/// it, an inbound Data/Open flood spawns one send task per frame; if the
+/// outbound path wedges they pile up unboundedly. Best-effort: when exhausted
+/// we DROP the control frame (cumulative ACKs self-heal; a dropped Reset only
+/// defers peer-side cleanup). Data retransmits do NOT use this path — they must
+/// not be dropped, and are already bounded by the per-stream send window.
+const MAX_INFLIGHT_CONTROL_SENDS: usize = 2048;
 
 type StreamSender = mpsc::Sender<StreamEvent>;
 
@@ -75,6 +91,10 @@ pub(crate) struct StreamEntry {
 #[derive(Default)]
 struct StreamTable {
     entries: HashMap<(PubKey, StreamId), StreamEntry>,
+    /// Live stream count per peer, kept in sync with `entries` so the per-peer
+    /// cap check is O(1) instead of an O(n) scan of `entries` on every Open
+    /// (an O(n) scan would itself be an Open-flood amplifier).
+    per_peer: HashMap<PubKey, u32>,
     next_sid: u32,
     next_generation: u64,
 }
@@ -84,6 +104,21 @@ impl StreamTable {
         let sid = self.next_sid;
         self.next_sid = self.next_sid.wrapping_add(1);
         sid
+    }
+
+    fn inc_peer(&mut self, peer: PubKey) {
+        *self.per_peer.entry(peer).or_insert(0) += 1;
+    }
+
+    /// Decrement on stream removal; drop the entry at zero so the map can't
+    /// grow unbounded from churned peers.
+    fn dec_peer(&mut self, peer: &PubKey) {
+        if let Some(c) = self.per_peer.get_mut(peer) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                self.per_peer.remove(peer);
+            }
+        }
     }
 
     /// Hand out the next install generation (see `StreamEntry::generation`).
@@ -118,6 +153,9 @@ pub struct MeshMux {
     /// clone per inbound Datagram so registration is lock-free on the
     /// hot path.
     datagram_handlers: Arc<Mutex<HashMap<u8, DatagramSender>>>,
+    /// Permits for in-flight fire-and-forget control sends (ACK / Reset).
+    /// Bounds the task/memory amplification of an inbound frame flood.
+    control_sends: Arc<Semaphore>,
 }
 
 /// Channel tag for `bifrost-vpnd`'s raw IP-packet fast path. Each TUN
@@ -145,6 +183,7 @@ impl MeshMux {
             table: Arc::new(Mutex::new(StreamTable::default())),
             accept_tx,
             datagram_handlers: Arc::new(Mutex::new(HashMap::new())),
+            control_sends: Arc::new(Semaphore::new(MAX_INFLIGHT_CONTROL_SENDS)),
         });
         tokio::spawn(read_loop(mux.clone()));
         tokio::spawn(retransmit_tick(mux.clone()));
@@ -201,6 +240,27 @@ impl MeshMux {
         &self.conn
     }
 
+    /// Fire-and-forget a control frame (ACK / Reset) with bounded concurrency.
+    /// Spawning a task per inbound frame is unbounded under a flood; this caps
+    /// the in-flight count via a semaphore and DROPS the frame when exhausted.
+    /// Safe to drop: cumulative ACKs self-heal on the next data frame, and a
+    /// dropped Reset only defers the peer's own cleanup. NOT for data
+    /// retransmits (those must not be dropped — see retransmit_tick).
+    fn spawn_control_send(self: &Arc<Self>, peer: PubKey, frame: Frame) {
+        let Ok(permit) = self.control_sends.clone().try_acquire_owned() else {
+            trace!(
+                "mux: control-send backlog full ({} max), dropping {:?} to {}",
+                MAX_INFLIGHT_CONTROL_SENDS, frame.kind(), hex::encode(&peer[..8])
+            );
+            return;
+        };
+        let mux = self.clone();
+        tokio::spawn(async move {
+            let _permit = permit; // released when the send future completes
+            let _ = mux.send_frame(&peer, frame).await;
+        });
+    }
+
     /// Open a new outbound stream toward `peer`. The returned MeshStream
     /// is usable immediately for writes; the OpenAck reply is delivered
     /// as a StreamEvent::OpenAck on the read side so callers can wait
@@ -221,6 +281,9 @@ impl MeshMux {
                     has_unacked: has_unacked.clone(),
                 },
             );
+            // Outbound streams count toward the per-peer total too (no cap is
+            // enforced here — these are locally initiated, not attacker-driven).
+            t.inc_peer(peer);
             (sid, generation)
         };
         let stream =
@@ -250,6 +313,7 @@ impl MeshMux {
             && t.entries.get(&(*peer, sid)).is_some_and(|e| e.generation == generation)
         {
             t.entries.remove(&(*peer, sid));
+            t.dec_peer(peer);
         }
     }
 
@@ -265,13 +329,22 @@ impl MeshMux {
         tx: StreamSender,
         reliability: Arc<Mutex<Reliability>>,
         has_unacked: Arc<std::sync::atomic::AtomicBool>,
-    ) -> (u64, Option<StreamEntry>) {
+    ) -> Option<(u64, Option<StreamEntry>)> {
         let mut t = self.table.lock().expect("StreamTable mutex poisoned");
-        let generation = t.allocate_generation();
         let stale = t.entries.remove(&(peer, sid));
+        if stale.is_none() {
+            // A genuinely new stream for this peer (not a reconnect replacing a
+            // still-live entry). Enforce the per-peer cap so an Open flood can't
+            // grow the table unbounded; the caller refuses the Open with a Reset.
+            if t.per_peer.get(&peer).copied().unwrap_or(0) >= MAX_STREAMS_PER_PEER {
+                return None;
+            }
+            t.inc_peer(peer);
+        }
+        let generation = t.allocate_generation();
         t.entries
             .insert((peer, sid), StreamEntry { tx, reliability, peer, sid, generation, has_unacked });
-        (generation, stale)
+        Some((generation, stale))
     }
 
     fn lookup_entry(&self, peer: &PubKey, sid: StreamId) -> Option<StreamEntry> {
@@ -308,8 +381,18 @@ async fn read_loop(mux: Arc<MeshMux>) {
                 let (tx, rx) = mpsc::channel(INBOUND_CHAN_DEPTH);
                 let reliability = Arc::new(Mutex::new(Reliability::default()));
                 let has_unacked = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let (generation, stale) =
-                    mux.install_inbound(peer, sid, tx, reliability.clone(), has_unacked.clone());
+                let Some((generation, stale)) =
+                    mux.install_inbound(peer, sid, tx, reliability.clone(), has_unacked.clone())
+                else {
+                    // Peer is at its per-peer stream cap — refuse this Open with
+                    // a Reset rather than growing unbounded state (drop gracefully).
+                    debug!(
+                        "mux: peer {} at stream cap ({}), refusing Open sid={sid}",
+                        hex::encode(&peer[..8]), MAX_STREAMS_PER_PEER
+                    );
+                    mux.spawn_control_send(peer, Frame::Reset { sid, code: 0x01 });
+                    continue;
+                };
                 if let Some(stale) = stale {
                     // The peer re-opened a sid that was still live on our
                     // side: it reconnected (a restarted process resets
@@ -397,14 +480,9 @@ async fn read_loop(mux: Arc<MeshMux>) {
 
 fn handle_data(mux: &Arc<MeshMux>, peer: PubKey, sid: StreamId, seq: u32, data: Vec<u8>) {
     let Some(entry) = mux.lookup_entry(&peer, sid) else {
-        // Unknown stream — tell the peer to give up. Fire-and-forget
-        // so the read loop doesn't stall on outbound writes.
-        let mux2 = mux.clone();
-        tokio::spawn(async move {
-            let _ = mux2
-                .send_frame(&peer, Frame::Reset { sid, code: 0x01 })
-                .await;
-        });
+        // Unknown stream — tell the peer to give up. Bounded fire-and-forget so
+        // a flood of Data for unknown sids can't spawn unbounded Reset tasks.
+        mux.spawn_control_send(peer, Frame::Reset { sid, code: 0x01 });
         return;
     };
     let (outcome, ack_state) = {
@@ -414,10 +492,7 @@ fn handle_data(mux: &Arc<MeshMux>, peer: PubKey, sid: StreamId, seq: u32, data: 
     };
     if outcome.send_ack {
         let (ack, win) = ack_state;
-        let mux2 = mux.clone();
-        tokio::spawn(async move {
-            let _ = mux2.send_frame(&peer, Frame::Ack { sid, ack, win }).await;
-        });
+        mux.spawn_control_send(peer, Frame::Ack { sid, ack, win });
     }
     if outcome.rx_buf_grew || outcome.eof_ready {
         let _ = entry.tx.try_send(StreamEvent::WakeRead);
@@ -458,12 +533,8 @@ fn handle_ack(mux: &Arc<MeshMux>, peer: PubKey, sid: StreamId, ack: u32, win: u3
 
 fn handle_close(mux: &Arc<MeshMux>, peer: PubKey, sid: StreamId, seq: u32) {
     let Some(entry) = mux.lookup_entry(&peer, sid) else {
-        let mux2 = mux.clone();
-        tokio::spawn(async move {
-            let _ = mux2
-                .send_frame(&peer, Frame::Reset { sid, code: 0x01 })
-                .await;
-        });
+        // Unknown stream — bounded fire-and-forget Reset (see handle_data).
+        mux.spawn_control_send(peer, Frame::Reset { sid, code: 0x01 });
         return;
     };
     let (outcome, ack_state) = {
@@ -477,10 +548,7 @@ fn handle_close(mux: &Arc<MeshMux>, peer: PubKey, sid: StreamId, seq: u32) {
     );
     if outcome.send_ack {
         let (ack, win) = ack_state;
-        let mux2 = mux.clone();
-        tokio::spawn(async move {
-            let _ = mux2.send_frame(&peer, Frame::Ack { sid, ack, win }).await;
-        });
+        mux.spawn_control_send(peer, Frame::Ack { sid, ack, win });
     }
     let _ = entry.tx.try_send(StreamEvent::PeerClose);
     if outcome.eof_ready {
@@ -528,14 +596,7 @@ async fn retransmit_tick(mux: Arc<MeshMux>) {
                         entry.sid,
                         seq
                     );
-                    let mux2 = mux.clone();
-                    let peer = entry.peer;
-                    let sid = entry.sid;
-                    tokio::spawn(async move {
-                        let _ = mux2
-                            .send_frame(&peer, Frame::Reset { sid, code: 0x06 })
-                            .await;
-                    });
+                    mux.spawn_control_send(entry.peer, Frame::Reset { sid: entry.sid, code: 0x06 });
                     let _ = entry.tx.try_send(StreamEvent::Reset(0x06));
                     mux.drop_stream(&entry.peer, entry.sid, entry.generation);
                 }
@@ -647,12 +708,13 @@ mod tests {
 
         // First Open from this peer.
         let (tx, r, h) = inbound_parts();
-        let (gen1, stale) = mux.install_inbound(peer, sid, tx, r, h);
+        let (gen1, stale) = mux.install_inbound(peer, sid, tx, r, h).expect("first install under cap");
         assert!(stale.is_none(), "first open has no predecessor");
 
         // Peer reconnects, re-opens the same sid.
         let (tx, r, h) = inbound_parts();
-        let (gen2, stale) = mux.install_inbound(peer, sid, tx, r, h);
+        let (gen2, stale) =
+            mux.install_inbound(peer, sid, tx, r, h).expect("reopen install under cap");
         let stale = stale.expect("re-open must surface the displaced stale entry");
         assert_eq!(stale.generation, gen1, "stale entry carries the old generation");
         assert_ne!(gen1, gen2, "the re-opened stream gets a fresh generation");
@@ -675,12 +737,47 @@ mod tests {
         let sid: StreamId = 3;
 
         let (tx, r, h) = inbound_parts();
-        let (generation, _) = mux.install_inbound(peer, sid, tx, r, h);
+        let (generation, _) = mux.install_inbound(peer, sid, tx, r, h).expect("install under cap");
 
         mux.drop_stream(&peer, sid, generation.wrapping_sub(1));
         assert!(mux.lookup_entry(&peer, sid).is_some(), "wrong-gen drop must not evict");
 
         mux.drop_stream(&peer, sid, generation);
         assert!(mux.lookup_entry(&peer, sid).is_none(), "matching-gen drop evicts");
+    }
+
+    #[tokio::test]
+    async fn per_peer_stream_cap_refuses_excess_opens() {
+        let mux = test_mux();
+        let peer: PubKey = [0x11; 32];
+        // Fill exactly the cap with distinct sids; remember sid 0's generation.
+        let mut gen0 = 0u64;
+        for sid in 0..MAX_STREAMS_PER_PEER {
+            let (tx, r, h) = inbound_parts();
+            let (g, _) = mux.install_inbound(peer, sid, tx, r, h).expect("install under cap");
+            if sid == 0 {
+                gen0 = g;
+            }
+        }
+        // The next NEW sid is refused (None → read_loop sends a Reset).
+        let (tx, r, h) = inbound_parts();
+        assert!(
+            mux.install_inbound(peer, MAX_STREAMS_PER_PEER, tx, r, h).is_none(),
+            "Open beyond the per-peer cap must be refused"
+        );
+        // The cap is per-peer: a different peer is unaffected.
+        let other: PubKey = [0x22; 32];
+        let (tx, r, h) = inbound_parts();
+        assert!(
+            mux.install_inbound(other, 0, tx, r, h).is_some(),
+            "cap is per-peer, not global"
+        );
+        // Freeing one of the saturated peer's slots admits a new Open again.
+        mux.drop_stream(&peer, 0, gen0);
+        let (tx, r, h) = inbound_parts();
+        assert!(
+            mux.install_inbound(peer, MAX_STREAMS_PER_PEER, tx, r, h).is_some(),
+            "a freed slot must admit a new Open"
+        );
     }
 }
