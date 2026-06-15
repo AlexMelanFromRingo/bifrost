@@ -251,6 +251,22 @@ impl ScoredExitPool {
                 break;
             }
         }
+        // The weighted draws above sample WITH replacement and are bounded, so
+        // they may not collect `cap` distinct items (e.g. every draw lands on
+        // the same high-weight peer, or two equal-weight peers but all draws
+        // hit one). Guarantee the documented contract — min(n, pool) distinct
+        // candidates — by deterministically filling any shortfall from the
+        // highest-weight not-yet-chosen entries. Without this, multi-exit
+        // racing silently loses redundancy, and the result is non-deterministic.
+        if out.len() < cap {
+            let snapshot = self.snapshot.lock().expect("snapshot mutex poisoned");
+            for s in snapshot.iter() {
+                if out.len() >= cap { break; }
+                if seen.insert(s.pub_key) {
+                    out.push((s.pub_key, s.tag.clone()));
+                }
+            }
+        }
         out
     }
 
