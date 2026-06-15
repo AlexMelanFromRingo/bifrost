@@ -1043,7 +1043,8 @@ mod tests {
     #[test]
     fn allocate_seq_refuses_above_send_cap_despite_huge_peer_window() {
         let mut r = Reliability::default();
-        r.peer_window = u32::MAX; // hostile: peer advertises a 4 GiB window
+        // Hostile peer advertises a 4 GiB window via an ACK (no unacked yet).
+        r.on_recv_ack(0, u32::MAX, Instant::now());
         // A single request above the local send-buffer cap is refused even
         // though peer_window would "allow" it — the cap is the binding limit.
         if MAX_SEND_BUF < u32::MAX {
