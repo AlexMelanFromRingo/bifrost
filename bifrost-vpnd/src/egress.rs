@@ -741,6 +741,7 @@ pub async fn start_exit(
     egress_iface: String,
     lease_persistence_path: String,
     admin_socket: String,
+    dst_filter: Arc<crate::dst_filter::DstFilter>,
 ) -> Result<()> {
     let pool = Arc::new(Mutex::new(
         AddressPool::new(v4_pool_base, v4_pool_prefix, v6_pool_base, v6_pool_prefix)
@@ -863,6 +864,7 @@ pub async fn start_exit(
     // sender side is coalescing aggressively.
     let table_for_in = table.clone();
     let tun_writer_in = tun_writer.clone();
+    let dst_filter_in = dst_filter.clone();
     tokio::spawn(async move {
         while let Some(recv) = datagram_rx.recv().await {
             let bifrost_core::mux::DatagramRecv { from, payload } = recv;
@@ -900,6 +902,21 @@ pub async fn start_exit(
                         );
                     }
                     continue;
+                }
+                // SSRF defence: drop client packets whose destination the
+                // egress policy forbids (loopback / link-local / cloud
+                // metadata always; private ranges unless the operator opted
+                // out or allowlisted them) BEFORE the kernel routes them out.
+                // Fail closed: an unparseable destination is dropped too.
+                match crate::dst_filter::DstFilter::dst_of(ip) {
+                    Some(dst) if dst_filter_in.allows(dst) => {}
+                    _ => {
+                        trace!(
+                            "egress exit: dst blocked by policy (from {}), drop",
+                            hex::encode(&from[..8])
+                        );
+                        continue;
+                    }
                 }
                 if let Err(e) = w.write_all(slot).await {
                     warn!("egress exit: TUN write failed: {e}");
@@ -1579,6 +1596,8 @@ pub async fn start_exit(
     _v6_pool_prefix: u8,
     _egress_iface: String,
     _lease_persistence_path: String,
+    _admin_socket: String,
+    _dst_filter: Arc<crate::dst_filter::DstFilter>,
 ) -> Result<()> {
     anyhow::bail!("egress exit requires the `tun` feature (rebuild with --features tun)")
 }

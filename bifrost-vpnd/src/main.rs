@@ -113,6 +113,16 @@ async fn run_exit(
     accept_rx: tokio::sync::mpsc::Receiver<bifrost_core::mux::AcceptedStream>,
     cfg: &VpnConfig,
 ) -> Result<()> {
+    // Build the egress destination filter (SSRF defence) up front so a bad
+    // dst_allow/dst_deny CIDR fails the daemon at startup, not mid-traffic.
+    let dst_filter = Arc::new(
+        bifrost_vpnd::dst_filter::DstFilter::new(
+            cfg.exit.block_private_dst,
+            &cfg.exit.dst_allow,
+            &cfg.exit.dst_deny,
+        )
+        .context("invalid exit destination filter (block_private_dst / dst_allow / dst_deny)")?,
+    );
     egress::start_exit(
         mux,
         accept_rx,
@@ -124,6 +134,7 @@ async fn run_exit(
         cfg.exit.egress_iface.clone(),
         cfg.exit.lease_persistence_path.clone(),
         cfg.exit.admin_socket.clone(),
+        dst_filter,
     )
     .await
 }

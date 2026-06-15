@@ -18,6 +18,18 @@ pool_base    = "10.55.0.0"
 pool_prefix  = 24                # /24 = 253 client leases
 egress_iface = "eth0"            # interface that gets MASQUERADE'd
 
+# Destination filtering (SSRF defence). Loopback, link-local (incl. the
+# 169.254.169.254 cloud-metadata endpoint), multicast, broadcast and
+# unspecified are ALWAYS dropped. With block_private_dst = true (the default)
+# RFC1918 (10/8, 172.16/12, 192.168/16), CGNAT 100.64/10 and IPv6 ULA fc00::/7
+# are dropped too, so a client can't pivot to the exit's internal network.
+block_private_dst = true
+# Punch holes for split-tunnel to specific internal subnets (overrides the
+# private block; does NOT re-enable the always-blocked set):
+# dst_allow = ["192.168.10.0/24"]
+# Extra ranges to drop on top of the defaults (dst_allow wins over dst_deny):
+# dst_deny = ["203.0.113.0/24"]
+
 [node]
 private_key = "REPLACE_ME_WITH_GENCONFIG_OUTPUT"
 listen = ["tcp://0.0.0.0:9001"]

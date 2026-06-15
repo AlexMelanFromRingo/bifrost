@@ -22,6 +22,7 @@
 
 pub mod admin;
 pub mod config;
+pub mod dst_filter;
 pub mod egress;
 pub mod lease_store;
 #[cfg(all(feature = "tun", target_os = "linux"))]

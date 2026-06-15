@@ -92,7 +92,30 @@ pub struct ExitSettings {
     /// Empty disables the admin server entirely.
     #[serde(default = "default_admin_socket_exit")]
     pub admin_socket: String,
+
+    /// SSRF defence: block client packets destined to the exit's own
+    /// internal/private ranges before the kernel routes them out. Loopback,
+    /// link-local (incl. 169.254.169.254 cloud metadata), multicast,
+    /// broadcast and unspecified are ALWAYS blocked. With this enabled (the
+    /// default) RFC1918 (10/8, 172.16/12, 192.168/16), CGNAT 100.64/10 and
+    /// IPv6 ULA fc00::/7 are blocked too. Set false for a split-tunnel exit
+    /// that is *meant* to reach a private LAN (then scope it with `dst_allow`).
+    #[serde(default = "default_true")]
+    pub block_private_dst: bool,
+
+    /// CIDRs to ALLOW even when `block_private_dst` would deny them, e.g.
+    /// `["192.168.10.0/24"]` for one reachable corporate subnet. Does not
+    /// override the always-blocked set.
+    #[serde(default)]
+    pub dst_allow: Vec<String>,
+
+    /// Extra CIDRs to DENY on top of the defaults (e.g. block a specific
+    /// public range). `dst_allow` takes precedence over `dst_deny`.
+    #[serde(default)]
+    pub dst_deny: Vec<String>,
 }
+
+fn default_true() -> bool { true }
 
 impl Default for ExitSettings {
     fn default() -> Self {
@@ -105,6 +128,9 @@ impl Default for ExitSettings {
             egress_iface: default_egress_iface(),
             lease_persistence_path: String::new(),
             admin_socket: default_admin_socket_exit(),
+            block_private_dst: true,
+            dst_allow: Vec::new(),
+            dst_deny: Vec::new(),
         }
     }
 }
