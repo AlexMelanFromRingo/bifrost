@@ -122,7 +122,15 @@ impl DstFilter {
             6 if pkt.len() >= 40 => {
                 let mut o = [0u8; 16];
                 o.copy_from_slice(&pkt[24..40]);
-                Some(Ipv6Addr::from(o).into())
+                let v6 = Ipv6Addr::from(o);
+                // Normalise IPv4-mapped (::ffff:a.b.c.d) to the embedded IPv4 so
+                // the v4 always-blocked / private rules apply. Otherwise a client
+                // could reach 127.0.0.1 / 169.254.169.254 / 10.0.0.0/8 via an
+                // ::ffff: destination that the v6-only checks would miss (SSRF).
+                match v6.to_ipv4_mapped() {
+                    Some(v4) => Some(IpAddr::V4(v4)),
+                    None => Some(IpAddr::V6(v6)),
+                }
             }
             _ => None,
         }
@@ -143,6 +151,8 @@ impl DstFilter {
                     || a.is_multicast()   // ff00::/8
                     || a.is_unspecified() // ::
                     || is_v6_link_local(a) // fe80::/10
+                    || is_v6_6to4(a)      // 2002::/16 — embeds v4 (tunnel range)
+                    || is_v6_nat64(a)     // 64:ff9b::/96 — embeds v4 (translation)
             }
         }
     }
@@ -171,6 +181,22 @@ fn is_v6_ula(a: Ipv6Addr) -> bool {
 fn is_v6_link_local(a: Ipv6Addr) -> bool {
     let o = a.octets();
     o[0] == 0xfe && (o[1] & 0xc0) == 0x80
+}
+
+/// 2002::/16 — 6to4 (RFC 3056, deprecated by RFC 7526). Embeds an IPv4 address;
+/// block outright so it can't smuggle a private/loopback v4 past the v6 checks
+/// (a normal exit doesn't run 6to4).
+fn is_v6_6to4(a: Ipv6Addr) -> bool {
+    let o = a.octets();
+    o[0] == 0x20 && o[1] == 0x02
+}
+
+/// 64:ff9b::/96 — the well-known NAT64 prefix (RFC 6052). Embeds an IPv4 in the
+/// low 32 bits; block so it can't reach a private/loopback v4 via translation.
+fn is_v6_nat64(a: Ipv6Addr) -> bool {
+    let o = a.octets();
+    o[0] == 0x00 && o[1] == 0x64 && o[2] == 0xff && o[3] == 0x9b
+        && o[4..12].iter().all(|&b| b == 0)
 }
 
 #[cfg(test)]
@@ -308,5 +334,38 @@ mod tests {
         assert_eq!(DstFilter::dst_of(&[0x45; 10]), None, "truncated v4 → None");
         assert_eq!(DstFilter::dst_of(&[0x60; 20]), None, "truncated v6 → None");
         assert_eq!(DstFilter::dst_of(&[0x00; 40]), None, "unknown version → None");
+    }
+
+    #[test]
+    fn ssrf_ipv4_mapped_ipv6_normalized_then_blocked() {
+        let f = default_filter();
+        // Build an IPv6 packet whose dst is ::ffff:<v4>.
+        let mapped_pkt = |v4: Ipv4Addr| -> Vec<u8> {
+            let mut p = vec![0u8; 40];
+            p[0] = 0x60; // version 6
+            p[24..40].copy_from_slice(&v4.to_ipv6_mapped().octets());
+            p
+        };
+        for s in ["127.0.0.1", "169.254.169.254", "10.0.0.1", "192.168.1.1"] {
+            let v4: Ipv4Addr = s.parse().unwrap();
+            let dst = DstFilter::dst_of(&mapped_pkt(v4)).expect("mapped v6 dst parses");
+            assert_eq!(dst, IpAddr::V4(v4), "::ffff:{s} must normalise to embedded v4");
+            assert!(!f.allows(dst), "mapped {s} must be blocked via v4 rules (SSRF)");
+        }
+        // A mapped PUBLIC v4 still flows.
+        let pub_dst = DstFilter::dst_of(&mapped_pkt("8.8.8.8".parse().unwrap())).unwrap();
+        assert!(f.allows(pub_dst), "mapped public v4 still allowed");
+    }
+
+    #[test]
+    fn ssrf_6to4_and_nat64_ranges_blocked() {
+        let f = default_filter();
+        // 6to4 (2002::/16) embedding loopback, and the NAT64 well-known prefix
+        // embedding loopback / RFC1918 — both must be blocked.
+        assert!(!f.allows(v6("2002:7f00:0001::")), "6to4 range must be blocked");
+        assert!(!f.allows(v6("64:ff9b::7f00:1")), "NAT64 embedding 127.0.0.1 must be blocked");
+        assert!(!f.allows(v6("64:ff9b::a00:1")), "NAT64 embedding 10.0.0.1 must be blocked");
+        // A normal public v6 in a neighbouring range is unaffected.
+        assert!(f.allows(v6("2001:4860:4860::8888")), "public v6 still allowed");
     }
 }
