@@ -55,6 +55,7 @@ stream.
 | mDNS exit discovery        | ✅ done  | `_bifrost-exit._tcp.local.`          |
 | Prometheus exporter        | ✅ done  | per-candidate weight/trust/RTT gauges|
 | `bifrost-ctl` admin CLI    | ✅ done  | UNIX-socket JSON RPC, 3 sub-commands |
+| Egress dst-filter (SSRF defence) | ✅ done | block metadata/loopback/link-local; opt-out private ranges; allow/deny CIDRs |
 | Mobile build (Android/iOS) | ⏸ later | x86_64 + aarch64 Linux only          |
 
 ---
@@ -347,6 +348,12 @@ What this protocol protects:
 * **Replay & reorder resistance** at the mesh layer (norn-rs sessions carry
   sequence numbers) and at the bifrost layer (per-stream seq + cumulative
   ACK rejects duplicates and reassembles in order).
+* **Egress destination filtering (SSRF defence)** at the exit. Client packets
+  aimed at the exit's loopback, link-local (incl. cloud metadata
+  `169.254.169.254` / `fd00:ec2::254`), RFC1918 / CGNAT / IPv6-ULA (by default),
+  or IPv4-mapped / 6to4 / NAT64 IPv6 wrappers of those, are dropped before the
+  kernel routes them — so the exit can't be used as an SSRF pivot into the
+  operator's infrastructure. Configurable allow/deny CIDRs for split-tunnel.
 
 What this protocol does **not** protect:
 
@@ -357,9 +364,12 @@ What this protocol does **not** protect:
   on the way out (it's a SOCKS5 / NAT'd packet, not a black box). Choose
   exits you trust; use TLS end-to-end (HTTPS) so even a hostile exit only
   sees ciphertext.
-* **DoS resistance under flood**. Bifrost inherits norn-rs's per-IP
-  handshake throttle but doesn't add its own. A flooded exit will drop
-  CONNECTs gracefully but won't black-hole the attacker.
+* **DoS resistance under flood** (partial, by design). Bifrost inherits norn-rs's
+  per-IP handshake throttle and adds a few cheap caps — a per-peer concurrent-
+  stream cap (excess `Open`s are refused with a `Reset`), bounded control-frame
+  sends, a 32 MiB per-stream send-buffer cap, and a GSO-segment cap — so a flood
+  degrades gracefully instead of exhausting memory. It does **not** add heavy
+  anti-flood machinery or black-hole an attacker.
 
 ---
 

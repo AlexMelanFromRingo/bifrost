@@ -56,6 +56,7 @@ sliding-window ARQ, который превращает ненадёжный dat
 | mDNS exit discovery          | ✅ done   | `_bifrost-exit._tcp.local.`             |
 | Prometheus exporter          | ✅ done   | per-candidate weight/trust/RTT          |
 | `bifrost-ctl` admin CLI      | ✅ done   | JSON RPC поверх UNIX-сокета             |
+| Egress dst-filter (защита от SSRF) | ✅ done | блок metadata/loopback/link-local; private-диапазоны опционально; allow/deny CIDR |
 | Mobile build (Android/iOS)   | ⏸ потом  | только x86_64 + aarch64 Linux           |
 
 ---
@@ -345,6 +346,13 @@ Reliability-слой трактует Data и Close как единое sequence
 * **Replay & reorder resistance** на mesh-слое (norn-rs сессии нумеруют
   пакеты) и на bifrost-слое (per-stream seq + cumulative ACK отбрасывает
   дубликаты и собирает фреймы в порядке).
+* **Фильтрация назначения egress (защита от SSRF)** на exit'е. Пакеты клиента,
+  нацеленные на loopback exit'а, link-local (вкл. cloud-metadata
+  `169.254.169.254` / `fd00:ec2::254`), RFC1918 / CGNAT / IPv6-ULA (по
+  умолчанию), либо IPv4-mapped / 6to4 / NAT64 IPv6-обёртки этих адресов —
+  дропаются до маршрутизации ядром, так что exit нельзя использовать как
+  SSRF-плацдарм в инфраструктуру оператора. Настраиваемые allow/deny CIDR для
+  split-tunnel.
 
 Что протокол **не защищает**:
 
@@ -355,9 +363,12 @@ Reliability-слой трактует Data и Close как единое sequence
   трафик на выходе (это SOCKS5 / NAT'нутый пакет, не чёрный ящик). Выбирай
   exit'ы которым доверяешь; пользуйся TLS end-to-end (HTTPS), чтобы даже
   враждебный exit видел только ciphertext.
-* **DoS-стойкость под флудом**. Bifrost унаследовал per-IP handshake throttle
-  от norn-rs, но своего не добавляет. Заваленный exit будет аккуратно ронять
-  CONNECT'ы, но не отрежет атакующего.
+* **DoS-стойкость под флудом** (частично, осознанно). Bifrost унаследовал per-IP
+  handshake throttle от norn-rs и добавил несколько дешёвых лимитов — кап на
+  число стримов с одного пира (лишние `Open` отбиваются `Reset`'ом),
+  ограниченные control-отправки, кап send-буфера 32 МиБ на стрим и кап
+  GSO-сегментов — так что флуд деградирует мягко, а не выжирает память. Тяжёлой
+  анти-флуд машинерии нет, атакующего не отрезает.
 
 ---
 
