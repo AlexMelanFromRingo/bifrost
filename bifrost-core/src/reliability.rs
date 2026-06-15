@@ -62,6 +62,12 @@ pub const INITIAL_PEER_WINDOW: u32 = DEFAULT_RX_BUF_CAP;
 /// (and forcing the peer to retransmit). Mirrors MAX_RX_BUF_CAP so a
 /// pathological reorder pattern can't exceed our per-stream cap.
 pub const REORDER_BYTE_CAP: u32 = MAX_RX_BUF_CAP;
+/// Upper bound on locally-buffered unacked (in-flight) bytes, independent of
+/// the peer's advertised window. `peer_window` is set from inbound ACKs and is
+/// attacker-controlled (a peer can advertise up to `u32::MAX`); without this cap
+/// a peer advertising a huge window could make us hold gigabytes of unacked data
+/// (one large upload's worth) in `unacked`. Mirrors `MAX_RX_BUF_CAP`.
+pub const MAX_SEND_BUF: u32 = MAX_RX_BUF_CAP;
 
 // ── Serial-number arithmetic (RFC 1982) for the 32-bit byte sequence space ──
 //
@@ -334,7 +340,12 @@ impl Reliability {
         if self.write_finished {
             return None;
         }
-        if self.unacked_bytes.saturating_add(len) > self.peer_window {
+        // Gate on the peer's advertised window AND a local send-buffer cap.
+        // `peer_window` is attacker-controlled (an inbound ACK can advertise up
+        // to u32::MAX); `MAX_SEND_BUF` bounds locally-held unacked data so a
+        // peer can't make us buffer multiple GiB regardless of what it advertises.
+        let effective_window = self.peer_window.min(MAX_SEND_BUF);
+        if self.unacked_bytes.saturating_add(len) > effective_window {
             return None;
         }
         let seq = self.next_seq;
@@ -441,7 +452,9 @@ impl Reliability {
         if self.write_finished {
             return 0;
         }
-        self.peer_window.saturating_sub(self.unacked_bytes)
+        // Bounded by the same local send cap as allocate_seq, so the stream
+        // layer never chunks against a window we won't actually grant.
+        self.peer_window.min(MAX_SEND_BUF).saturating_sub(self.unacked_bytes)
     }
 
     /// Current receive buffer cap (post auto-tune). Exposed for tests
@@ -1025,5 +1038,24 @@ mod tests {
         );
         // The 0x40 far-future entry is still buffered (gap [0, 0x40) missing).
         assert!(r.reorder.contains_key(&0x0000_0040u32));
+    }
+
+    #[test]
+    fn allocate_seq_refuses_above_send_cap_despite_huge_peer_window() {
+        let mut r = Reliability::default();
+        r.peer_window = u32::MAX; // hostile: peer advertises a 4 GiB window
+        // A single request above the local send-buffer cap is refused even
+        // though peer_window would "allow" it — the cap is the binding limit.
+        if MAX_SEND_BUF < u32::MAX {
+            assert!(
+                r.allocate_seq(MAX_SEND_BUF.saturating_add(1)).is_none(),
+                "send-buffer cap must bind below an attacker's advertised window"
+            );
+        }
+        // Allocations up to the cap still succeed (no regression for honest peers).
+        assert!(
+            r.allocate_seq(MAX_SEND_BUF).is_some(),
+            "allocations up to MAX_SEND_BUF must still succeed"
+        );
     }
 }
