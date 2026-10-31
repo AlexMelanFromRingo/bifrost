@@ -2,6 +2,13 @@
 
 All notable changes to bifrost are documented here.
 
+## v0.2.2 — 2026-10-31
+
+- **Evicted lease quarantine.** Operator `EvictLease` returned the address
+  to the pool before the conntrack flush ran, so a new client could be
+  handed it (and the old owner's flows) in between. The slot now goes back
+  to the pool only after the flush completes.
+
 ## v0.2.1 — 2026-10-31
 
 Fixes from an automated security review of v0.2.0. No wire changes; one new

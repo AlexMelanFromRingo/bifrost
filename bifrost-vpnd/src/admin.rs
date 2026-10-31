@@ -327,21 +327,24 @@ fn evict_lease(state: &AdminState, hex_key: &str) -> AdminResponse {
     let pool = state.pool.as_ref().expect("exit mode invariant: pool is set");
     let table = state.table.as_ref().expect("exit mode invariant: table is set");
 
-    // Pool → table, the same order as the handshake path, held together so
-    // the slot can't be re-allocated between the table removal and release.
-    let removed = {
-        let mut p = pool.lock().unwrap();
-        let removed = table.lock().unwrap().remove_peer(&peer);
-        if let Some(lease) = removed {
-            p.release(lease);
-        }
-        removed
-    };
+    // Drop the peer from the table now, but return the slot to the pool only
+    // AFTER the evicted owner's conntrack/NAT state is flushed: until then
+    // the address is quarantined (neither leased nor allocatable), so a new
+    // client can never inherit the old owner's flows or in-flight replies.
+    let removed = table.lock().unwrap().remove_peer(&peer);
     if let Some(lease) = removed {
-        // The address can go to the next client right away: drop the evicted
-        // owner's conntrack/NAT state first (same as automatic reclamation).
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            rt.spawn(async move { crate::egress::flush_conntrack(&lease).await });
+        let pool = pool.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    crate::egress::flush_conntrack(&lease).await;
+                    pool.lock().unwrap().release(lease);
+                });
+            }
+            Err(_) => {
+                crate::egress::flush_conntrack_blocking(&lease);
+                pool.lock().unwrap().release(lease);
+            }
         }
         if let Some(store) = &state.lease_store
             && let Err(e) = crate::egress::persist_leases(table, store)
@@ -496,11 +499,24 @@ mod tests {
             serde_json::from_value(resp.data.unwrap()).unwrap();
         assert!(payload.evicted);
         assert_eq!(payload.freed_v4.as_deref(), Some("10.55.0.2"));
-        // Pool slot must be reusable on the next allocate.
-        let next = pool.lock().unwrap().allocate().unwrap();
-        assert_eq!(next.v4, Ipv4Addr::new(10, 55, 0, 2));
         // Table no longer knows about this peer.
         assert!(table.lock().unwrap().lease_of(&peer).is_none());
+        // Quarantine: on this current-thread runtime the conntrack-flush task
+        // hasn't run yet, so the evicted address must NOT be allocatable —
+        // a new client must never inherit the old owner's flows.
+        let other = pool.lock().unwrap().allocate().unwrap();
+        assert_ne!(other.v4, Ipv4Addr::new(10, 55, 0, 2), "handed out before its flush");
+        pool.lock().unwrap().release(other);
+        // Once the flush task ran, the slot is reusable.
+        for _ in 0..400 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let next = pool.lock().unwrap().allocate().unwrap();
+            if next.v4 == Ipv4Addr::new(10, 55, 0, 2) {
+                return;
+            }
+            pool.lock().unwrap().release(next);
+        }
+        panic!("evicted address never returned to the pool after the flush");
     }
 
     /// Regression: the admin read was an unbounded `read_line`, so a local

@@ -166,7 +166,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bifrost-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "bifrost-ctl"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "bifrost-core",
@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "bifrost-ffi"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "bifrost-core",
@@ -215,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "bifrost-socks5d"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "bifrost-core",
@@ -234,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "bifrost-vpnd"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "bifrost-core",
