@@ -254,7 +254,23 @@ egress_iface   = "eth0"            # интерфейс под MASQUERADE
 # клиента совпадающие адреса в обоих стеках. Без v6_pool_base — v4-only.
 # v6_pool_base   = "fd55:0:0:1::"
 # v6_pool_prefix = 64
+# Допуск клиентов. ed25519-ключи генерируются бесплатно, а каждый
+# допущенный ключ получает sticky-лизу — перечислите обслуживаемых
+# клиентов. Пусто = открытый exit (предупреждение в логе при старте).
+allowed_clients     = ["<client-pub-key-hex>"]
+# Цена идентичности: минимальная сложность ключа по мере norn (ведущие
+# 1-биты BLAKE2b(pub_key), та же, что у Sybil-порога norn). 0 = выкл.
+min_client_pow_bits = 0
+admin_socket        = "/run/bifrost/vpnd-exit.sock"   # каталог создаётся 0700
 ```
+
+Лизы закреплены за pub_key (и переживают рестарт при
+`lease_persistence_path`). Когда пул исчерпан, exit **отбирает наименее
+давно активную лизу**, у пира которой нет живой egress-сессии и который не
+подключён; используемая лиза не отбирается никогда — если живы все, новый
+клиент получает отказ. Время последней активности сохраняется на диск, так
+что порядок переживает рестарт. Сохранённые лизы ключей, которые больше не
+допускаются, отбрасываются при старте.
 
 Специфика `bifrost-vpnd` (client mode):
 
@@ -264,6 +280,11 @@ mode = "client"
 [client]
 tun_name              = "bifrost-eg0"
 install_default_route = true        # выключено по умолчанию; opt-in
+admin_socket          = "/run/bifrost/vpnd-client.sock"
+# Exit недоверенный: подсеть его лизы должна лежать в RFC1918 / CGNAT
+# 100.64/10 / ULA fc00::/7, а шлюз — внутри неё, иначе клиент отказывает
+# (злонамеренный exit не может завернуть публичные префиксы в туннель).
+# allowed_lease_cidrs = ["198.18.0.0/15"]   # только явным opt-in
 ```
 
 См. `examples/*.toml` для готовых шаблонов.
@@ -353,6 +374,12 @@ Reliability-слой трактует Data и Close как единое sequence
   дропаются до маршрутизации ядром, так что exit нельзя использовать как
   SSRF-плацдарм в инфраструктуру оператора. Настраиваемые allow/deny CIDR для
   split-tunnel.
+* **Допуск клиентов на exit** (`bifrost-vpnd`): опциональный allowlist и
+  порог сложности ключа на идентичность; заполненный пул лиз отбирает
+  простаивающие лизы вместо блокировки новых клиентов.
+* **Проверка лизы на клиенте** (`bifrost-vpnd`): exit не может выдать
+  лизу/шлюз вне приватных диапазонов (или явных `allowed_lease_cidrs`
+  клиента), а значит не может перехватить маршруты split-tunnel клиента.
 
 Что протокол **не защищает**:
 
@@ -379,7 +406,11 @@ Reliability-слой трактует Data и Close как единое sequence
   `status`, `exits`, `peers`, `penalty <pk>`, `reset-penalty <pk>`,
   `reset-all-penalties`, `reload`. По умолчанию — таблицы;
   `--json` отдаёт сырой envelope для скриптов. Дефолтный
-  socket: `/tmp/bifrost-socks5d-ctl.sock`.
+  socket: `/run/bifrost/socks5d.sock`. Admin-сокет `bifrost-vpnd`
+  (`leases`, `evict-lease`) по умолчанию —
+  `/run/bifrost/vpnd-{exit,client}.sock`: отсутствующий каталог создаётся
+  с `0700`, сокет получает `0600` (без изменения umask процесса), запрос
+  ограничен 64 KiB.
 
   **`bifrost-ctl reload`** перечитывает конфиг с диска и
   hot-применяет reloadable поля: дельта `[egress].exits`
@@ -395,8 +426,14 @@ Reliability-слой трактует Data и Close как единое sequence
 
 * **mDNS-обнаружение** — exit'ы рекламируют
   `_bifrost-exit._tcp.local.` с `pk=<64hex>` в TXT; Auto-клиенты
-  browse'ят и автоматически добавляют в пул (тег `mDNS`). Eviction
-  при `ServiceRemoved`. Управление: `[bifrost].mdns_discovery`.
+  browse'ят и добавляют найденных в пул (тег `mDNS`) **только если ключ
+  есть в `[bifrost].trusted_exits`** — mDNS не аутентифицирован, а exit
+  видит каждую цель CONNECT, которую через него проводят.
+  `mdns_trust_any = true` — явный (небезопасный) opt-in на любой анонс в
+  LAN; `mdns_max_exits` (по умолчанию 16) ограничивает число найденных.
+  Без доверенных ключей и без trust-any browser не запускается. Eviction
+  при `ServiceRemoved` (статически заданные exit'ы не трогаются).
+  Управление: `[bifrost].mdns_discovery`.
 
 * **Happy-eyeballs racing** — каждый CONNECT гоняет OPEN-фрейм
   параллельно по `race_exits` лучшим exit'ам и берёт первого
@@ -460,3 +497,11 @@ crypto-pool, Android NDK).
 ## Лицензия
 
 MIT. См. [LICENSE](LICENSE).
+
+## Библиотеки, которые стоит изучить
+
+Прежде чем делать обход NAT, relay-серверы или новые типы каналов, загляните в
+**Reticulum** (<https://reticulum.network>), **rust-libp2p**
+(<https://github.com/libp2p/rust-libp2p>) и **iroh**
+(<https://github.com/n0-computer/iroh>) — подробности в
+[norn-rs/docs/PRIOR-ART.md](https://github.com/AlexMelanFromRingo/norn-rs/blob/master/docs/PRIOR-ART.md).

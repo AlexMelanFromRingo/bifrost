@@ -21,6 +21,7 @@
 //!   depending on the daemon binary.
 
 pub mod admin;
+pub mod admission;
 pub mod config;
 pub mod dst_filter;
 pub mod egress;

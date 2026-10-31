@@ -22,21 +22,34 @@
 //! {
 //!   "version": 1,
 //!   "leases": [
-//!     { "peer": "ad427eaa…", "v4": "10.55.0.2", "v6": "fd55::2" },
-//!     { "peer": "bb63f7c7…", "v4": "10.55.0.3", "v6": null      }
+//!     { "peer": "ad427eaa…", "v4": "10.55.0.2", "v6": "fd55::2", "last_active": 1761900000 },
+//!     { "peer": "bb63f7c7…", "v4": "10.55.0.3", "v6": null }
 //!   ]
 //! }
 //! ```
 //!
+//! `last_active` (unix seconds of the peer's last handshake or
+//! disconnect) is optional: files written before it existed load with
+//! `0`, i.e. "oldest", which makes those leases the first reclaimed.
+//!
+//! The file is a mirror of the exit's in-memory `EgressTable`: every
+//! save replaces the store's contents with a fresh table snapshot (see
+//! `egress::persist_leases`), so the two can't drift apart.
+//!
 //! ## Eviction policy
 //!
-//! v0.1: **sticky leases**. Once handed out, an entry stays in the
-//! file until an operator deletes it manually (e.g. via `bifrost-ctl
-//! evict-lease <pub_key>` — not implemented yet) or until the pool
-//! is exhausted and a new client needs the slot. Stream-close on
-//! the control channel no longer releases the underlying lease —
-//! the bifrost-vpnd `handle_egress_handshake` change keeps the
-//! `EgressTable` entry alive for sticky resume.
+//! **Sticky leases with reclamation.** Once handed out, an entry stays
+//! until either
+//!
+//! * an operator evicts it (`bifrost-ctl evict-lease <pub_key>`), or
+//! * the pool is exhausted and a new client needs a slot: the exit then
+//!   reclaims the **least-recently-active** lease whose peer has no live
+//!   egress session and is not currently connected to the exit. A lease
+//!   in active use is never reclaimed — if every lease is live the new
+//!   client is refused.
+//!
+//! Stream-close on the control channel does not release the lease; it
+//! only stamps `last_active` so the reclamation order survives restarts.
 //!
 //! ## Failure modes
 //!
@@ -73,6 +86,9 @@ struct PersistedLease {
     v4: Ipv4Addr,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     v6: Option<Ipv6Addr>,
+    /// Unix seconds of the last handshake / disconnect. 0 = unknown.
+    #[serde(default)]
+    last_active: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +103,9 @@ struct PersistedFile {
 pub struct LeaseStore {
     path: PathBuf,
     leases: Vec<(PubKey, Lease)>,
+    /// Per-peer last-activity stamp (unix seconds), persisted alongside
+    /// the lease so least-recently-active reclamation survives restarts.
+    last_active: std::collections::HashMap<PubKey, u64>,
 }
 
 impl LeaseStore {
@@ -96,7 +115,11 @@ impl LeaseStore {
     /// always construct one; persistence is purely a function of
     /// whether the path is set.
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into(), leases: Vec::new() }
+        Self {
+            path: path.into(),
+            leases: Vec::new(),
+            last_active: std::collections::HashMap::new(),
+        }
     }
 
     /// True if a non-empty path is set. Callers use this to decide
@@ -116,6 +139,12 @@ impl LeaseStore {
     /// or the file is unparseable (the caller is expected to log
     /// the latter at warn level via `load_with_warn`).
     pub fn load(&mut self) -> Result<Vec<(PubKey, Lease)>> {
+        Ok(self.load_entries()?.into_iter().map(|(p, l, _)| (p, l)).collect())
+    }
+
+    /// Like [`load`](Self::load) but also returns each entry's persisted
+    /// `last_active` stamp (0 when the file predates the field).
+    pub fn load_entries(&mut self) -> Result<Vec<(PubKey, Lease, u64)>> {
         if !self.is_persistent() { return Ok(Vec::new()); }
         let body = match std::fs::read_to_string(&self.path) {
             Ok(s) => s,
@@ -135,9 +164,9 @@ impl LeaseStore {
             let mut peer = [0u8; 32];
             hex::decode_to_slice(&p.peer, &mut peer)
                 .with_context(|| format!("bad peer hex {:?}", p.peer))?;
-            out.push((peer, Lease { v4: p.v4, v6: p.v6 }));
+            out.push((peer, Lease { v4: p.v4, v6: p.v6 }, p.last_active));
         }
-        self.leases = out.clone();
+        self.replace_all(out.clone());
         Ok(out)
     }
 
@@ -156,6 +185,7 @@ impl LeaseStore {
                 peer: hex::encode(peer),
                 v4: lease.v4,
                 v6: lease.v6,
+                last_active: self.last_active.get(peer).copied().unwrap_or(0),
             }).collect(),
         };
         let body = serde_json::to_vec_pretty(&file).context("serialising lease store")?;
@@ -207,7 +237,25 @@ impl LeaseStore {
     pub fn remove(&mut self, peer: &PubKey) -> bool {
         let before = self.leases.len();
         self.leases.retain(|(p, _)| p != peer);
+        self.last_active.remove(peer);
         self.leases.len() != before
+    }
+
+    /// Replace the whole in-memory set with `entries` (peer, lease,
+    /// last_active). Used to mirror the exit's live table before a save.
+    pub fn replace_all(&mut self, entries: Vec<(PubKey, Lease, u64)>) {
+        self.leases.clear();
+        self.last_active.clear();
+        for (peer, lease, ts) in entries {
+            self.leases.push((peer, lease));
+            self.last_active.insert(peer, ts);
+        }
+    }
+
+    /// Persisted last-activity stamp for `peer` (unix seconds).
+    #[allow(dead_code)]
+    pub fn last_active_of(&self, peer: &PubKey) -> Option<u64> {
+        self.last_active.get(peer).copied()
     }
 
     /// Look up an existing lease by peer pub key. Used by tests and
@@ -230,15 +278,16 @@ impl LeaseStore {
     #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.leases.clear();
+        self.last_active.clear();
     }
 }
 
 /// Best-effort load that swallows parse errors as warnings rather
 /// than refusing to start the daemon. Returns the recovered
-/// leases (empty on error).
-pub fn load_with_warn(path: &Path) -> Vec<(PubKey, Lease)> {
+/// `(peer, lease, last_active)` entries (empty on error).
+pub fn load_with_warn(path: &Path) -> Vec<(PubKey, Lease, u64)> {
     let mut store = LeaseStore::new(path);
-    match store.load() {
+    match store.load_entries() {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
@@ -395,6 +444,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// `last_active` must round-trip so least-recently-active reclamation
+    /// keeps its order across an exit restart; files from before the field
+    /// existed still load (as 0 = oldest).
+    #[test]
+    fn last_active_roundtrips_and_old_files_default_to_zero() {
+        let tmpdir = tempdir_pathbuf();
+        let path = tmpdir.join("leases.json");
+        let mut store = LeaseStore::new(&path);
+        store.replace_all(vec![
+            (peer(0x01), Lease { v4: Ipv4Addr::new(10, 55, 0, 2), v6: None }, 1_700_000_000),
+            (peer(0x02), Lease { v4: Ipv4Addr::new(10, 55, 0, 3), v6: None }, 42),
+        ]);
+        store.save().unwrap();
+        let got = load_with_warn(&path);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].2, 1_700_000_000);
+        assert_eq!(got[1].2, 42);
+
+        std::fs::write(
+            &path,
+            r#"{"version":1,"leases":[{"peer":"0303030303030303030303030303030303030303030303030303030303030303","v4":"10.55.0.4"}]}"#,
+        )
+        .unwrap();
+        let got = load_with_warn(&path);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].2, 0, "pre-last_active file loads as oldest");
+        std::fs::remove_dir_all(&tmpdir).unwrap();
     }
 
     /// Operators usually point `lease_persistence_path` at something

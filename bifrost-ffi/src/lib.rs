@@ -65,7 +65,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use bifrost_core::mux::MeshMux;
 use bifrost_core::stream::MeshStream;
-use bifrost_vpnd::egress::{client_handshake, run_client_pump};
+use bifrost_vpnd::egress::{client_handshake, run_client_pump, LeasePolicy};
 use norn_rs::{config::NodeConfig, node::Node};
 use tokio::runtime::Runtime;
 use tracing::{error, info};
@@ -243,8 +243,12 @@ pub unsafe extern "C" fn bifrost_client_connect(
         node.start().await.context("node.start")?;
         let conn = node.conn.clone();
         info!("bifrost-ffi: node up; pub_key={}", hex::encode(conn.pub_key));
-        let (mux, _accept_rx) = MeshMux::new(conn);
-        let (mesh, hello) = client_handshake(mux.clone(), exit_peer)
+        // The mobile client never serves inbound Opens: drop the accept
+        // receiver right away so the mux refuses them with a Reset.
+        let (mux, _) = MeshMux::new(conn);
+        // Mobile has no config surface for extra lease CIDRs: strict
+        // default (RFC1918 / CGNAT / ULA only).
+        let (mesh, hello) = client_handshake(mux.clone(), exit_peer, &LeasePolicy::default())
             .await
             .context("client_handshake")?;
         info!(
@@ -373,7 +377,7 @@ pub unsafe extern "C" fn bifrost_client_run(handle: *mut BifrostClient, tun_fd: 
             }
         });
         let (r, w) = tokio::io::split(framed);
-        run_client_pump(r, w, mux, exit_peer, lease_v4, mesh)
+        run_client_pump(r, w, mux, exit_peer, lease_v4, mesh, LeasePolicy::default())
             .await
             .context("run_client_pump")?;
         Ok(())

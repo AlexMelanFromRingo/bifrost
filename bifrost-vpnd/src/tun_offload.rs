@@ -138,6 +138,12 @@ pub mod gso_type {
     pub const ECN_FLAG: u8 = 0x80;
 }
 
+/// `virtio_net_hdr.flags` bits. Mirror the kernel `VIRTIO_NET_HDR_F_*`.
+pub mod hdr_flag {
+    pub const NEEDS_CSUM: u8 = 0x01;
+    pub const DATA_VALID: u8 = 0x02;
+}
+
 /// `TUNSETOFFLOAD` flag bits. Mirror the kernel `TUN_F_*` values.
 pub mod offload_flag {
     pub const CSUM:  u32 = 0x01;
@@ -188,6 +194,44 @@ impl VirtioNetHdr {
         })
     }
 
+    /// Conservative check that the kernel will accept this header in
+    /// front of a `payload_len`-byte packet on a TUN `write(2)`. Mirrors the
+    /// `-EINVAL` paths of `tun_get_user` / `virtio_net_hdr_to_skb`: unknown
+    /// flag bits or GSO types, ECN without GSO, GSO with `gso_size == 0`,
+    /// `hdr_len` past the payload, a checksum slot past the payload.
+    ///
+    /// The vhdr crosses the mesh verbatim, so on the receiving TUN it is
+    /// remote-controlled input: one bad header would otherwise surface as
+    /// a write error on the shared TUN writer.
+    pub fn is_sane_for(&self, payload_len: usize) -> bool {
+        if self.flags & !(hdr_flag::NEEDS_CSUM | hdr_flag::DATA_VALID) != 0 {
+            return false;
+        }
+        match self.gso_type & !gso_type::ECN_FLAG {
+            gso_type::NONE => {
+                if self.gso_type & gso_type::ECN_FLAG != 0 {
+                    return false;
+                }
+            }
+            gso_type::TCPV4 | gso_type::TCPV6 | gso_type::UDP | gso_type::UDP_L4 => {
+                if self.gso_size == 0 {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+        if self.hdr_len as usize > payload_len {
+            return false;
+        }
+        if self.flags & hdr_flag::NEEDS_CSUM != 0 {
+            let csum_end = self.csum_start as usize + self.csum_offset as usize + 2;
+            if csum_end > payload_len {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Split a `[virtio_net_hdr][packet bytes]` buffer into the
     /// header + a borrow of the payload. Returns `None` if the
     /// buffer is shorter than the header.
@@ -195,6 +239,12 @@ impl VirtioNetHdr {
         if buf.len() < VIRTIO_NET_HDR_LEN { return None; }
         Self::decode(buf).map(|h| (h, &buf[VIRTIO_NET_HDR_LEN..]))
     }
+}
+
+/// True iff `slot` is `[vhdr | payload]` with a header the kernel will
+/// accept for that payload (see [`VirtioNetHdr::is_sane_for`]).
+pub fn slot_vhdr_is_sane(slot: &[u8]) -> bool {
+    VirtioNetHdr::split(slot).is_some_and(|(h, payload)| h.is_sane_for(payload.len()))
 }
 
 /// Try to enable kernel-side TUN offload on `fd`. The flags are
@@ -291,6 +341,47 @@ mod tests {
     fn virtio_net_hdr_split_rejects_undersize() {
         // 5 bytes — clearly too short for the 12-byte header.
         assert!(VirtioNetHdr::split(&[0u8; 5]).is_none());
+    }
+
+    fn slot(h: VirtioNetHdr, payload_len: usize) -> Vec<u8> {
+        let mut v = h.encode().to_vec();
+        v.resize(VIRTIO_NET_HDR_LEN + payload_len, 0x45);
+        v
+    }
+
+    #[test]
+    fn vhdr_sanity_accepts_what_the_kernel_produces() {
+        assert!(slot_vhdr_is_sane(&slot(VirtioNetHdr::raw_no_offload(), 60)));
+        let tso = VirtioNetHdr {
+            flags: hdr_flag::NEEDS_CSUM,
+            gso_type: gso_type::TCPV4,
+            hdr_len: 40,
+            gso_size: 1448,
+            csum_start: 20,
+            csum_offset: 16,
+        };
+        assert!(slot_vhdr_is_sane(&slot(tso, 40 + 3 * 1448)));
+        let ecn = VirtioNetHdr { gso_type: gso_type::TCPV6 | gso_type::ECN_FLAG, ..tso };
+        assert!(slot_vhdr_is_sane(&slot(ecn, 40 + 1448)));
+    }
+
+    #[test]
+    fn vhdr_sanity_rejects_client_supplied_garbage() {
+        let base = VirtioNetHdr::raw_no_offload();
+        let bad = [
+            VirtioNetHdr { flags: 0x80, ..base },                          // unknown flag bit
+            VirtioNetHdr { gso_type: 0x42, gso_size: 100, ..base },        // unknown GSO type
+            VirtioNetHdr { gso_type: gso_type::ECN_FLAG, ..base },         // ECN without GSO
+            VirtioNetHdr { gso_type: gso_type::TCPV4, gso_size: 0, ..base }, // GSO, no size
+            VirtioNetHdr { hdr_len: 61, ..base },                          // hdr_len > payload
+            VirtioNetHdr {                                                 // csum slot past end
+                flags: hdr_flag::NEEDS_CSUM, csum_start: 50, csum_offset: 9, ..base
+            },
+        ];
+        for h in bad {
+            assert!(!slot_vhdr_is_sane(&slot(h, 60)), "{h:?} must be rejected");
+        }
+        assert!(!slot_vhdr_is_sane(&[0u8; 5]), "truncated header");
     }
 
     #[test]

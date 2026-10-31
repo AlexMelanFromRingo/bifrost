@@ -40,6 +40,41 @@ pub const INBOUND_CHAN_DEPTH: usize = 256;
 /// Default minimum effective payload per DATA frame.
 const MIN_DATA_CHUNK: usize = 256;
 
+/// Must-not-be-lost per-stream signals (OpenAck / Reset), written by the
+/// mux read loop and consumed by the stream. The event channel is bounded
+/// and the read loop only ever `try_send`s into it (one stream's slow
+/// consumer must never stall demux for every stream), so a full channel
+/// could drop these. The latch is the source of truth for their values;
+/// the matching `StreamEvent` is only a wake hint. Writers latch FIRST,
+/// then `try_send`: a hint dropped on a full channel is harmless because
+/// the consumer re-checks the latch after draining the queued events.
+#[derive(Debug, Default)]
+pub(crate) struct StreamLatch {
+    inner: Mutex<LatchState>,
+}
+
+#[derive(Debug, Default)]
+struct LatchState {
+    open_ack: Option<u8>,
+    reset: Option<u8>,
+}
+
+impl StreamLatch {
+    pub(crate) fn set_open_ack(&self, code: u8) {
+        self.inner.lock().expect("StreamLatch mutex poisoned").open_ack = Some(code);
+    }
+
+    pub(crate) fn set_reset(&self, code: u8) {
+        self.inner.lock().expect("StreamLatch mutex poisoned").reset = Some(code);
+    }
+
+    /// Take both latched values (each is delivered to the stream once).
+    fn take(&self) -> (Option<u8>, Option<u8>) {
+        let mut l = self.inner.lock().expect("StreamLatch mutex poisoned");
+        (l.open_ack.take(), l.reset.take())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum StreamEvent {
     /// rx_buf grew or EOF is now reachable — poll_read should retry.
@@ -47,11 +82,13 @@ pub enum StreamEvent {
     /// Peer ACKed something; write window may have opened.
     WakeWrite,
     /// Peer's Open reply (0x00 = success, anything else = SOCKS5 REP).
+    /// Wake hint only — the value is read from the `StreamLatch`.
     OpenAck(u8),
     /// Peer sent Close (already integrated into Reliability; this is
     /// just a wake hint for callers waiting on `await_open_ack`).
     PeerClose,
     /// Peer aborted the stream (or our own retransmit budget ran out).
+    /// Wake hint only — the value is read from the `StreamLatch`.
     Reset(u8),
 }
 
@@ -60,6 +97,8 @@ pub enum StreamEvent {
 pub mod reply {
     pub const SUCCESS:           u8 = 0x00;
     pub const GENERAL_FAILURE:   u8 = 0x01;
+    /// "Connection not allowed by ruleset" — exit destination policy.
+    pub const NOT_ALLOWED:       u8 = 0x02;
     pub const NET_UNREACHABLE:   u8 = 0x03;
     pub const HOST_UNREACHABLE:  u8 = 0x04;
     pub const CONN_REFUSED:      u8 = 0x05;
@@ -86,6 +125,8 @@ pub struct MeshStream {
     /// to walk us; mux's handle_ack flips it back to `false` once
     /// `unacked_empty && !close_pending`.
     has_unacked: Arc<std::sync::atomic::AtomicBool>,
+    /// Latched OpenAck / Reset values (see `StreamLatch`).
+    latch: Arc<StreamLatch>,
     /// Outstanding Data-send future from poll_write. We deliberately
     /// hold exactly one — naively pipelining N futures here looked
     /// attractive (4-MB reliability window divided by ~64-KB chunks)
@@ -119,6 +160,7 @@ pub struct MeshStream {
 }
 
 impl MeshStream {
+    #[allow(clippy::too_many_arguments)] // shared per-stream state handed over by the mux
     pub(crate) fn new(
         mux: Arc<MeshMux>,
         peer: PubKey,
@@ -127,6 +169,7 @@ impl MeshStream {
         rx: mpsc::Receiver<StreamEvent>,
         reliability: Arc<Mutex<Reliability>>,
         has_unacked: Arc<std::sync::atomic::AtomicBool>,
+        latch: Arc<StreamLatch>,
     ) -> Self {
         Self {
             mux,
@@ -136,6 +179,7 @@ impl MeshStream {
             rx,
             reliability,
             has_unacked,
+            latch,
             write_fut: None,
             close_fut: None,
             close_registered: false,
@@ -155,29 +199,46 @@ impl MeshStream {
         mtu.saturating_sub(MAX_FRAME_OVERHEAD).max(MIN_DATA_CHUNK)
     }
 
+    /// Move latched OpenAck / Reset values into the stream's own slots.
+    /// Returns true if either was present.
+    fn absorb_latch(&mut self) -> bool {
+        absorb_latch(&self.latch, &mut self.pending_ack, &mut self.pending_reset)
+    }
+
     /// Wait for the next OpenAck reply.
     pub async fn await_open_ack(&mut self) -> io::Result<u8> {
-        if let Some(code) = self.pending_ack.take() {
-            return Ok(code);
-        }
         loop {
+            // The latch is checked before every wait: the channel event
+            // is only a hint and may have been dropped on a full queue.
+            self.absorb_latch();
+            if let Some(code) = self.pending_ack.take() {
+                return Ok(code);
+            }
+            if let Some(code) = self.pending_reset.take() {
+                self.write_closed = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    format!("stream reset (code 0x{code:02x}) before OpenAck"),
+                ));
+            }
             match self.rx.recv().await {
-                Some(StreamEvent::OpenAck(code)) => return Ok(code),
-                Some(StreamEvent::Reset(code)) => {
-                    self.write_closed = true;
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        format!("stream reset (code 0x{code:02x}) before OpenAck"),
-                    ));
-                }
                 Some(StreamEvent::PeerClose) => {
+                    // An OpenAck latched just ahead of the Close still wins.
+                    self.absorb_latch();
+                    if let Some(code) = self.pending_ack.take() {
+                        return Ok(code);
+                    }
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "peer closed before OpenAck",
                     ));
                 }
-                Some(StreamEvent::WakeRead) | Some(StreamEvent::WakeWrite) => continue,
+                Some(_) => continue,
                 None => {
+                    self.absorb_latch();
+                    if let Some(code) = self.pending_ack.take() {
+                        return Ok(code);
+                    }
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "mux channel closed before OpenAck",
@@ -196,6 +257,13 @@ impl MeshStream {
         let peer = self.peer;
         let sid = self.sid;
         async move { mux.send_frame(&peer, Frame::OpenAck { sid, code }).await }
+    }
+
+    /// Suppress the abort-Reset that `Drop` would otherwise fire. Used by
+    /// the mux when it refuses an accepted stream and sends the Reset
+    /// itself through its bounded control-send path.
+    pub(crate) fn disarm_drop_reset(&mut self) {
+        self.write_closed = true;
     }
 
     pub fn reset(
@@ -249,36 +317,45 @@ impl Drop for MeshStream {
 /// 0x05 mirrors "Connection refused / aborted" sentinels.
 pub const RESET_ABORTED: u8 = 0x05;
 
-/// Pull ready events from the channel without blocking and apply their
-/// side effects. Returns true if at least one event was consumed.
+fn absorb_latch(
+    latch: &StreamLatch,
+    pending_ack: &mut Option<u8>,
+    pending_reset: &mut Option<u8>,
+) -> bool {
+    let (ack, reset) = latch.take();
+    if let Some(code) = ack {
+        *pending_ack = Some(code);
+    }
+    if let Some(code) = reset {
+        *pending_reset = Some(code);
+    }
+    ack.is_some() || reset.is_some()
+}
+
+/// Pull ready events from the channel without blocking, then fold in the
+/// latched OpenAck / Reset values. Returns true if anything was consumed —
+/// callers must then RE-CHECK their condition instead of parking: the
+/// consumed event may have been the very wake they would park for, and it
+/// will not be delivered again (the waker is only armed by the final
+/// `Pending`).
 fn drain_events(
     rx: &mut mpsc::Receiver<StreamEvent>,
+    latch: &StreamLatch,
     pending_ack: &mut Option<u8>,
     pending_reset: &mut Option<u8>,
     cx: &mut Context<'_>,
 ) -> bool {
     let mut consumed = false;
-    loop {
-        match rx.poll_recv(cx) {
-            Poll::Ready(Some(StreamEvent::WakeRead))
-            | Poll::Ready(Some(StreamEvent::WakeWrite))
-            | Poll::Ready(Some(StreamEvent::PeerClose)) => {
-                consumed = true;
-                continue;
-            }
-            Poll::Ready(Some(StreamEvent::OpenAck(code))) => {
-                *pending_ack = Some(code);
-                consumed = true;
-                continue;
-            }
-            Poll::Ready(Some(StreamEvent::Reset(code))) => {
-                *pending_reset = Some(code);
-                consumed = true;
-                continue;
-            }
-            Poll::Ready(None) | Poll::Pending => return consumed,
-        }
+    // OpenAck / Reset payloads are ignored here: the latch holds the
+    // authoritative value (see `StreamLatch`). Stops on Pending (waker
+    // armed) or a closed channel.
+    while let Poll::Ready(Some(_)) = rx.poll_recv(cx) {
+        consumed = true;
     }
+    // Check the latch only AFTER the channel reported Pending (waker
+    // armed): a value latched later is followed by a `try_send` that
+    // either wakes us or finds the queue full of events we'll drain.
+    absorb_latch(latch, pending_ack, pending_reset) || consumed
 }
 
 impl AsyncRead for MeshStream {
@@ -321,31 +398,38 @@ impl AsyncRead for MeshStream {
             // borrow checker doesn't see that `self.reliability` and
             // `self.scratch` are disjoint fields through .lock().
             let want = buf.remaining();
-            let drained_eof: (Option<Vec<u8>>, bool) = {
+            let drained_eof: (Option<Vec<u8>>, bool, Option<(u32, u32)>) = {
                 let mut r = self.reliability.lock().expect("Reliability mutex poisoned");
                 if r.rx_buf_len() == 0 {
-                    (None, r.eof_reached())
+                    (None, r.eof_reached(), None)
                 } else {
                     let mut tmp = vec![0u8; want.max(1)];
                     let n = r.rx_drain(&mut tmp);
                     tmp.truncate(n);
-                    (Some(tmp), false)
+                    // Draining reopened our receive window; if the peer
+                    // may be stalled on it, tell it (see window_update).
+                    (Some(tmp), false, r.window_update())
                 }
             };
             match drained_eof {
-                (Some(tmp), _) => {
+                (Some(tmp), _, update) => {
+                    if let Some((ack, win)) = update {
+                        let sid = self.sid;
+                        self.mux.spawn_control_send(self.peer, Frame::Ack { sid, ack, win });
+                    }
                     self.scratch.extend(tmp);
                     continue;
                 }
-                (None, true) => {
+                (None, true, _) => {
                     self.read_eof = true;
                     return Poll::Ready(Ok(()));
                 }
-                (None, false) => {}
+                (None, false, _) => {}
             }
             // Step 3: nothing to read right now — wait for a wake.
-            let Self { ref mut rx, ref mut pending_ack, ref mut pending_reset, .. } = *self;
-            let consumed = drain_events(rx, pending_ack, pending_reset, cx);
+            let Self { ref mut rx, ref latch, ref mut pending_ack, ref mut pending_reset, .. } =
+                *self;
+            let consumed = drain_events(rx, latch, pending_ack, pending_reset, cx);
             if !consumed {
                 return Poll::Pending;
             }
@@ -360,64 +444,69 @@ impl AsyncWrite for MeshStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.write_closed {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "stream half-closed for writes",
-            )));
-        }
-        if let Some(code) = self.pending_reset.take() {
-            self.write_closed = true;
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                format!("peer reset (code 0x{code:02x})"),
-            )));
-        }
-        // Finish any in-flight send before issuing a new one. We hold
-        // exactly one outstanding Data send per stream — that bounds
-        // memory and gives the mux retransmit task room to work.
-        if let Some(mut fut) = self.write_fut.take() {
-            match fut.as_mut().poll(cx) {
-                Poll::Pending => {
-                    self.write_fut = Some(fut);
-                    return Poll::Pending;
-                }
-                Poll::Ready(Err(e)) => {
-                    self.write_closed = true;
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        e.to_string(),
-                    )));
-                }
-                Poll::Ready(Ok(())) => {}
+        let (seq, chunk_len) = loop {
+            if self.write_closed {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "stream half-closed for writes",
+                )));
             }
-        }
-        // Pick a chunk that fits both the MTU and the peer's remaining window.
-        let cap = self.chunk_size();
-        let alloc = {
-            let mut r = self.reliability.lock().expect("Reliability mutex poisoned");
-            let win = r.write_window_available() as usize;
-            let len = buf.len().min(cap).min(win);
-            if len == 0 {
-                None
-            } else {
-                let seq = r.allocate_seq(len as u32).expect("window check just passed");
-                r.record_sent(seq, buf[..len].to_vec(), Instant::now());
-                // Tell the mux's retransmit_tick that this stream has
-                // pending work — flipping inside the reliability mutex
-                // means handle_ack can never observe the flip ordering
-                // wrong-way (a concurrent ACK that empties the queue
-                // would already be serialised behind us on the mutex).
-                self.has_unacked.store(true, std::sync::atomic::Ordering::Relaxed);
-                Some((seq, len))
+            if let Some(code) = self.pending_reset.take() {
+                self.write_closed = true;
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    format!("peer reset (code 0x{code:02x})"),
+                )));
             }
-        };
-        let (seq, chunk_len) = match alloc {
-            Some(x) => x,
-            None => {
-                // Window closed — wait for an ACK to land.
-                let Self { ref mut rx, ref mut pending_ack, ref mut pending_reset, .. } = *self;
-                let _ = drain_events(rx, pending_ack, pending_reset, cx);
+            // Finish any in-flight send before issuing a new one. We hold
+            // exactly one outstanding Data send per stream — that bounds
+            // memory and gives the mux retransmit task room to work.
+            if let Some(mut fut) = self.write_fut.take() {
+                match fut.as_mut().poll(cx) {
+                    Poll::Pending => {
+                        self.write_fut = Some(fut);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Err(e)) => {
+                        self.write_closed = true;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            e.to_string(),
+                        )));
+                    }
+                    Poll::Ready(Ok(())) => {}
+                }
+            }
+            // Pick a chunk that fits both the MTU and the peer's remaining window.
+            let cap = self.chunk_size();
+            let alloc = {
+                let mut r = self.reliability.lock().expect("Reliability mutex poisoned");
+                let win = r.write_window_available() as usize;
+                let len = buf.len().min(cap).min(win);
+                if len == 0 {
+                    None
+                } else {
+                    let seq = r.allocate_seq(len as u32).expect("window check just passed");
+                    r.record_sent(seq, buf[..len].to_vec(), Instant::now());
+                    // Tell the mux's retransmit_tick that this stream has
+                    // pending work — flipping inside the reliability mutex
+                    // means handle_ack can never observe the flip ordering
+                    // wrong-way (a concurrent ACK that empties the queue
+                    // would already be serialised behind us on the mutex).
+                    self.has_unacked.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Some((seq, len))
+                }
+            };
+            if let Some(x) = alloc {
+                break x;
+            }
+            // Window closed — wait for an ACK to land. If draining consumed
+            // anything (possibly the very WakeWrite we'd park for, or a
+            // Reset), loop and re-check rather than park on a wake that
+            // has already been spent.
+            let Self { ref mut rx, ref latch, ref mut pending_ack, ref mut pending_reset, .. } =
+                *self;
+            if !drain_events(rx, latch, pending_ack, pending_reset, cx) {
                 return Poll::Pending;
             }
         };
@@ -505,23 +594,29 @@ impl AsyncWrite for MeshStream {
         // Now wait for the ACK of our FIN. Mux retransmits Close every
         // RTO; we just park until either close_pending clears or peer
         // resets us (or retries exhaust → mux Resets).
-        if let Some(code) = self.pending_reset.take() {
-            self.write_closed = true;
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                format!("peer reset (code 0x{code:02x})"),
-            )));
+        loop {
+            if let Some(code) = self.pending_reset.take() {
+                self.write_closed = true;
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    format!("peer reset (code 0x{code:02x})"),
+                )));
+            }
+            let still_pending = {
+                let r = self.reliability.lock().expect("Reliability mutex poisoned");
+                r.close_pending()
+            };
+            if !still_pending {
+                self.write_closed = true;
+                return Poll::Ready(Ok(()));
+            }
+            // Same lost-wakeup guard as poll_write: anything consumed
+            // means re-check, not park.
+            let Self { ref mut rx, ref latch, ref mut pending_ack, ref mut pending_reset, .. } =
+                *self;
+            if !drain_events(rx, latch, pending_ack, pending_reset, cx) {
+                return Poll::Pending;
+            }
         }
-        let still_pending = {
-            let r = self.reliability.lock().expect("Reliability mutex poisoned");
-            r.close_pending()
-        };
-        if !still_pending {
-            self.write_closed = true;
-            return Poll::Ready(Ok(()));
-        }
-        let Self { ref mut rx, ref mut pending_ack, ref mut pending_reset, .. } = *self;
-        let _ = drain_events(rx, pending_ack, pending_reset, cx);
-        Poll::Pending
     }
 }

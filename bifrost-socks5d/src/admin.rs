@@ -1,10 +1,10 @@
 // Admin UNIX socket server for bifrost-socks5d.
 //
-// Listens on a configurable path (default /tmp/bifrost-socks5d-ctl.sock),
+// Listens on a configurable path (default /run/bifrost/socks5d.sock),
 // reads ONE newline-terminated JSON request per connection, dispatches
 // into the live daemon state, writes ONE JSON response back, closes.
 //
-// The socket is chmod 0600 on creation — the file lives in /tmp by
+// The socket is chmod 0600 on creation — the file lives in /run/bifrost by
 // default and we don't want other users on the host poking at the
 // daemon's selection state.
 
@@ -75,6 +75,15 @@ pub async fn listen(path: &str, state: Arc<AdminState>) -> Result<()> {
     // Idempotent restart: a stale socket from a previous run blocks
     // bind() with EADDRINUSE. Remove unconditionally — only the
     // owner has access (chmod 0600 below).
+    // Missing parent (e.g. /run/bifrost on tmpfs /run) → create it 0700.
+    if let Some(dir) = std::path::Path::new(path).parent()
+        && !dir.as_os_str().is_empty()
+        && !dir.exists()
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+            .with_context(|| format!("creating admin socket dir {}", dir.display()))?;
+    }
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)
         .with_context(|| format!("binding admin socket {path}"))?;

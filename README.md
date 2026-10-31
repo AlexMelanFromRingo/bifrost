@@ -256,7 +256,22 @@ egress_iface   = "eth0"            # interface that gets MASQUERADE'd
 # matching addresses on both stacks. Omit v6_pool_base for v4-only.
 # v6_pool_base   = "fd55:0:0:1::"
 # v6_pool_prefix = 64
+# Client admission. ed25519 keys are free to mint and every admitted key
+# gets a sticky lease, so list the clients you serve. Empty = open exit
+# (logged as a warning at startup).
+allowed_clients     = ["<client-pub-key-hex>"]
+# Per-identity cost: minimum norn key difficulty (leading 1-bits of
+# BLAKE2b(pub_key), same measure as norn's Sybil threshold). 0 = off.
+min_client_pow_bits = 0
+admin_socket        = "/run/bifrost/vpnd-exit.sock"   # dir created 0700
 ```
+
+Leases are sticky per pub key (and survive restarts with
+`lease_persistence_path`). When the pool is full, the exit **reclaims the
+least-recently-active lease** whose peer has no live egress session and isn't
+connected; a lease in active use is never taken — if all are live, the new
+client is refused. Last activity is persisted, so the order survives restarts.
+Persisted leases of keys that are no longer admitted are dropped at startup.
 
 `bifrost-vpnd`-specific (client mode):
 
@@ -266,6 +281,11 @@ mode = "client"
 [client]
 tun_name              = "bifrost-eg0"
 install_default_route = true        # off by default; opt-in
+admin_socket          = "/run/bifrost/vpnd-client.sock"
+# The exit is untrusted: its lease subnet must lie in RFC1918 / CGNAT
+# 100.64/10 / ULA fc00::/7 with the gateway inside it, or the client refuses
+# it (stops a malicious exit from routing public prefixes into the tunnel).
+# allowed_lease_cidrs = ["198.18.0.0/15"]   # explicit opt-in only
 ```
 
 See `examples/*.toml` for ready-to-edit templates.
@@ -354,6 +374,12 @@ What this protocol protects:
   or IPv4-mapped / 6to4 / NAT64 IPv6 wrappers of those, are dropped before the
   kernel routes them — so the exit can't be used as an SSRF pivot into the
   operator's infrastructure. Configurable allow/deny CIDRs for split-tunnel.
+* **Exit admission** (`bifrost-vpnd`): optional client allowlist and a
+  per-identity key-difficulty bar; a full lease pool reclaims idle leases
+  instead of locking new clients out.
+* **Client-side lease validation** (`bifrost-vpnd`): an exit can't push a
+  lease/gateway outside private space (or the client's explicit
+  `allowed_lease_cidrs`), so it can't hijack a split-tunnel client's routes.
 
 What this protocol does **not** protect:
 
@@ -380,7 +406,11 @@ What this protocol does **not** protect:
   `status`, `exits`, `peers`, `penalty <pk>`, `reset-penalty <pk>`,
   `reset-all-penalties`, `reload`. Default render is a tidy table;
   `--json` dumps the raw envelope for scripts. Default socket
-  path: `/tmp/bifrost-socks5d-ctl.sock`.
+  path: `/run/bifrost/socks5d.sock`. `bifrost-vpnd`'s admin
+  socket (`leases`, `evict-lease`) defaults to
+  `/run/bifrost/vpnd-{exit,client}.sock`: a missing directory is created
+  `0700`, the socket is chmod'ed `0600` (no process-wide umask change), and
+  requests are capped at 64 KiB.
 
   **`bifrost-ctl reload`** re-reads the daemon's config file and
   hot-applies the reloadable fields: `[egress].exits` diff (added
@@ -397,9 +427,14 @@ What this protocol does **not** protect:
 
 * **mDNS discovery** — exits advertise
   `_bifrost-exit._tcp.local.` with `pk=<64hex>` in TXT;
-  Auto-mode clients browse and auto-add discovered peers (tagged
-  `mDNS`). Eviction on `ServiceRemoved`. Toggle with
-  `[bifrost].mdns_discovery`.
+  Auto-mode clients browse and add discovered peers (tagged `mDNS`)
+  **only if the key is in `[bifrost].trusted_exits`** — mDNS is
+  unauthenticated and an exit sees every CONNECT target it carries.
+  `mdns_trust_any = true` is the explicit (unsafe) opt-in to accept any
+  LAN advert; `mdns_max_exits` (default 16) caps discovered candidates.
+  With neither trusted keys nor trust-any the browser isn't started.
+  Eviction on `ServiceRemoved` (never of a statically configured exit).
+  Toggle with `[bifrost].mdns_discovery`.
 
 * **Happy-eyeballs racing** — each CONNECT races the OPEN frame
   across `race_exits` top-weighted exits in parallel and takes
@@ -465,3 +500,12 @@ NDK builds).
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Libraries worth studying
+
+Before building NAT traversal, relays or new link types here, look at
+**Reticulum** (<https://reticulum.network>), **rust-libp2p**
+(<https://github.com/libp2p/rust-libp2p>) and **iroh**
+(<https://github.com/n0-computer/iroh>) — see
+[norn-rs/docs/PRIOR-ART.md](https://github.com/AlexMelanFromRingo/norn-rs/blob/master/docs/PRIOR-ART.md)
+for what each is good for.

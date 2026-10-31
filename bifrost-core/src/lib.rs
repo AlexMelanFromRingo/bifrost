@@ -12,6 +12,8 @@
 //                  stream's per-stream channel.
 //   * policy.rs  — exit-peer selection: parse pub keys, pick one for a
 //                  CONNECT, drop unreachable peers from the rotation.
+//   * dst_filter.rs — exit-side destination policy (SSRF defence) shared
+//                  by the vpnd packet egress and the socks5d TCP dialer.
 //
 // v0.1 makes one explicit reliability assumption: the exit peer is a
 // direct neighbour of the client, so the underlying TCP session inside
@@ -20,6 +22,7 @@
 
 pub mod admin_proto;
 pub mod discovery;
+pub mod dst_filter;
 pub mod frame;
 pub mod metrics;
 pub mod mux;

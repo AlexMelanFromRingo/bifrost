@@ -22,7 +22,7 @@ private_key = "REPLACE_ME_WITH_GENCONFIG_OUTPUT"
 listen = ["tcp://0.0.0.0:9001"]
 peers = ["tcp://<EXIT-HOST>:9001"]
 # tun_name = "norn0"          # optional mesh TUN; comment out for headless client
-admin_socket = "/tmp/bifrost-client.sock"
+admin_socket = "/run/bifrost/norn-socks5-client.sock"
 peer_cache_path = ""           # disable persistence for ephemeral lab setup
 multicast_enabled = false
 mdns_enabled = false
@@ -33,3 +33,13 @@ mode = "exit"
 exits = [
   { pub_key = "<EXIT-PUBKEY-HEX>", tag = "primary" },
 ]
+
+[bifrost]
+# mDNS exit discovery applies to `mode = "auto"` only. mDNS is
+# unauthenticated: a discovered exit is used ONLY if its pub key is listed in
+# trusted_exits (every exit sees the CONNECT targets routed through it). With
+# no trusted keys and mdns_trust_any = false the browser isn't started.
+mdns_discovery = true
+# trusted_exits  = ["<OTHER-EXIT-PUBKEY-HEX>"]
+mdns_trust_any = false     # true = any LAN host may become an exit (unsafe)
+mdns_max_exits = 16        # cap on discovered candidates

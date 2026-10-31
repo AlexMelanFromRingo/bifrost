@@ -22,7 +22,7 @@ use tracing::{debug, trace, warn};
 
 use crate::frame::{Frame, OpenTarget};
 use crate::reliability::Reliability;
-use crate::stream::{MeshStream, StreamEvent, INBOUND_CHAN_DEPTH};
+use crate::stream::{MeshStream, StreamEvent, StreamLatch, INBOUND_CHAN_DEPTH};
 use crate::{PubKey, StreamId};
 
 /// Max retries while waiting for the ChaCha20-Poly1305 session handshake
@@ -86,6 +86,24 @@ pub(crate) struct StreamEntry {
     /// prevent (would never retransmit a lost frame), so flips are
     /// always done with the reliability mutex held.
     pub has_unacked: Arc<std::sync::atomic::AtomicBool>,
+    /// Latched OpenAck / Reset values shared with the MeshStream.
+    pub latch: Arc<StreamLatch>,
+}
+
+impl StreamEntry {
+    /// Deliver an event WITHOUT ever blocking the read loop on this
+    /// stream's consumer. OpenAck / Reset are latched first so a full
+    /// channel can't lose them (see `StreamLatch`); wake hints are
+    /// coalescable and safe to drop. Returns false iff the consumer is
+    /// gone (receiver dropped).
+    fn deliver(&self, ev: StreamEvent) -> bool {
+        match ev {
+            StreamEvent::OpenAck(code) => self.latch.set_open_ack(code),
+            StreamEvent::Reset(code) => self.latch.set_reset(code),
+            _ => {}
+        }
+        !matches!(self.tx.try_send(ev), Err(mpsc::error::TrySendError::Closed(_)))
+    }
 }
 
 #[derive(Default)]
@@ -176,6 +194,10 @@ impl MeshMux {
     /// Wrap a PacketConn in a mux. Returns the mux + an accept-stream
     /// receiver. The mux spawns two tokio tasks: the demux read loop and
     /// the retransmit tick.
+    ///
+    /// A node that doesn't serve inbound Opens must DROP the receiver (not
+    /// park it in a `_rx` binding): the mux then refuses every Open with a
+    /// Reset instead of queueing streams nobody will ever accept.
     pub fn new(conn: Arc<PacketConn>) -> (Arc<Self>, mpsc::Receiver<AcceptedStream>) {
         let (accept_tx, accept_rx) = mpsc::channel(64);
         let mux = Arc::new(Self {
@@ -219,6 +241,14 @@ impl MeshMux {
     /// state is touched and there is no retransmit — the caller is
     /// responsible for any reliability they need on top.
     ///
+    /// Single attempt, no session-wait: datagrams are best-effort, and the
+    /// callers are shared fan-out loops (vpnd's exit TUN reader serves
+    /// every client). Riding `write_with_session_wait` here let ONE offline
+    /// peer park that loop for up to 60 s and stall downlink for all. A
+    /// failed attempt still kicks off session re-establishment inside
+    /// `PacketConn::write_to`; the packet itself is dropped (TCP/QUIC inside
+    /// the tunnel recovers).
+    ///
     /// Cheap relative to `mux.send_frame(Frame::Data {...})`: skips
     /// reliability bookkeeping, no seq allocation, no window check, no
     /// retransmit-task entry. The hot path for L3 VPN traffic.
@@ -233,7 +263,7 @@ impl MeshMux {
         }
         let frame = Frame::Datagram { channel, payload: payload.to_vec() };
         let bytes = frame.encode()?;
-        write_with_session_wait(&self.conn, peer, &bytes).await
+        self.conn.write_to(&bytes, peer).await
     }
 
     pub fn conn(&self) -> &Arc<PacketConn> {
@@ -246,7 +276,7 @@ impl MeshMux {
     /// Safe to drop: cumulative ACKs self-heal on the next data frame, and a
     /// dropped Reset only defers the peer's own cleanup. NOT for data
     /// retransmits (those must not be dropped — see retransmit_tick).
-    fn spawn_control_send(self: &Arc<Self>, peer: PubKey, frame: Frame) {
+    pub(crate) fn spawn_control_send(self: &Arc<Self>, peer: PubKey, frame: Frame) {
         let Ok(permit) = self.control_sends.clone().try_acquire_owned() else {
             trace!(
                 "mux: control-send backlog full ({} max), dropping {:?} to {}",
@@ -270,6 +300,7 @@ impl MeshMux {
         let (tx, rx) = mpsc::channel(INBOUND_CHAN_DEPTH);
         let reliability = Arc::new(Mutex::new(Reliability::default()));
         let has_unacked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let latch = Arc::new(StreamLatch::default());
         let (sid, generation) = {
             let mut t = self.table.lock().expect("StreamTable mutex poisoned");
             let sid = t.allocate();
@@ -278,7 +309,7 @@ impl MeshMux {
                 (peer, sid),
                 StreamEntry {
                     tx, reliability: reliability.clone(), peer, sid, generation,
-                    has_unacked: has_unacked.clone(),
+                    has_unacked: has_unacked.clone(), latch: latch.clone(),
                 },
             );
             // Outbound streams count toward the per-peer total too (no cap is
@@ -286,8 +317,9 @@ impl MeshMux {
             t.inc_peer(peer);
             (sid, generation)
         };
-        let stream =
-            MeshStream::new(self.clone(), peer, sid, generation, rx, reliability, has_unacked);
+        let stream = MeshStream::new(
+            self.clone(), peer, sid, generation, rx, reliability, has_unacked, latch,
+        );
         let frame = Frame::Open { sid, target };
         let bytes = frame.encode()?;
         if let Err(e) = write_with_session_wait(&self.conn, &peer, &bytes).await {
@@ -329,6 +361,7 @@ impl MeshMux {
         tx: StreamSender,
         reliability: Arc<Mutex<Reliability>>,
         has_unacked: Arc<std::sync::atomic::AtomicBool>,
+        latch: Arc<StreamLatch>,
     ) -> Option<(u64, Option<StreamEntry>)> {
         let mut t = self.table.lock().expect("StreamTable mutex poisoned");
         let stale = t.entries.remove(&(peer, sid));
@@ -342,8 +375,10 @@ impl MeshMux {
             t.inc_peer(peer);
         }
         let generation = t.allocate_generation();
-        t.entries
-            .insert((peer, sid), StreamEntry { tx, reliability, peer, sid, generation, has_unacked });
+        t.entries.insert(
+            (peer, sid),
+            StreamEntry { tx, reliability, peer, sid, generation, has_unacked, latch },
+        );
         Some((generation, stale))
     }
 
@@ -377,57 +412,14 @@ async fn read_loop(mux: Arc<MeshMux>) {
         };
         let peer = pkt.from;
         match frame {
-            Frame::Open { sid, target } => {
-                let (tx, rx) = mpsc::channel(INBOUND_CHAN_DEPTH);
-                let reliability = Arc::new(Mutex::new(Reliability::default()));
-                let has_unacked = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let Some((generation, stale)) =
-                    mux.install_inbound(peer, sid, tx, reliability.clone(), has_unacked.clone())
-                else {
-                    // Peer is at its per-peer stream cap — refuse this Open with
-                    // a Reset rather than growing unbounded state (drop gracefully).
-                    debug!(
-                        "mux: peer {} at stream cap ({}), refusing Open sid={sid}",
-                        hex::encode(&peer[..8]), MAX_STREAMS_PER_PEER
-                    );
-                    mux.spawn_control_send(peer, Frame::Reset { sid, code: 0x01 });
-                    continue;
-                };
-                if let Some(stale) = stale {
-                    // The peer re-opened a sid that was still live on our
-                    // side: it reconnected (a restarted process resets
-                    // `next_sid` to 0) and its previous transport
-                    // connection died without a Close. Retire the
-                    // orphaned stream so its handler task unwinds and
-                    // frees whatever it held (e.g. an egress IP lease) —
-                    // otherwise every reconnect from this peer collides
-                    // here forever and never gets an OpenAck. Reset wakes
-                    // the parked handler; the stream marks itself
-                    // write-closed so its Drop won't fire a spurious
-                    // Reset frame at the now-reconnected peer.
-                    debug!(
-                        "mux: re-open from {} sid={sid} — peer reconnected, retiring stale stream",
-                        hex::encode(&peer[..8])
-                    );
-                    let _ = stale.tx.try_send(StreamEvent::Reset(0x01));
-                }
-                let stream = MeshStream::new(
-                    mux.clone(), peer, sid, generation, rx, reliability, has_unacked,
-                );
-                let accepted = AcceptedStream { from: peer, target, stream };
-                if mux.accept_tx.send(accepted).await.is_err() {
-                    mux.drop_stream(&peer, sid, generation);
-                }
-            }
-            Frame::OpenAck { sid, code } => {
-                signal(&mux, &peer, sid, StreamEvent::OpenAck(code)).await
-            }
+            Frame::Open { sid, target } => handle_open(&mux, peer, sid, target),
+            Frame::OpenAck { sid, code } => signal(&mux, &peer, sid, StreamEvent::OpenAck(code)),
             Frame::Data { sid, seq, data } => handle_data(&mux, peer, sid, seq, data),
             Frame::Ack { sid, ack, win } => handle_ack(&mux, peer, sid, ack, win),
             Frame::Close { sid, seq } => handle_close(&mux, peer, sid, seq),
             Frame::Reset { sid, code } => {
                 if let Some(entry) = mux.lookup_entry(&peer, sid) {
-                    let _ = entry.tx.send(StreamEvent::Reset(code)).await;
+                    entry.deliver(StreamEvent::Reset(code));
                     mux.drop_stream(&peer, sid, entry.generation);
                 }
             }
@@ -478,6 +470,65 @@ async fn read_loop(mux: Arc<MeshMux>) {
     }
 }
 
+/// Install an inbound `Open` and hand it to the accept queue. Never awaits:
+/// the queue is fed with `try_send`, and an Open that can't be queued — the
+/// acceptor is backlogged, or this node doesn't serve Opens at all (client /
+/// mesh modes drop the receiver) — is refused with a Reset. Awaiting a full
+/// queue here froze the whole read loop, i.e. every stream on the node, on
+/// 65 Opens from any peer.
+fn handle_open(mux: &Arc<MeshMux>, peer: PubKey, sid: StreamId, target: OpenTarget) {
+    let (tx, rx) = mpsc::channel(INBOUND_CHAN_DEPTH);
+    let reliability = Arc::new(Mutex::new(Reliability::default()));
+    let has_unacked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let latch = Arc::new(StreamLatch::default());
+    let Some((generation, stale)) = mux.install_inbound(
+        peer, sid, tx, reliability.clone(), has_unacked.clone(), latch.clone(),
+    ) else {
+        // Peer is at its per-peer stream cap — refuse this Open with
+        // a Reset rather than growing unbounded state (drop gracefully).
+        debug!(
+            "mux: peer {} at stream cap ({}), refusing Open sid={sid}",
+            hex::encode(&peer[..8]), MAX_STREAMS_PER_PEER
+        );
+        mux.spawn_control_send(peer, Frame::Reset { sid, code: 0x01 });
+        return;
+    };
+    if let Some(stale) = stale {
+        // The peer re-opened a sid that was still live on our
+        // side: it reconnected (a restarted process resets
+        // `next_sid` to 0) and its previous transport
+        // connection died without a Close. Retire the
+        // orphaned stream so its handler task unwinds and
+        // frees whatever it held (e.g. an egress IP lease) —
+        // otherwise every reconnect from this peer collides
+        // here forever and never gets an OpenAck. Reset wakes
+        // the parked handler; the stream marks itself
+        // write-closed so its Drop won't fire a spurious
+        // Reset frame at the now-reconnected peer.
+        debug!(
+            "mux: re-open from {} sid={sid} — peer reconnected, retiring stale stream",
+            hex::encode(&peer[..8])
+        );
+        stale.deliver(StreamEvent::Reset(0x01));
+    }
+    let stream = MeshStream::new(
+        mux.clone(), peer, sid, generation, rx, reliability, has_unacked, latch,
+    );
+    let accepted = AcceptedStream { from: peer, target, stream };
+    if let Err(e) = mux.accept_tx.try_send(accepted) {
+        let (why, acc) = match e {
+            mpsc::error::TrySendError::Full(a) => ("accept queue full", a),
+            mpsc::error::TrySendError::Closed(a) => ("not accepting streams", a),
+        };
+        debug!("mux: {why}, refusing Open sid={sid} from {}", hex::encode(&peer[..8]));
+        let mut stream = acc.stream;
+        // Send the refusal through the bounded control path; dropping the
+        // stream then just frees its table entry (generation-checked).
+        stream.disarm_drop_reset();
+        mux.spawn_control_send(peer, Frame::Reset { sid, code: 0x01 });
+    }
+}
+
 fn handle_data(mux: &Arc<MeshMux>, peer: PubKey, sid: StreamId, seq: u32, data: Vec<u8>) {
     let Some(entry) = mux.lookup_entry(&peer, sid) else {
         // Unknown stream — tell the peer to give up. Bounded fire-and-forget so
@@ -488,7 +539,7 @@ fn handle_data(mux: &Arc<MeshMux>, peer: PubKey, sid: StreamId, seq: u32, data: 
     let (outcome, ack_state) = {
         let mut r = entry.reliability.lock().expect("Reliability mutex poisoned");
         let out = r.on_recv_data(seq, data);
-        (out, r.ack_state())
+        (out, if out.send_ack { r.advertise_ack() } else { r.ack_state() })
     };
     if outcome.send_ack {
         let (ack, win) = ack_state;
@@ -517,10 +568,11 @@ fn handle_ack(mux: &Arc<MeshMux>, peer: PubKey, sid: StreamId, ack: u32, win: u3
         // Wake whenever the window grew OR the FIN got acknowledged.
         let opened = after_win > before_win || (before_close && !after_close);
         // For the retransmit_tick fast-path hint: this stream has no
-        // more retransmit work iff there's nothing unacked AND no
-        // pending close. Compute under the mutex so the write to
+        // more retransmit work iff there's nothing unacked, no pending
+        // close, AND it isn't stalled on a zero window (that needs the
+        // persist probe). Compute under the mutex so the write to
         // `has_unacked` can never race a concurrent allocate_seq.
-        let idle = r.unacked_empty() && !r.close_pending();
+        let idle = r.unacked_empty() && !r.close_pending() && !r.zero_window_stalled();
         (opened, idle)
     };
     if now_idle {
@@ -540,7 +592,7 @@ fn handle_close(mux: &Arc<MeshMux>, peer: PubKey, sid: StreamId, seq: u32) {
     let (outcome, ack_state) = {
         let mut r = entry.reliability.lock().expect("Reliability mutex poisoned");
         let out = r.on_recv_close(seq);
-        (out, r.ack_state())
+        (out, if out.send_ack { r.advertise_ack() } else { r.ack_state() })
     };
     debug!(
         "close: rx peer={} sid={} close_seq={} → ack={} win={}",
@@ -556,9 +608,12 @@ fn handle_close(mux: &Arc<MeshMux>, peer: PubKey, sid: StreamId, seq: u32) {
     }
 }
 
-async fn signal(mux: &Arc<MeshMux>, peer: &PubKey, sid: StreamId, ev: StreamEvent) {
+/// Deliver a per-stream event from the read loop. Non-blocking: a flood
+/// of OpenAck frames at one stream whose consumer isn't polling must not
+/// park demux for every other stream (see `StreamEntry::deliver`).
+fn signal(mux: &Arc<MeshMux>, peer: &PubKey, sid: StreamId, ev: StreamEvent) {
     let Some(entry) = mux.lookup_entry(peer, sid) else { return; };
-    if entry.tx.send(ev).await.is_err() {
+    if !entry.deliver(ev) {
         mux.drop_stream(peer, sid, entry.generation);
     }
 }
@@ -597,7 +652,7 @@ async fn retransmit_tick(mux: Arc<MeshMux>) {
                         seq
                     );
                     mux.spawn_control_send(entry.peer, Frame::Reset { sid: entry.sid, code: 0x06 });
-                    let _ = entry.tx.try_send(StreamEvent::Reset(0x06));
+                    entry.deliver(StreamEvent::Reset(0x06));
                     mux.drop_stream(&entry.peer, entry.sid, entry.generation);
                 }
                 Ok(due) => {
@@ -612,6 +667,19 @@ async fn retransmit_tick(mux: Arc<MeshMux>) {
                         tokio::spawn(async move {
                             let _ = mux2.send_frame(&peer, frame).await;
                         });
+                    }
+                    if let Some(seq) = due.probe {
+                        // Zero-window persist probe: an empty Data frame
+                        // the peer answers with an ACK carrying its window.
+                        // Droppable — the persist timer re-probes.
+                        trace!(
+                            "mux persist: probing zero window peer={} sid={} seq={}",
+                            hex::encode(&entry.peer[..8]), entry.sid, seq
+                        );
+                        mux.spawn_control_send(
+                            entry.peer,
+                            Frame::Data { sid: entry.sid, seq, data: Vec::new() },
+                        );
                     }
                     if let Some(job) = due.close_job {
                         debug!(
@@ -685,12 +753,14 @@ mod tests {
         StreamSender,
         Arc<Mutex<Reliability>>,
         Arc<std::sync::atomic::AtomicBool>,
+        Arc<StreamLatch>,
     ) {
         let (tx, _rx) = mpsc::channel(INBOUND_CHAN_DEPTH);
         (
             tx,
             Arc::new(Mutex::new(Reliability::default())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(StreamLatch::default()),
         )
     }
 
@@ -707,14 +777,14 @@ mod tests {
         let sid: StreamId = 0;
 
         // First Open from this peer.
-        let (tx, r, h) = inbound_parts();
-        let (gen1, stale) = mux.install_inbound(peer, sid, tx, r, h).expect("first install under cap");
+        let (tx, r, h, l) = inbound_parts();
+        let (gen1, stale) = mux.install_inbound(peer, sid, tx, r, h, l).expect("first install under cap");
         assert!(stale.is_none(), "first open has no predecessor");
 
         // Peer reconnects, re-opens the same sid.
-        let (tx, r, h) = inbound_parts();
+        let (tx, r, h, l) = inbound_parts();
         let (gen2, stale) =
-            mux.install_inbound(peer, sid, tx, r, h).expect("reopen install under cap");
+            mux.install_inbound(peer, sid, tx, r, h, l).expect("reopen install under cap");
         let stale = stale.expect("re-open must surface the displaced stale entry");
         assert_eq!(stale.generation, gen1, "stale entry carries the old generation");
         assert_ne!(gen1, gen2, "the re-opened stream gets a fresh generation");
@@ -736,8 +806,8 @@ mod tests {
         let peer: PubKey = [0x07; 32];
         let sid: StreamId = 3;
 
-        let (tx, r, h) = inbound_parts();
-        let (generation, _) = mux.install_inbound(peer, sid, tx, r, h).expect("install under cap");
+        let (tx, r, h, l) = inbound_parts();
+        let (generation, _) = mux.install_inbound(peer, sid, tx, r, h, l).expect("install under cap");
 
         mux.drop_stream(&peer, sid, generation.wrapping_sub(1));
         assert!(mux.lookup_entry(&peer, sid).is_some(), "wrong-gen drop must not evict");
@@ -753,31 +823,150 @@ mod tests {
         // Fill exactly the cap with distinct sids; remember sid 0's generation.
         let mut gen0 = 0u64;
         for sid in 0..MAX_STREAMS_PER_PEER {
-            let (tx, r, h) = inbound_parts();
-            let (g, _) = mux.install_inbound(peer, sid, tx, r, h).expect("install under cap");
+            let (tx, r, h, l) = inbound_parts();
+            let (g, _) = mux.install_inbound(peer, sid, tx, r, h, l).expect("install under cap");
             if sid == 0 {
                 gen0 = g;
             }
         }
         // The next NEW sid is refused (None → read_loop sends a Reset).
-        let (tx, r, h) = inbound_parts();
+        let (tx, r, h, l) = inbound_parts();
         assert!(
-            mux.install_inbound(peer, MAX_STREAMS_PER_PEER, tx, r, h).is_none(),
+            mux.install_inbound(peer, MAX_STREAMS_PER_PEER, tx, r, h, l).is_none(),
             "Open beyond the per-peer cap must be refused"
         );
         // The cap is per-peer: a different peer is unaffected.
         let other: PubKey = [0x22; 32];
-        let (tx, r, h) = inbound_parts();
+        let (tx, r, h, l) = inbound_parts();
         assert!(
-            mux.install_inbound(other, 0, tx, r, h).is_some(),
+            mux.install_inbound(other, 0, tx, r, h, l).is_some(),
             "cap is per-peer, not global"
         );
         // Freeing one of the saturated peer's slots admits a new Open again.
         mux.drop_stream(&peer, 0, gen0);
-        let (tx, r, h) = inbound_parts();
+        let (tx, r, h, l) = inbound_parts();
         assert!(
-            mux.install_inbound(peer, MAX_STREAMS_PER_PEER, tx, r, h).is_some(),
+            mux.install_inbound(peer, MAX_STREAMS_PER_PEER, tx, r, h, l).is_some(),
             "a freed slot must admit a new Open"
         );
+    }
+
+    fn conn() -> Arc<PacketConn> {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        Arc::new(PacketConn::new(sk))
+    }
+
+    /// Install an inbound stream directly and return the live MeshStream
+    /// plus a sender into its event channel (to simulate a flood).
+    fn inbound_stream(mux: &Arc<MeshMux>, peer: PubKey, sid: StreamId) -> (MeshStream, StreamSender) {
+        let (tx, rx) = mpsc::channel(INBOUND_CHAN_DEPTH);
+        let (_, r, h, l) = inbound_parts();
+        let (generation, _) = mux
+            .install_inbound(peer, sid, tx.clone(), r.clone(), h.clone(), l.clone())
+            .expect("install under cap");
+        (MeshStream::new(mux.clone(), peer, sid, generation, rx, r, h, l), tx)
+    }
+
+    /// Client / mesh modes drop the accept receiver. An Open flood must be
+    /// refused (and its table entries freed) instead of blocking the read
+    /// loop on a channel nobody drains.
+    #[tokio::test]
+    async fn opens_refused_when_not_accepting() {
+        let (mux, accept_rx) = MeshMux::new(conn());
+        drop(accept_rx);
+        let peer: PubKey = [0x33; 32];
+        // Far more than the 64-deep accept queue: the old awaiting send
+        // would never return past the 65th.
+        for sid in 0..200 {
+            handle_open(&mux, peer, sid, OpenTarget::Egress);
+        }
+        for sid in 0..200 {
+            assert!(mux.lookup_entry(&peer, sid).is_none(), "refused Open sid={sid} must not linger");
+        }
+    }
+
+    /// An exit whose acceptor is backlogged refuses the overflow with a
+    /// Reset rather than parking the read loop on the full queue.
+    #[tokio::test]
+    async fn opens_beyond_accept_backlog_are_refused_not_awaited() {
+        let (mux, mut accept_rx) = MeshMux::new(conn());
+        let peer: PubKey = [0x34; 32];
+        for sid in 0..100 {
+            handle_open(&mux, peer, sid, OpenTarget::Egress);
+        }
+        let mut queued = Vec::new();
+        while let Ok(acc) = accept_rx.try_recv() {
+            queued.push(acc);
+        }
+        assert_eq!(queued.len(), 64, "exactly the accept-queue depth is queued");
+        assert!(mux.lookup_entry(&peer, 63).is_some(), "queued streams stay live");
+        assert!(mux.lookup_entry(&peer, 64).is_none(), "overflow Opens are refused");
+    }
+
+    /// OpenAck into a stream whose event channel is full must neither block
+    /// the read loop nor be lost.
+    #[tokio::test]
+    async fn open_ack_survives_full_event_channel_without_blocking() {
+        let mux = test_mux();
+        let peer: PubKey = [0x44; 32];
+        let (mut stream, tx) = inbound_stream(&mux, peer, 7);
+        for _ in 0..INBOUND_CHAN_DEPTH {
+            tx.try_send(StreamEvent::WakeRead).unwrap();
+        }
+        // `signal` is synchronous now; a flood of these can't park demux.
+        for _ in 0..1000 {
+            signal(&mux, &peer, 7, StreamEvent::OpenAck(0x00));
+        }
+        let code = tokio::time::timeout(Duration::from_secs(2), stream.await_open_ack())
+            .await
+            .expect("await_open_ack must not hang")
+            .expect("OpenAck delivered");
+        assert_eq!(code, 0x00);
+    }
+
+    /// Same for Reset: latched through a full channel and surfaced on read.
+    #[tokio::test]
+    async fn reset_survives_full_event_channel() {
+        use tokio::io::AsyncReadExt;
+        let mux = test_mux();
+        let peer: PubKey = [0x45; 32];
+        let (mut stream, tx) = inbound_stream(&mux, peer, 8);
+        for _ in 0..INBOUND_CHAN_DEPTH {
+            tx.try_send(StreamEvent::WakeRead).unwrap();
+        }
+        let entry = mux.lookup_entry(&peer, 8).unwrap();
+        assert!(entry.deliver(StreamEvent::Reset(0x05)), "consumer still alive");
+        let mut buf = [0u8; 16];
+        let err = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .expect("read must not hang")
+            .expect_err("reset surfaces as an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+
+    /// Lost-wakeup regression: poll_write on a closed window drains the
+    /// event channel; if that consumed the event it would park on (here a
+    /// Reset) it must re-check instead of returning Pending forever.
+    #[tokio::test]
+    async fn poll_write_rechecks_after_draining_events() {
+        use std::task::Poll;
+        use tokio::io::AsyncWrite;
+        let mux = test_mux();
+        let peer: PubKey = [0x46; 32];
+        let (mut stream, _tx) = inbound_stream(&mux, peer, 9);
+        let entry = mux.lookup_entry(&peer, 9).unwrap();
+        // Peer advertised a zero window: poll_write can't allocate.
+        entry.reliability.lock().unwrap().on_recv_ack(0, 0, Instant::now());
+        // The event arrives before poll_write gets to its drain.
+        entry.deliver(StreamEvent::Reset(0x01));
+        // A SINGLE poll must resolve: once the drain has consumed the event
+        // nothing will wake a parked writer again (a timeout wrapper would
+        // mask that by re-polling when its timer fires).
+        let mut stream = std::pin::Pin::new(&mut stream);
+        let first = std::future::poll_fn(|cx| Poll::Ready(stream.as_mut().poll_write(cx, b"x"))).await;
+        match first {
+            Poll::Ready(Err(e)) => assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset),
+            other => panic!("poll_write parked on a consumed wake: {other:?}"),
+        }
     }
 }
