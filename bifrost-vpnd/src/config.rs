@@ -110,10 +110,23 @@ pub struct ExitSettings {
     #[serde(default)]
     pub min_client_pow_bits: u32,
 
+    /// Lease reclamation idle floor, in seconds. When the pool is full, a
+    /// newcomer may take over the least-recently-active lease — but only one
+    /// with no live session, whose owner isn't connected, and that has been
+    /// idle at least this long (default 600 = 10 min). A freshly freed
+    /// address would otherwise reach the new client while the old one's
+    /// conntrack / NAT state and in-flight replies are still live; the exit
+    /// also flushes that state (`conntrack -D`, best-effort) on reclaim.
+    /// With no lease past the floor a full pool refuses the newcomer.
+    /// 0 reclaims immediately (not recommended).
+    #[serde(default = "default_reclaim_min_idle_secs")]
+    pub reclaim_min_idle_secs: u64,
+
     /// SSRF defence: block client packets destined to the exit's own
     /// internal/private ranges before the kernel routes them out. Loopback,
     /// link-local (incl. 169.254.169.254 cloud metadata), multicast,
-    /// broadcast and unspecified are ALWAYS blocked. With this enabled (the
+    /// broadcast, 0.0.0.0/8, the 6to4 / NAT64 ranges and the exit host's own
+    /// interface addresses are ALWAYS blocked. With this enabled (the
     /// default) RFC1918 (10/8, 172.16/12, 192.168/16), CGNAT 100.64/10 and
     /// IPv6 ULA fc00::/7 are blocked too. Set false for a split-tunnel exit
     /// that is *meant* to reach a private LAN (then scope it with `dst_allow`).
@@ -133,6 +146,7 @@ pub struct ExitSettings {
 }
 
 fn default_true() -> bool { true }
+fn default_reclaim_min_idle_secs() -> u64 { crate::egress::RECLAIM_MIN_IDLE_SECS_DEFAULT }
 
 impl Default for ExitSettings {
     fn default() -> Self {
@@ -147,6 +161,7 @@ impl Default for ExitSettings {
             admin_socket: default_admin_socket_exit(),
             allowed_clients: Vec::new(),
             min_client_pow_bits: 0,
+            reclaim_min_idle_secs: default_reclaim_min_idle_secs(),
             block_private_dst: true,
             dst_allow: Vec::new(),
             dst_deny: Vec::new(),
@@ -338,6 +353,9 @@ allowed_clients = [
 # Per-identity admission cost: minimum norn key difficulty (leading 1-bits
 # of BLAKE2b(pub_key)) a client key needs. 0 disables.
 min_client_pow_bits = 0
+# A full pool reclaims only leases idle (no session, owner offline) at least
+# this long, and flushes their conntrack state; otherwise it refuses.
+reclaim_min_idle_secs = 600
 # bifrost-ctl admin socket (Status / Peers / Leases / EvictLease).
 admin_socket = "/run/bifrost/vpnd-exit.sock"
 
@@ -396,6 +414,7 @@ mod tests {
         assert_eq!(cfg.exit.min_client_pow_bits, 0);
         assert!(cfg.exit.admission().unwrap().is_open());
         assert_eq!(cfg.exit.admin_socket, "/run/bifrost/vpnd-exit.sock");
+        assert_eq!(cfg.exit.reclaim_min_idle_secs, 600, "reclamation needs a 10 min idle floor");
         assert_eq!(ClientSettings::default().admin_socket, "/run/bifrost/vpnd-client.sock");
     }
 

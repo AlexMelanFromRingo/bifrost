@@ -39,7 +39,10 @@ impl HostTun {
         // caller-owned fd; `OwnedFd` now owns it.
         let owned = unsafe { OwnedFd::from_raw_fd(raw) };
         Ok(Self {
-            fd: AsyncFd::new(owned)?,
+            // SAFETY: `owned` is an `OwnedFd`: the descriptor is open, owned
+            // solely by this AsyncFd, and `as_raw_fd()` is stable for its
+            // whole lifetime — exactly `AsyncFd::register`'s contract.
+            fd: unsafe { AsyncFd::register(owned) }?,
         })
     }
 }

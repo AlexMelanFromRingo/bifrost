@@ -17,8 +17,9 @@ mode = "exit"
 
 # Destination filtering (SSRF defence). Every CONNECT target is resolved and
 # EVERY resolved address is checked before dialing. Loopback, link-local (incl.
-# the 169.254.169.254 cloud-metadata endpoint), multicast, broadcast and
-# unspecified are ALWAYS refused. With block_private_dst = true (the default)
+# the 169.254.169.254 cloud-metadata endpoint), multicast, broadcast, 0.0.0.0/8,
+# the 6to4 / NAT64 ranges and the exit host's OWN interface addresses are
+# ALWAYS refused. With block_private_dst = true (the default)
 # RFC1918 (10/8, 172.16/12, 192.168/16), CGNAT 100.64/10 and IPv6 ULA fc00::/7
 # are refused too, so a client can't pivot to the exit's internal network.
 [exit]

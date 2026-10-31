@@ -56,7 +56,7 @@
 //!   ioctl(fd, TUNSETIFF, &ifr { name = "bif-eg0", flags = IFF_TUN | IFF_NO_PI | IFF_VNET_HDR })
 //!   ioctl(fd, TUNSETOFFLOAD, TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6)
 //!   fd.set_nonblocking(true)
-//!   AsyncFd::new(fd)
+//!   AsyncFd::register(fd)
 //!
 //!   on read:
 //!     let buf = recv up to 64 KiB

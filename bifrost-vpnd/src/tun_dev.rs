@@ -244,7 +244,10 @@ impl OffloadTun {
         set_mtu(&finalised_name, mtu)?;
 
         Ok(Self {
-            fd: AsyncFd::new(owned)?,
+            // SAFETY: `owned` is an `OwnedFd`: the descriptor is open, owned
+            // solely by this AsyncFd, and `as_raw_fd()` is stable for its
+            // whole lifetime — exactly `AsyncFd::register`'s contract.
+            fd: unsafe { AsyncFd::register(owned) }?,
             name: finalised_name,
             mtu,
             offload_active,

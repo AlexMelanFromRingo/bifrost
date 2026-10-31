@@ -263,15 +263,24 @@ allowed_clients     = ["<client-pub-key-hex>"]
 # Per-identity cost: minimum norn key difficulty (leading 1-bits of
 # BLAKE2b(pub_key), same measure as norn's Sybil threshold). 0 = off.
 min_client_pow_bits = 0
+# A full pool reclaims only leases idle this long (see below). 0 = immediately
+# (not recommended: the newcomer inherits the old owner's conntrack state).
+reclaim_min_idle_secs = 600
 admin_socket        = "/run/bifrost/vpnd-exit.sock"   # dir created 0700
 ```
 
 Leases are sticky per pub key (and survive restarts with
 `lease_persistence_path`). When the pool is full, the exit **reclaims the
 least-recently-active lease** whose peer has no live egress session and isn't
-connected; a lease in active use is never taken — if all are live, the new
-client is refused. Last activity is persisted, so the order survives restarts.
-Persisted leases of keys that are no longer admitted are dropped at startup.
+connected, **and only once it has been idle for `reclaim_min_idle_secs`**
+(default 600 = 10 min); a lease in active use is never taken — if none
+qualifies, the new client is refused. The idle floor is what makes reclamation
+safe: a reclaimed address goes straight to the newcomer, who would otherwise
+inherit the previous owner's live conntrack / NAT state and in-flight replies.
+On reclaim the exit also flushes that state best-effort (`conntrack -D -s/-d
+<ip>`; skipped if `conntrack` isn't installed). Last activity is persisted, so
+the order survives restarts. Persisted leases of keys that are no longer
+admitted are dropped at startup.
 
 `bifrost-vpnd`-specific (client mode):
 
@@ -287,6 +296,12 @@ admin_socket          = "/run/bifrost/vpnd-client.sock"
 # it (stops a malicious exit from routing public prefixes into the tunnel).
 # allowed_lease_cidrs = ["198.18.0.0/15"]   # explicit opt-in only
 ```
+
+The client also refuses a lease subnet that overlaps any existing route or
+interface address on the host (LAN, docker bridges, another VPN — anything not
+on its own TUN; the default route is ignored), and installs the lease route
+with `ip route add`, never `replace`, so an existing route is never silently
+overwritten. Needs iproute2 with `-j` (JSON) support.
 
 See `examples/*.toml` for ready-to-edit templates.
 
@@ -370,16 +385,20 @@ What this protocol protects:
   ACK rejects duplicates and reassembles in order).
 * **Egress destination filtering (SSRF defence)** at the exit. Client packets
   aimed at the exit's loopback, link-local (incl. cloud metadata
-  `169.254.169.254` / `fd00:ec2::254`), RFC1918 / CGNAT / IPv6-ULA (by default),
-  or IPv4-mapped / 6to4 / NAT64 IPv6 wrappers of those, are dropped before the
-  kernel routes them — so the exit can't be used as an SSRF pivot into the
-  operator's infrastructure. Configurable allow/deny CIDRs for split-tunnel.
+  `169.254.169.254` / `fd00:ec2::254`), `0.0.0.0/8`, RFC1918 / CGNAT / IPv6-ULA
+  (by default), IPv4-mapped / -compatible / -translated IPv6 wrappers of those,
+  the 6to4 and NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`) ranges, and **the exit
+  host's own interface addresses** (public / LAN / TUN, re-enumerated every
+  60 s), are dropped before the kernel routes them — so the exit can't be used
+  as an SSRF pivot into the operator's infrastructure or its own services.
+  Configurable allow/deny CIDRs for split-tunnel.
 * **Exit admission** (`bifrost-vpnd`): optional client allowlist and a
-  per-identity key-difficulty bar; a full lease pool reclaims idle leases
-  instead of locking new clients out.
+  per-identity key-difficulty bar; a full lease pool reclaims leases idle for
+  `reclaim_min_idle_secs` instead of locking new clients out.
 * **Client-side lease validation** (`bifrost-vpnd`): an exit can't push a
   lease/gateway outside private space (or the client's explicit
-  `allowed_lease_cidrs`), so it can't hijack a split-tunnel client's routes.
+  `allowed_lease_cidrs`), so it can't hijack a split-tunnel client's routes;
+  a lease overlapping the client's existing routes / addresses is refused.
 
 What this protocol does **not** protect:
 

@@ -34,15 +34,21 @@ allowed_clients = [
 # doubles the work to grind a throwaway key. 0 = disabled.
 min_client_pow_bits = 0
 # When the pool is full, the least-recently-active lease with no live session
-# (and whose peer isn't connected) is reclaimed; live leases never are.
+# (and whose peer isn't connected) is reclaimed — but only once it has been
+# idle at least reclaim_min_idle_secs, and its conntrack state is flushed
+# (best-effort, needs the `conntrack` tool). Live leases never are; with none
+# past the idle floor the newcomer is refused. 0 = reclaim immediately (not
+# recommended: the new client inherits the old one's NAT state / replies).
+reclaim_min_idle_secs = 600
 
 # bifrost-ctl admin socket. The parent dir is created 0700 if missing and
 # the socket is chmod 0600. "" disables.
 admin_socket = "/run/bifrost/vpnd-exit.sock"
 
 # Destination filtering (SSRF defence). Loopback, link-local (incl. the
-# 169.254.169.254 cloud-metadata endpoint), multicast, broadcast and
-# unspecified are ALWAYS dropped. With block_private_dst = true (the default)
+# 169.254.169.254 cloud-metadata endpoint), multicast, broadcast, 0.0.0.0/8,
+# the 6to4 / NAT64 ranges and the exit host's OWN interface addresses are
+# ALWAYS dropped. With block_private_dst = true (the default)
 # RFC1918 (10/8, 172.16/12, 192.168/16), CGNAT 100.64/10 and IPv6 ULA fc00::/7
 # are dropped too, so a client can't pivot to the exit's internal network.
 block_private_dst = true

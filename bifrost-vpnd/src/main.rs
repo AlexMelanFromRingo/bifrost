@@ -130,6 +130,15 @@ async fn run_exit(
         )
         .context("invalid exit destination filter (block_private_dst / dst_allow / dst_deny)")?,
     );
+    // The exit host's own addresses (public / LAN / egress TUN) are always
+    // blocked so a client can't reach services bound on the exit itself.
+    // Re-enumerated periodically (DHCP / NIC changes) and once more by
+    // start_exit after it puts the gateway address on the egress TUN.
+    let n_local = dst_filter
+        .refresh_local_addrs()
+        .context("enumerating local interface addresses for the destination filter")?;
+    dst_filter.spawn_local_addr_refresh(bifrost_vpnd::dst_filter::LOCAL_ADDR_REFRESH);
+    info!("exit: {n_local} local address(es) blocked as egress destinations");
     let admission = Arc::new(
         cfg.exit
             .admission()
@@ -148,6 +157,7 @@ async fn run_exit(
         cfg.exit.admin_socket.clone(),
         dst_filter,
         admission,
+        cfg.exit.reclaim_min_idle_secs,
     )
     .await
 }
