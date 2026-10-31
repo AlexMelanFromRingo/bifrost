@@ -209,3 +209,12 @@ and pushing the docker harness past 300 nodes to find the real knee.
 * **Inline lz4/zstd compression on the wire.** Encrypted bytes are
   high-entropy; compression buys 0–2 % and costs a per-packet CPU
   tax that hurts more than it helps.
+
+## Libraries worth studying
+
+Before building NAT traversal, relays or new link types here, look at
+**Reticulum** (<https://reticulum.network>), **rust-libp2p**
+(<https://github.com/libp2p/rust-libp2p>) and **iroh**
+(<https://github.com/n0-computer/iroh>) — see
+[norn-rs/docs/PRIOR-ART.md](https://github.com/AlexMelanFromRingo/norn-rs/blob/master/docs/PRIOR-ART.md)
+for what each is good for.

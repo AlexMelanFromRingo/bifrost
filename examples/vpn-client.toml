@@ -18,12 +18,20 @@ tun_name              = "bifrost-eg0"
 # gateway. Off by default: it's a global change and you should opt in
 # explicitly once you trust the exit operator.
 install_default_route = false
+# bifrost-ctl admin socket (dir created 0700, socket 0600). "" disables.
+admin_socket          = "/run/bifrost/vpnd-client.sock"
+# The exit is untrusted. Its lease subnet must lie in RFC1918 (10/8,
+# 172.16/12, 192.168/16), CGNAT 100.64/10 or ULA fc00::/7, with the gateway
+# inside the same subnet — otherwise the client refuses the lease, so a
+# malicious exit can't route public prefixes into the tunnel. Add CIDRs here
+# only for an exit you trust with other address space.
+# allowed_lease_cidrs = ["198.18.0.0/15"]
 
 [node]
 private_key = "REPLACE_ME_WITH_GENCONFIG_OUTPUT"
 listen = ["tcp://0.0.0.0:9001"]
 peers = ["tcp://<EXIT-HOST>:9001"]
-admin_socket = "/tmp/bifrost-vpn-client.sock"
+admin_socket = "/run/bifrost/norn-vpn-client.sock"
 peer_cache_path = ""
 multicast_enabled = false
 mdns_enabled = false

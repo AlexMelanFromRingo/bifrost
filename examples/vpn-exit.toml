@@ -18,6 +18,28 @@ pool_base    = "10.55.0.0"
 pool_prefix  = 24                # /24 = 253 client leases
 egress_iface = "eth0"            # interface that gets MASQUERADE'd
 
+# Persist peer → lease (and last-activity) so clients keep their IP across
+# exit restarts. Empty disables persistence.
+# lease_persistence_path = "/var/lib/bifrost/leases.json"
+
+# Client admission. ed25519 identities are free to mint and every admitted
+# key gets a sticky lease, so an open exit can have its pool filled by
+# throwaway keys. List the clients you serve (hex pub keys). Empty = open
+# exit (a warning is logged at startup).
+allowed_clients = [
+  # "<CLIENT-PUBKEY-HEX>",
+]
+# Per-identity admission cost: minimum norn key difficulty (leading 1-bits
+# of BLAKE2b(pub_key) — same measure as norn's Sybil threshold). Each bit
+# doubles the work to grind a throwaway key. 0 = disabled.
+min_client_pow_bits = 0
+# When the pool is full, the least-recently-active lease with no live session
+# (and whose peer isn't connected) is reclaimed; live leases never are.
+
+# bifrost-ctl admin socket. The parent dir is created 0700 if missing and
+# the socket is chmod 0600. "" disables.
+admin_socket = "/run/bifrost/vpnd-exit.sock"
+
 # Destination filtering (SSRF defence). Loopback, link-local (incl. the
 # 169.254.169.254 cloud-metadata endpoint), multicast, broadcast and
 # unspecified are ALWAYS dropped. With block_private_dst = true (the default)
@@ -34,7 +56,7 @@ block_private_dst = true
 private_key = "REPLACE_ME_WITH_GENCONFIG_OUTPUT"
 listen = ["tcp://0.0.0.0:9001"]
 peers = []
-admin_socket = "/tmp/bifrost-vpn-exit.sock"
+admin_socket = "/run/bifrost/norn-vpn-exit.sock"
 peer_cache_path = "/var/lib/bifrost/vpn-exit-peers.json"
 multicast_enabled = false
 mdns_enabled = false

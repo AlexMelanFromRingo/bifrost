@@ -31,7 +31,7 @@ use bifrost_core::admin_proto::{
     StatusResponse,
 };
 use norn_rs::router::PacketConn;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tracing::{debug, info, warn};
 
@@ -69,38 +69,27 @@ impl AdminMode {
     }
 }
 
+/// Max bytes of one admin request line (matches `bifrost-socks5d`). A
+/// client that never sends `\n` can't make us buffer without bound.
+pub const MAX_ADMIN_REQUEST: u64 = 64 * 1024;
+
 /// Bind the UNIX socket at `path` (0600) and dispatch incoming
 /// requests in tokio tasks until the listener is dropped. Returns
 /// immediately after spawning the accept loop; caller keeps the
 /// state alive for the daemon lifetime.
+///
+/// Permissions without touching the process-global umask (which, in a
+/// multithreaded runtime, would race every other thread creating files):
+/// a missing parent directory is created `0700` first, so nobody else can
+/// reach the socket in the instant between `bind` and the `chmod 0600`
+/// that follows. An existing parent that is group/world-writable is
+/// warned about (e.g. a socket configured under `/tmp`).
 pub fn spawn_listener(path: PathBuf, state: AdminState) -> Result<()> {
     if path.as_os_str().is_empty() {
         info!("vpnd admin socket disabled (empty path)");
         return Ok(());
     }
-    // Remove any stale socket file from a prior crashed run; the
-    // bind would fail with EADDRINUSE otherwise.
-    let _ = std::fs::remove_file(&path);
-    // Use a tight umask around the bind so the socket lands at 0600
-    // (the default on Linux is 0777-umask). We restore the umask
-    // immediately so we don't leak this restriction to other code
-    // paths in the same process.
-    #[cfg(unix)]
-    let _g = {
-        struct UmaskGuard(libc::mode_t);
-        impl Drop for UmaskGuard {
-            fn drop(&mut self) {
-                // SAFETY: umask is process-global; restoring the
-                // previous mask is the canonical pattern.
-                unsafe { libc::umask(self.0); }
-            }
-        }
-        // SAFETY: setting + reading the umask is process-global
-        // but always defined.
-        let prev = unsafe { libc::umask(0o077) };
-        UmaskGuard(prev)
-    };
-    let listener = UnixListener::bind(&path)?;
+    let listener = bind_private(&path)?;
     info!("vpnd admin socket at {path:?} (mode 0600)");
     tokio::spawn(async move {
         loop {
@@ -123,22 +112,70 @@ pub fn spawn_listener(path: PathBuf, state: AdminState) -> Result<()> {
     Ok(())
 }
 
+/// Create the parent dir (0700) if needed, bind, then chmod the socket 0600.
+fn bind_private(path: &std::path::Path) -> Result<UnixListener> {
+    use anyhow::Context as _;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        if !dir.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .with_context(|| format!("creating admin socket dir {dir:?}"))?;
+            // `mode` is filtered by the umask; force exactly 0700.
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("chmod 0700 {dir:?}"))?;
+        } else if let Ok(md) = std::fs::metadata(dir)
+            && md.permissions().mode() & 0o022 != 0
+        {
+            warn!(
+                "vpnd admin socket dir {dir:?} is group/world-writable; prefer a private \
+                 directory such as /run/bifrost (created 0700 automatically)"
+            );
+        }
+    }
+    // Remove any stale socket file from a prior crashed run; the bind
+    // would fail with EADDRINUSE otherwise.
+    let _ = std::fs::remove_file(path);
+    let listener = UnixListener::bind(path)
+        .with_context(|| format!("binding admin socket {path:?}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 0600 on admin socket {path:?}"))?;
+    }
+    Ok(listener)
+}
+
 async fn handle_client(
     stream: tokio::net::UnixStream,
     state: &AdminState,
 ) -> Result<()> {
     let (r, mut w) = stream.into_split();
-    let mut reader = BufReader::new(r);
-    let mut line = String::new();
-    reader.read_line(&mut line).await?;
-    let req: AdminRequest = serde_json::from_str(line.trim())
-        .map_err(|e| anyhow::anyhow!("malformed admin request: {e}"))?;
-    let response = dispatch(req, state);
+    let line = read_request_line(r).await?;
+    let response = match serde_json::from_str::<AdminRequest>(line.trim()) {
+        Ok(req) => dispatch(req, state),
+        Err(e) => AdminResponse::err(format!("bad request: {e}")),
+    };
     let body = serde_json::to_string(&response)?;
     w.write_all(body.as_bytes()).await?;
     w.write_all(b"\n").await?;
     w.shutdown().await.ok();
     Ok(())
+}
+
+/// Read one request line, capped at [`MAX_ADMIN_REQUEST`] bytes.
+async fn read_request_line<R: tokio::io::AsyncRead + Unpin>(r: R) -> Result<String> {
+    let mut line = String::new();
+    let mut bounded = BufReader::new(r).take(MAX_ADMIN_REQUEST);
+    bounded.read_line(&mut line).await?;
+    if !line.ends_with('\n') && line.len() as u64 >= MAX_ADMIN_REQUEST {
+        anyhow::bail!("admin request exceeds {MAX_ADMIN_REQUEST} bytes");
+    }
+    Ok(line)
 }
 
 fn dispatch(req: AdminRequest, state: &AdminState) -> AdminResponse {
@@ -213,16 +250,17 @@ fn snapshot_leases(state: &AdminState) -> LeasesResponse {
             }
         });
 
-    // Exit: snapshot the full EgressTable; persisted-but-disconnected
-    // entries are surfaced as `live=false` so an operator can tell
-    // sticky reserves apart from active sessions.
+    // Exit: snapshot the full EgressTable. `live` = the lease has an active
+    // egress session right now; sticky reserves (disconnected, or reseeded
+    // from disk and not yet resumed) show as `live=false`.
     if let Some(table) = &state.table {
-        let live_map: std::collections::HashMap<_, _> = table
-            .lock()
-            .unwrap()
-            .snapshot()
-            .into_iter()
-            .collect();
+        let live_map: std::collections::HashMap<_, _> = {
+            let t = table.lock().unwrap();
+            t.snapshot()
+                .into_iter()
+                .map(|(p, l)| (p, (l, t.sessions_of(&p) > 0)))
+                .collect()
+        };
         let persisted: Vec<(bifrost_core::PubKey, Lease)> = state
             .lease_store
             .as_ref()
@@ -234,7 +272,7 @@ fn snapshot_leases(state: &AdminState) -> LeasesResponse {
                 pub_key: hex::encode(p),
                 v4: l.v4.to_string(),
                 v6: l.v6.map(|v| v.to_string()),
-                live: live_map.contains_key(p),
+                live: live_map.get(p).is_some_and(|(_, live)| *live),
             })
             .collect();
         // Surface in-memory-only rows too (rare but possible:
@@ -243,13 +281,13 @@ fn snapshot_leases(state: &AdminState) -> LeasesResponse {
         // present in `persisted`.
         let seen: std::collections::HashSet<bifrost_core::PubKey> =
             persisted.iter().map(|(p, _)| *p).collect();
-        for (p, l) in live_map {
+        for (p, (l, live)) in live_map {
             if !seen.contains(&p) {
                 rows.push(LeaseRow {
                     pub_key: hex::encode(p),
                     v4: l.v4.to_string(),
                     v6: l.v6.map(|v| v.to_string()),
-                    live: true,
+                    live,
                 });
             }
         }
@@ -289,23 +327,25 @@ fn evict_lease(state: &AdminState, hex_key: &str) -> AdminResponse {
     let pool = state.pool.as_ref().expect("exit mode invariant: pool is set");
     let table = state.table.as_ref().expect("exit mode invariant: table is set");
 
-    // Acquire-and-release in one critical section per Mutex so we
-    // never hold two locks at once (the data plane locks pool and
-    // table independently — overlapping them risks an ordering
-    // deadlock with the handshake path).
-    let removed = table.lock().unwrap().remove_peer(&peer);
+    // Pool → table, the same order as the handshake path, held together so
+    // the slot can't be re-allocated between the table removal and release.
+    let removed = {
+        let mut p = pool.lock().unwrap();
+        let removed = table.lock().unwrap().remove_peer(&peer);
+        if let Some(lease) = removed {
+            p.release(lease);
+        }
+        removed
+    };
     if let Some(lease) = removed {
-        pool.lock().unwrap().release(lease);
-        if let Some(store) = &state.lease_store {
-            let mut s = store.lock().unwrap();
-            s.remove(&peer);
-            if let Err(e) = s.save() {
-                warn!(
-                    "evict-lease: persistence save failed for {}: {e:#} \
-                     (in-memory state is correct; will retry on next change)",
-                    &hex_key[..16.min(hex_key.len())]
-                );
-            }
+        if let Some(store) = &state.lease_store
+            && let Err(e) = crate::egress::persist_leases(table, store)
+        {
+            warn!(
+                "evict-lease: persistence save failed for {}: {e:#} \
+                 (in-memory state is correct; will retry on next change)",
+                &hex_key[..16.min(hex_key.len())]
+            );
         }
         info!(
             "evict-lease: freed {} (was held by peer {})",
@@ -458,6 +498,52 @@ mod tests {
         assert!(table.lock().unwrap().lease_of(&peer).is_none());
     }
 
+    /// Regression: the admin read was an unbounded `read_line`, so a local
+    /// client that never sent `\n` grew our buffer without limit.
+    #[tokio::test]
+    async fn admin_request_line_is_capped() {
+        let (mut a, b) = tokio::io::duplex(1024);
+        let writer = tokio::spawn(async move {
+            let chunk = [b'x'; 4096];
+            // 4x the cap, no newline; ignore the error once the reader quits.
+            for _ in 0..(4 * MAX_ADMIN_REQUEST as usize / chunk.len()) {
+                if a.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let err = read_request_line(b).await.expect_err("oversized line must be refused");
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        writer.abort();
+
+        let (mut a, b) = tokio::io::duplex(1024);
+        a.write_all(b"\"Status\"\n").await.unwrap();
+        assert_eq!(read_request_line(b).await.unwrap().trim(), "\"Status\"");
+    }
+
+    /// The socket lands 0600 inside a freshly created 0700 directory, with
+    /// no process-global umask change.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn admin_socket_dir_0700_and_socket_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("bifrost-vpnd-admin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sock = base.join("run").join("bifrost").join("vpnd-exit.sock");
+        let before = unsafe { libc::umask(0o022) };
+        unsafe { libc::umask(before) };
+        let _listener = bind_private(&sock).unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(sock.parent().unwrap()), 0o700);
+        assert_eq!(mode(&sock), 0o600);
+        let after = unsafe { libc::umask(before) };
+        assert_eq!(after, before, "umask untouched");
+        // Re-binding over a stale socket works (daemon restart).
+        drop(_listener);
+        let _again = bind_private(&sock).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
     #[tokio::test]
     async fn snapshot_leases_marks_disconnected_persisted_as_not_live() {
         let lease_store = Arc::new(Mutex::new(LeaseStore::new("")));
@@ -470,6 +556,8 @@ mod tests {
 
         let table = Arc::new(Mutex::new(crate::egress::EgressTable::default()));
         table.lock().unwrap().insert(peer_live, lease_a);
+        // `live` = an egress session currently holds the lease.
+        table.lock().unwrap().join(&peer_live, 1);
 
         let state = AdminState {
             table: Some(table),

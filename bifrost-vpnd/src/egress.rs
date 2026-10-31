@@ -27,6 +27,7 @@
 
 use anyhow::{Context, Result};
 use bifrost_core::{
+    dst_filter::Cidr,
     frame::OpenTarget,
     mux::{AcceptedStream, MeshMux},
 };
@@ -309,7 +310,14 @@ impl EgressHello {
     /// kernel TUN + routes. The exit is untrusted to a VPN client (it chooses
     /// the lease), so reject values that would otherwise reach `ip` / the
     /// `subnet_*_cidr_str` shift math as garbage (e.g. a v4 prefix > 32).
-    pub fn validate(&self) -> Result<()> {
+    ///
+    /// Route-hijack defence: the client installs `ip route replace
+    /// <lease subnet> dev <tun>`, so the lease subnet must not cover address
+    /// space the exit has no business capturing. The gateway must sit in the
+    /// same subnet as the lease, and that subnet must lie inside RFC1918 /
+    /// CGNAT 100.64/10 (v4) or ULA fc00::/7 (v6) unless `policy` explicitly
+    /// allows a CIDR that contains it.
+    pub fn validate(&self, policy: &LeasePolicy) -> Result<()> {
         if !(16..=30).contains(&self.v4_prefix) {
             anyhow::bail!("egress hello: v4 prefix /{} out of range [16,30]", self.v4_prefix);
         }
@@ -333,7 +341,95 @@ impl EgressHello {
         if !(576..=4080).contains(&self.mtu) {
             anyhow::bail!("egress hello: implausible mtu {}", self.mtu);
         }
+
+        // ── v4: gateway in the lease subnet, subnet in allowed space ──
+        let v4_subnet = Cidr::parse(&subnet_v4_cidr_str(self.allocated_v4, self.v4_prefix))?;
+        if !v4_subnet.contains(IpAddr::V4(self.gateway_v4)) {
+            anyhow::bail!(
+                "egress hello: gateway {} is outside the lease subnet of {}/{}",
+                self.gateway_v4, self.allocated_v4, self.v4_prefix
+            );
+        }
+        let host_mask = (1u32 << (32 - self.v4_prefix as u32)) - 1;
+        for (what, a) in [("lease", self.allocated_v4), ("gateway", self.gateway_v4)] {
+            let host = u32::from(a) & host_mask;
+            if host == 0 || host == host_mask {
+                anyhow::bail!("egress hello: {what} {a} is the network/broadcast address");
+            }
+        }
+        if self.gateway_v4 == self.allocated_v4 {
+            anyhow::bail!("egress hello: gateway equals the leased address {}", self.allocated_v4);
+        }
+        if !policy.permits(&v4_subnet) {
+            anyhow::bail!(
+                "egress hello: lease subnet {} is not private (RFC1918 / 100.64/10) and not in \
+                 [client].allowed_lease_cidrs — refusing to route it into the tunnel",
+                subnet_v4_cidr_str(self.allocated_v4, self.v4_prefix)
+            );
+        }
+
+        // ── v6: same rules, ULA by default ──
+        if let Some(v6) = self.allocated_v6 {
+            let Some(gw6) = self.gateway_v6 else {
+                anyhow::bail!("egress hello: v6 lease without a v6 gateway");
+            };
+            let v6_subnet = Cidr::parse(&subnet_v6_cidr_str(v6, self.v6_prefix))?;
+            if !v6_subnet.contains(IpAddr::V6(gw6)) {
+                anyhow::bail!(
+                    "egress hello: v6 gateway {gw6} is outside the lease subnet of {v6}/{}",
+                    self.v6_prefix
+                );
+            }
+            if gw6 == v6 {
+                anyhow::bail!("egress hello: v6 gateway equals the leased address {v6}");
+            }
+            if !policy.permits(&v6_subnet) {
+                anyhow::bail!(
+                    "egress hello: v6 lease subnet {} is not ULA (fc00::/7) and not in \
+                     [client].allowed_lease_cidrs — refusing to route it into the tunnel",
+                    subnet_v6_cidr_str(v6, self.v6_prefix)
+                );
+            }
+        }
         Ok(())
+    }
+}
+
+/// Which address space a VPN client lets an (untrusted) exit place its lease
+/// subnet in. Private ranges are always permitted; `allowed_lease_cidrs` adds
+/// more. See [`EgressHello::validate`].
+#[derive(Debug, Clone, Default)]
+pub struct LeasePolicy {
+    extra: Vec<Cidr>,
+}
+
+impl LeasePolicy {
+    /// RFC1918 + CGNAT (v4) and ULA (v6) — the only ranges an exit may use
+    /// without explicit client opt-in.
+    const PRIVATE: [&'static str; 5] = [
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "100.64.0.0/10",
+        "fc00::/7",
+    ];
+
+    pub fn new(allowed_lease_cidrs: &[String]) -> Result<Self> {
+        let extra = allowed_lease_cidrs
+            .iter()
+            .map(|c| Cidr::parse(c).with_context(|| format!("[client].allowed_lease_cidrs {c:?}")))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { extra })
+    }
+
+    /// True if the whole `subnet` lies inside a private range or one of the
+    /// explicitly allowed CIDRs.
+    pub fn permits(&self, subnet: &Cidr) -> bool {
+        Self::PRIVATE
+            .iter()
+            .map(|c| Cidr::parse(c).expect("static CIDR"))
+            .chain(self.extra.iter().copied())
+            .any(|c| c.contains_cidr(subnet))
     }
 }
 
@@ -499,30 +595,68 @@ impl AddressPool {
 /// packet to; the datagram receiver looks up the source peer's
 /// allocated lease here to anti-spoof.
 ///
-/// Two maps so each direction is one O(1) lookup. They are kept in
-/// sync by `handle_egress_handshake` and never go stale because the
-/// same handshake task that registers also owns the cleanup on stream
-/// close. A dual-stack lease registers two `peer_by_ip` entries
-/// (one per family) so packets in either direction route correctly.
+/// Two maps so each direction is one O(1) lookup. A dual-stack lease
+/// registers two `peer_by_ip` entries (one per family) so packets in
+/// either direction route correctly.
+///
+/// Each lease also carries bookkeeping for its lifecycle:
+///
+/// * `sessions` — how many live egress control streams currently use it.
+///   Two handshakes from one peer can overlap (reconnect racing a stale
+///   stream); a rollback or disconnect only drops *its* reference, so a
+///   failing handshake can never free a lease another session still uses.
+/// * `generation` — unique per insert. A session remembers the generation it
+///   joined; if the entry was evicted / reclaimed / re-allocated since,
+///   the stale session's end is a no-op instead of touching the new owner.
+/// * `last_active` — unix seconds of the last handshake / disconnect;
+///   drives least-recently-active reclamation and is persisted.
 #[derive(Default)]
 pub struct EgressTable {
     /// allocated IP → owning peer
     peer_by_ip: std::collections::HashMap<IpAddr, bifrost_core::PubKey>,
-    /// peer → its allocated lease (for src-spoofing validation)
-    lease_by_peer: std::collections::HashMap<bifrost_core::PubKey, Lease>,
+    /// peer → its allocated lease + lifecycle bookkeeping
+    lease_by_peer: std::collections::HashMap<bifrost_core::PubKey, LeaseEntry>,
+    next_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LeaseEntry {
+    lease: Lease,
+    sessions: u32,
+    last_active: u64,
+    generation: u64,
 }
 
 impl EgressTable {
-    pub fn insert(&mut self, peer: bifrost_core::PubKey, lease: Lease) {
+    /// Register `peer → lease` with no live session (e.g. a sticky lease
+    /// reseeded from disk). Replaces any prior entry for `peer`.
+    pub fn insert(&mut self, peer: bifrost_core::PubKey, lease: Lease) -> u64 {
+        self.insert_with_activity(peer, lease, 0)
+    }
+
+    /// Like [`insert`](Self::insert) with an explicit `last_active` stamp.
+    /// Returns the entry's generation.
+    pub fn insert_with_activity(
+        &mut self,
+        peer: bifrost_core::PubKey,
+        lease: Lease,
+        last_active: u64,
+    ) -> u64 {
+        // Drop the old IP mappings first so a replaced lease can't leave a
+        // dangling `peer_by_ip` entry routing someone else's address here.
+        self.remove_peer(&peer);
         self.peer_by_ip.insert(IpAddr::V4(lease.v4), peer);
         if let Some(v6) = lease.v6 {
             self.peer_by_ip.insert(IpAddr::V6(v6), peer);
         }
-        self.lease_by_peer.insert(peer, lease);
+        self.next_generation += 1;
+        let generation = self.next_generation;
+        self.lease_by_peer.insert(peer, LeaseEntry { lease, sessions: 0, last_active, generation });
+        generation
     }
 
     pub fn remove_peer(&mut self, peer: &bifrost_core::PubKey) -> Option<Lease> {
-        let lease = self.lease_by_peer.remove(peer)?;
+        let lease = self.lease_by_peer.remove(peer)?.lease;
         self.peer_by_ip.remove(&IpAddr::V4(lease.v4));
         if let Some(v6) = lease.v6 {
             self.peer_by_ip.remove(&IpAddr::V6(v6));
@@ -535,14 +669,65 @@ impl EgressTable {
     }
 
     pub fn lease_of(&self, peer: &bifrost_core::PubKey) -> Option<Lease> {
-        self.lease_by_peer.get(peer).copied()
+        self.lease_by_peer.get(peer).map(|e| e.lease)
+    }
+
+    /// Number of live egress sessions holding `peer`'s lease.
+    pub fn sessions_of(&self, peer: &bifrost_core::PubKey) -> u32 {
+        self.lease_by_peer.get(peer).map_or(0, |e| e.sessions)
+    }
+
+    /// Last-activity stamp (unix seconds) of `peer`'s lease.
+    pub fn last_active_of(&self, peer: &bifrost_core::PubKey) -> Option<u64> {
+        self.lease_by_peer.get(peer).map(|e| e.last_active)
     }
 
     /// All `(peer, lease)` pairs currently in the table — used by
     /// the admin layer for the `Leases` endpoint.
     pub fn snapshot(&self) -> Vec<(bifrost_core::PubKey, Lease)> {
-        self.lease_by_peer.iter().map(|(p, l)| (*p, *l)).collect()
+        self.lease_by_peer.iter().map(|(p, e)| (*p, e.lease)).collect()
     }
+
+    /// `(peer, lease, last_active)` for persistence, in a stable order
+    /// (by v4 address) so the file diff is readable.
+    pub fn persist_snapshot(&self) -> Vec<(bifrost_core::PubKey, Lease, u64)> {
+        let mut v: Vec<_> = self
+            .lease_by_peer
+            .iter()
+            .map(|(p, e)| (*p, e.lease, e.last_active))
+            .collect();
+        v.sort_by_key(|(_, l, _)| u32::from(l.v4));
+        v
+    }
+
+    /// Join `peer`'s existing lease as one more live session.
+    pub(crate) fn join(&mut self, peer: &bifrost_core::PubKey, now: u64) -> Option<(Lease, u64)> {
+        let e = self.lease_by_peer.get_mut(peer)?;
+        e.sessions += 1;
+        e.last_active = e.last_active.max(now);
+        Some((e.lease, e.generation))
+    }
+
+    /// The reclamation victim when the pool is full: the least-recently-
+    /// active lease with no live session whose peer isn't connected. Never
+    /// a lease in use. Ties break on the lower v4 address (deterministic).
+    fn reclaim_victim(
+        &self,
+        connected: &std::collections::HashSet<bifrost_core::PubKey>,
+    ) -> Option<bifrost_core::PubKey> {
+        self.lease_by_peer
+            .iter()
+            .filter(|(p, e)| e.sessions == 0 && !connected.contains(*p))
+            .min_by_key(|(_, e)| (e.last_active, u32::from(e.lease.v4)))
+            .map(|(p, _)| *p)
+    }
+}
+
+/// Unix seconds now (0 if the clock is before the epoch).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 pub type SharedTable = Arc<Mutex<EgressTable>>;
@@ -705,15 +890,19 @@ pub fn configure_client_kernel(
     gateway_v6: Option<Ipv6Addr>,
     install_default_route: bool,
 ) -> Result<()> {
+    // Routes are derived from the LEASED address; `EgressHello::validate`
+    // has already pinned the gateway into that same (private or
+    // explicitly allowed) subnet, so the exit can't steer this route.
     let v4_cidr = format!("{}/{}", v4_addr, v4_prefix);
-    let v4_subnet = subnet_v4_cidr_str(gateway_v4, v4_prefix);
+    let v4_subnet = subnet_v4_cidr_str(v4_addr, v4_prefix);
     run_cmd("ip", &["link", "set", tun_name, "up"])?;
     let _ = Command::new("ip").args(["addr", "add", &v4_cidr, "dev", tun_name]).status();
     let _ = Command::new("ip").args(["route", "replace", &v4_subnet, "dev", tun_name]).status();
 
-    if let (Some(v6), Some(gw6)) = (v6_addr, gateway_v6) {
+    // The v6 gateway is on-link inside `v6_subnet` (validated).
+    if let (Some(v6), Some(_)) = (v6_addr, gateway_v6) {
         let v6_cidr = format!("{}/{}", v6, v6_prefix);
-        let v6_subnet = subnet_v6_cidr_str(gw6, v6_prefix);
+        let v6_subnet = subnet_v6_cidr_str(v6, v6_prefix);
         let _ = Command::new("ip").args(["-6", "addr", "add", &v6_cidr, "dev", tun_name]).status();
         let _ = Command::new("ip").args(["-6", "route", "replace", &v6_subnet, "dev", tun_name]).status();
     }
@@ -773,7 +962,26 @@ pub async fn start_exit(
     lease_persistence_path: String,
     admin_socket: String,
     dst_filter: Arc<crate::dst_filter::DstFilter>,
+    admission: Arc<crate::admission::ExitAdmission>,
 ) -> Result<()> {
+    if admission.is_open() {
+        warn!(
+            "egress exit: OPEN exit — [exit].allowed_clients is empty, so any mesh key \
+             can obtain a sticky lease{}. Keys are free to mint; set allowed_clients \
+             (and/or min_client_pow_bits) unless this is intentional.",
+            if admission.min_pow_bits() > 0 {
+                format!(" (subject to min_client_pow_bits = {})", admission.min_pow_bits())
+            } else {
+                String::new()
+            }
+        );
+    } else {
+        info!(
+            "egress exit: client allowlist active ({} key(s)), min_client_pow_bits = {}",
+            admission.allowlist_len(),
+            admission.min_pow_bits()
+        );
+    }
     let pool = Arc::new(Mutex::new(
         AddressPool::new(v4_pool_base, v4_pool_prefix, v6_pool_base, v6_pool_prefix)
             .with_context(|| format!(
@@ -803,34 +1011,26 @@ pub async fn start_exit(
         let loaded = crate::lease_store::load_with_warn(
             std::path::Path::new(&lease_persistence_path)
         );
-        let mut reseeded = 0usize;
-        let mut dropped  = 0usize;
-        {
-            let mut p = pool.lock().unwrap();
-            let mut t = table.lock().unwrap();
-            let mut s = lease_store.lock().unwrap();
-            for (peer, lease) in loaded {
-                match p.reserve(lease) {
-                    Ok(()) => {
-                        t.insert(peer, lease);
-                        s.insert(peer, lease);
-                        reseeded += 1;
-                    }
-                    Err(e) => {
-                        warn!(
-                            "lease store: dropping {} (peer {}): {e}",
-                            lease.v4, hex::encode(&peer[..8])
-                        );
-                        dropped += 1;
-                    }
-                }
-            }
+        let (reseeded, dropped, refused) = reseed_leases(&pool, &table, &admission, loaded);
+        // Mirror the reseeded table into the store and write the cleaned
+        // set back (dropped / no-longer-admitted entries gone) so the file
+        // reflects what the exit actually holds.
+        if let Err(e) = persist_leases(&table, &lease_store) {
+            warn!("lease store: rewriting reseeded store failed: {e:#}");
+        }
+        if dropped + refused > 0 {
+            debug!("lease store: removed {} stale entr(y/ies) from disk", dropped + refused);
         }
         info!(
-            "lease store: reseeded {reseeded} sticky lease(s) from {:?}{}",
+            "lease store: reseeded {reseeded} sticky lease(s) from {:?}{}{}",
             lease_persistence_path,
             if dropped > 0 {
                 format!(" ({dropped} dropped as out-of-range)")
+            } else {
+                String::new()
+            },
+            if refused > 0 {
+                format!(" ({refused} dropped: peer no longer admitted)")
             } else {
                 String::new()
             }
@@ -842,8 +1042,9 @@ pub async fn start_exit(
     // Bring up the vpnd admin socket before the data plane so an
     // operator running `bifrost-ctl leases` against a freshly-started
     // exit sees the reseeded entries immediately, even if no client
-    // has connected yet.
-    crate::admin::spawn_listener(
+    // has connected yet. Non-fatal: the admin RPC is an operator
+    // convenience and must not take the data plane down with it.
+    if let Err(e) = crate::admin::spawn_listener(
         admin_socket.into(),
         crate::admin::AdminState {
             conn: mux.conn().clone(),
@@ -854,8 +1055,12 @@ pub async fn start_exit(
             lease_store: Some(lease_store.clone()),
             self_lease: None,
         },
-    )
-    .context("starting vpnd admin socket")?;
+    ) {
+        warn!(
+            "vpnd admin socket unavailable ({e:#}); set [exit].admin_socket to a \
+             writable path, or \"\" to disable it"
+        );
+    }
 
     let dev = crate::tun_dev::OffloadTun::open(
         &tun_name,
@@ -897,6 +1102,7 @@ pub async fn start_exit(
     let tun_writer_in = tun_writer.clone();
     let dst_filter_in = dst_filter.clone();
     tokio::spawn(async move {
+        let mut write_failures: u64 = 0;
         while let Some(recv) = datagram_rx.recv().await {
             let bifrost_core::mux::DatagramRecv { from, payload } = recv;
             if payload.is_empty() { continue; }
@@ -912,7 +1118,6 @@ pub async fn start_exit(
             // coalesced packets inside the lock so we never write
             // halfway-through a packet.
             let mut w = tun_writer_in.lock().await;
-            let mut batch_failed = false;
             for slot in PacketBatchIter::new(&payload) {
                 // Each slot is `[10-byte vhdr | IP packet]`. Anti-
                 // spoof reads from the IP part; the vhdr stays
@@ -949,13 +1154,21 @@ pub async fn start_exit(
                         continue;
                     }
                 }
+                // The vhdr is client-supplied: drop one the kernel would
+                // reject (EINVAL) rather than hand it to the shared TUN.
+                if !crate::tun_offload::slot_vhdr_is_sane(slot) {
+                    trace!(
+                        "egress exit: invalid virtio_net_hdr from {}, drop",
+                        hex::encode(&from[..8])
+                    );
+                    continue;
+                }
+                // A write error is per-packet: log + drop, never tear down
+                // this loop — it is the uplink for EVERY client.
                 if let Err(e) = w.write_all(slot).await {
-                    warn!("egress exit: TUN write failed: {e}");
-                    batch_failed = true;
-                    break;
+                    note_tun_write_error("egress exit", &mut write_failures, &e);
                 }
             }
-            if batch_failed { break; }
         }
         warn!("egress exit: datagram receiver exited");
     });
@@ -1009,7 +1222,10 @@ pub async fn start_exit(
                 }
             }
 
-            // Flush each non-empty bucket as one Datagram.
+            // Flush each non-empty bucket as one Datagram. `send_datagram`
+            // is a single non-waiting attempt: this one task serves every
+            // client, so an offline peer's batch is dropped, not retried —
+            // it must never stall downlink for the others.
             for (peer, slots) in buckets.iter().filter(|(_, v)| !v.is_empty()) {
                 let refs: Vec<&[u8]> = slots.iter().map(|v| v.as_slice()).collect();
                 let payload = encode_packet_batch(&refs);
@@ -1036,9 +1252,11 @@ pub async fn start_exit(
         let pool = pool.clone();
         let table = table.clone();
         let lease_store = lease_store.clone();
+        let mux = mux.clone();
+        let admission = admission.clone();
         tokio::spawn(async move {
             handle_egress_handshake(
-                acc, pool, table, lease_store,
+                acc, mux, admission, pool, table, lease_store,
                 gw4, prefix4, gw6, prefix6,
             ).await;
         });
@@ -1061,6 +1279,8 @@ pub async fn start_exit(
 #[allow(clippy::too_many_arguments)] // v4+v6 gateway layout + persistence handle
 async fn handle_egress_handshake(
     acc: AcceptedStream,
+    mux: Arc<MeshMux>,
+    admission: Arc<crate::admission::ExitAdmission>,
     pool: SharedPool,
     table: SharedTable,
     lease_store: Arc<Mutex<crate::lease_store::LeaseStore>>,
@@ -1073,78 +1293,71 @@ async fn handle_egress_handshake(
     let peer = acc.from;
     let peer_short = hex::encode(&peer[..8]);
 
-    // Sticky-lease lookup. If we have an existing entry in the
-    // shared table (loaded from disk at startup or installed by
-    // a prior session that's since disconnected), reuse it. This
-    // is the whole point of the persistence layer — returning
-    // clients keep their address across exit restarts and across
-    // client TCP reconnects within a single exit lifetime.
-    //
-    // Pool was already reserved for sticky leases at startup, so
-    // we just need to make sure the table has the entry and we
-    // don't double-allocate.
-    // Two-step lookup so we never hold the MutexGuard across an
-    // await: first peek for an existing lease; if absent, allocate
-    // and insert in a fresh critical section. `None` means pool
-    // exhaustion — handled below by send_open_ack outside any lock.
-    let lookup: Option<(Lease, bool)> = {
-        let t = table.lock().unwrap();
-        t.lease_of(&peer).map(|l| (l, true))
+    // Admission BEFORE any lease state is touched: keys are free to mint,
+    // so an un-gated exit hands every throwaway identity a sticky slot.
+    if let Err(why) = admission.check(&peer) {
+        warn!("egress exit: refusing peer {peer_short}: {why}");
+        let _ = mesh.send_open_ack(bifrost_core::stream::reply::NOT_ALLOWED).await;
+        return;
+    }
+
+    // Sticky-lease lookup / allocation / reclamation, atomically, and
+    // register this handshake as a live session on the lease. `None` means
+    // the pool is full of leases that are all in use.
+    let acquired = lease_lookup_or_allocate(&pool, &table, peer, unix_now(), || {
+        mux.conn().get_peer_stats().into_iter().map(|s| s.key).collect()
+    });
+    let Some(acq) = acquired else {
+        warn!(
+            "egress exit: address pool exhausted for peer {peer_short} \
+             (every lease has a live session or connected owner)"
+        );
+        let _ = mesh.send_open_ack(bifrost_core::stream::reply::GENERAL_FAILURE).await;
+        return;
     };
-    let (lease, was_sticky) = match lookup {
-        Some(found) => found,
-        None => {
-            let fresh = pool.lock().unwrap().allocate();
-            match fresh {
-                Some(l) => {
-                    table.lock().unwrap().insert(peer, l);
-                    (l, false)
-                }
-                None => {
-                    warn!("egress exit: address pool exhausted for peer {peer_short}");
-                    let _ = mesh.send_open_ack(0x01 /* general failure */).await;
-                    return;
-                }
-            }
-        }
-    };
+    let lease = acq.lease;
+    let session = LeaseSession::new(pool.clone(), table.clone(), peer, &acq);
 
     let alloc_desc = match lease.v6 {
         Some(v6) => format!("{} + {}", lease.v4, v6),
         None => lease.v4.to_string(),
     };
-    if was_sticky {
+    if let Some((victim, old)) = acq.reclaimed {
+        info!(
+            "egress exit: pool full — reclaimed idle lease {} from peer {}",
+            old.v4, hex::encode(&victim[..8])
+        );
+    }
+    if acq.was_sticky {
         info!("egress exit: sticky-resume {alloc_desc} for peer {peer_short}");
     } else {
         info!("egress exit: allocated {alloc_desc} for peer {peer_short}");
-        // Persist the new mapping immediately so a crash between
-        // here and the next save doesn't lose the lease (the
-        // client will already be holding it from EgressHello).
-        let save_result = {
-            let mut s = lease_store.lock().unwrap();
-            s.insert(peer, lease);
-            s.save()
-        };
-        if let Err(e) = save_result {
-            warn!(
-                "egress exit: persisting lease for {peer_short} failed: {e:#} \
-                 (lease is live in memory; will retry on next change)"
-            );
-        }
     }
-    if let Err(e) = mesh.send_open_ack(0x00).await {
-        warn!("egress exit: OpenAck failed for {peer_short}: {e}");
-        // OpenAck failed: we never actually got past the
-        // handshake. Roll back the in-memory state so the next
-        // attempt sees a clean slate, but leave the persistent
-        // store untouched for sticky-lease purposes — if the
-        // peer comes back later, they should still resume.
-        if !was_sticky {
-            table.lock().unwrap().remove_peer(&peer);
-            pool.lock().unwrap().release(lease);
-            lease_store.lock().unwrap().remove(&peer);
-            let _ = lease_store.lock().unwrap().save();
+    // Persist immediately (new mapping / reclaimed victim / fresh
+    // last_active) so a crash between here and the next save doesn't lose
+    // the lease the client is about to be told about.
+    if let Err(e) = persist_leases(&table, &lease_store) {
+        warn!(
+            "egress exit: persisting lease for {peer_short} failed: {e:#} \
+             (lease is live in memory; will retry on next change)"
+        );
+    }
+
+    // Rollback on a failed handshake: drop only THIS session's reference.
+    // The lease is freed only if this handshake allocated it and no other
+    // session (a concurrent handshake from the same peer) joined it — the
+    // old unconditional release freed a lease still in use.
+    let rollback = |session: LeaseSession| {
+        if let Rollback::Released(_) = session.rollback()
+            && let Err(e) = persist_leases(&table, &lease_store)
+        {
+            warn!("egress exit: persisting rollback for {peer_short} failed: {e:#}");
         }
+    };
+
+    if let Err(e) = mesh.send_open_ack(bifrost_core::stream::reply::SUCCESS).await {
+        warn!("egress exit: OpenAck failed for {peer_short}: {e}");
+        rollback(session);
         return;
     }
     let hello = EgressHello {
@@ -1162,36 +1375,31 @@ async fn handle_egress_handshake(
     };
     if let Err(e) = write_framed(&mut mesh, &hello.encode()).await {
         warn!("egress exit: hello send failed for {peer_short} ({alloc_desc}): {e}");
-        if !was_sticky {
-            table.lock().unwrap().remove_peer(&peer);
-            pool.lock().unwrap().release(lease);
-            lease_store.lock().unwrap().remove(&peer);
-            let _ = lease_store.lock().unwrap().save();
-        }
+        rollback(session);
         return;
     }
 
     // Park here until the client half-closes (or its TCP dies). The
     // mesh stream carries no further data — it's purely a session
-    // lifecycle marker. read_to_end completes on graceful Close;
-    // unexpected EOF / errors also fall through.
+    // lifecycle marker.
     //
-    // Critically: we do NOT release the lease here. The sticky
-    // policy keeps `EgressTable` + persistence intact so the peer
-    // resumes onto the same IP on next reconnect. Without
-    // persistence the in-memory `table` would still survive the
-    // peer's TCP teardown but only until the exit restarts;
-    // persistence extends that lifetime across daemon restarts.
-    let mut throwaway = Vec::new();
-    let _ = mesh.read_to_end(&mut throwaway).await;
-    if !throwaway.is_empty() {
+    // We do NOT release the lease on disconnect: it stays sticky so the
+    // peer resumes onto the same IP. Ending the session only drops the
+    // live-session count and stamps `last_active`, which makes the lease
+    // eligible for least-recently-active reclamation under pool pressure.
+    let discarded = drain_to_eof(&mut mesh).await;
+    if discarded > 0 {
         // Old clients (pre-datagram) sent IP packets through the
         // stream; loudly flag those so the operator can roll forward.
         warn!(
             "egress exit: peer {} sent {} bytes on the control stream — \
              expected datagram-path client (post-2026-05-19 build)",
-            peer_short, throwaway.len()
+            peer_short, discarded
         );
+    }
+    session.end();
+    if let Err(e) = persist_leases(&table, &lease_store) {
+        debug!("egress exit: persisting last_active for {peer_short} failed: {e:#}");
     }
     info!(
         "egress exit: client {peer_short} disconnected (lease {alloc_desc} held sticky)"
@@ -1207,13 +1415,14 @@ pub async fn start_client(
     tun_name: String,
     install_default_route: bool,
     admin_socket: String,
+    lease_policy: LeasePolicy,
 ) -> Result<()> {
-    let (mesh, hello) = client_handshake(mux.clone(), exit_peer).await?;
+    let (mesh, hello) = client_handshake(mux.clone(), exit_peer, &lease_policy).await?;
     let self_lease = Lease {
         v4: hello.allocated_v4,
         v6: hello.allocated_v6,
     };
-    crate::admin::spawn_listener(
+    if let Err(e) = crate::admin::spawn_listener(
         admin_socket.into(),
         crate::admin::AdminState {
             conn: mux.conn().clone(),
@@ -1224,8 +1433,12 @@ pub async fn start_client(
             lease_store: None,
             self_lease: Some(self_lease),
         },
-    )
-    .context("starting vpnd admin socket")?;
+    ) {
+        warn!(
+            "vpnd admin socket unavailable ({e:#}); set [client].admin_socket to a \
+             writable path, or \"\" to disable it"
+        );
+    }
     let dev = crate::tun_dev::OffloadTun::open(
         &tun_name,
         hello.mtu,
@@ -1247,17 +1460,21 @@ pub async fn start_client(
         install_default_route,
     )?;
     let (tun_reader, tun_writer) = tokio::io::split(dev);
-    run_client_pump(tun_reader, tun_writer, mux, exit_peer, hello.allocated_v4, mesh).await
+    run_client_pump(
+        tun_reader, tun_writer, mux, exit_peer, hello.allocated_v4, mesh, lease_policy,
+    ).await
 }
 
 /// Run the client → exit handshake: wait for the peer to be
 /// reachable on the mesh, open an Egress stream, await the
 /// OpenAck, and read the framed [`EgressHello`]. Returns the live
 /// control stream + the parsed hello. Used by `start_client` and
-/// by `bifrost-ffi` (mobile shim).
+/// by `bifrost-ffi` (mobile shim). `lease_policy` bounds which address
+/// space the exit may put the lease in (see [`EgressHello::validate`]).
 pub async fn client_handshake(
     mux: Arc<MeshMux>,
     exit_peer: bifrost_core::PubKey,
+    lease_policy: &LeasePolicy,
 ) -> Result<(bifrost_core::stream::MeshStream, EgressHello)> {
     info!(
         "egress client: opening tunnel to exit {}",
@@ -1317,7 +1534,7 @@ pub async fn client_handshake(
     // The exit is untrusted to a VPN client: validate the announced lease/MTU
     // before feeding it to kernel TUN/route config. Out-of-range values
     // (e.g. v4_prefix > 32) otherwise reach `subnet_v4_cidr_str`'s shift math.
-    hello.validate()?;
+    hello.validate(lease_policy)?;
     let v6_desc = hello
         .allocated_v6
         .map(|v6| format!(" + {v6}/{}", hello.v6_prefix))
@@ -1350,6 +1567,7 @@ pub async fn run_client_pump<R, W>(
     exit_peer: bifrost_core::PubKey,
     lease_v4: Ipv4Addr,
     mesh: bifrost_core::stream::MeshStream,
+    lease_policy: LeasePolicy,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -1375,6 +1593,7 @@ where
     // TUN.
     let tun_writer_clone = tun_writer.clone();
     tokio::spawn(async move {
+        let mut write_failures: u64 = 0;
         while let Some(recv) = datagram_rx.recv().await {
             if recv.from != exit_peer {
                 trace!(
@@ -1384,15 +1603,13 @@ where
                 continue;
             }
             let mut w = tun_writer_clone.lock().await;
-            let mut batch_failed = false;
             for pkt in PacketBatchIter::new(&recv.payload) {
+                // Per-packet failure (e.g. an exit-supplied vhdr the kernel
+                // rejects): drop it, keep the downlink alive.
                 if let Err(e) = w.write_all(pkt).await {
-                    warn!("egress client: TUN write failed: {e}");
-                    batch_failed = true;
-                    break;
+                    note_tun_write_error("egress client", &mut write_failures, &e);
                 }
             }
-            if batch_failed { break; }
         }
         warn!("egress client: datagram receiver exited");
     });
@@ -1478,11 +1695,10 @@ where
             // Block until the current control stream dies. Both EOF
             // (exit released the lease) and reset (peer-reconnect
             // retired a stale stream) end the read here.
-            let mut throwaway = Vec::new();
-            let _ = mesh.read_to_end(&mut throwaway).await;
+            drain_to_eof(&mut mesh).await;
             warn!("egress client: control stream down — rebuilding tunnel");
 
-            match client_handshake(mux.clone(), exit_peer).await {
+            match client_handshake(mux.clone(), exit_peer, &lease_policy).await {
                 Ok((new_mesh, hello)) => {
                     if hello.allocated_v4 != lease_v4 {
                         // The host committed its TUN to `lease_v4` and
@@ -1506,7 +1722,7 @@ where
                     warn!("egress client: tunnel rebuild failed: {e:#} — retry in {backoff:?}");
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(30));
-                    // `mesh` is still the dead stream; its `read_to_end`
+                    // `mesh` is still the dead stream; its `drain_to_eof`
                     // at the top of the loop returns at once, so we go
                     // straight back into another handshake attempt.
                 }
@@ -1515,6 +1731,227 @@ where
     });
 
     Ok(())
+}
+
+/// Outcome of [`lease_lookup_or_allocate`].
+#[cfg_attr(not(any(feature = "tun", test)), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Acquired {
+    pub lease: Lease,
+    /// Generation of the table entry this session joined.
+    pub generation: u64,
+    /// True if the peer already held this lease (sticky resume / a
+    /// concurrent handshake), false if this call allocated it.
+    pub was_sticky: bool,
+    /// Peer whose idle lease was reclaimed to make room, if any.
+    pub reclaimed: Option<(bifrost_core::PubKey, Lease)>,
+}
+
+/// Return `peer`'s existing lease (`was_sticky = true`) or allocate and
+/// register a fresh one, as ONE atomic step, and count the caller as a live
+/// session on it. A check-then-allocate split across two critical sections
+/// let two concurrent `Open(Egress)` from the same peer both miss the lookup
+/// and both allocate; the second `insert` overwrote the first, whose pool
+/// slot then leaked forever.
+///
+/// Pool exhausted → reclaim the least-recently-active lease that has no live
+/// session and whose peer is not in `connected()` (computed lazily, only when
+/// needed). If every lease is in use the caller gets `None` and refuses.
+///
+/// Lock order is pool → table, matching the startup reseed; no await while
+/// held. The lease store is NOT touched here — the caller persists a table
+/// snapshot afterwards ([`persist_leases`]).
+#[cfg_attr(not(any(feature = "tun", test)), allow(dead_code))]
+fn lease_lookup_or_allocate(
+    pool: &SharedPool,
+    table: &SharedTable,
+    peer: bifrost_core::PubKey,
+    now: u64,
+    connected: impl FnOnce() -> std::collections::HashSet<bifrost_core::PubKey>,
+) -> Option<Acquired> {
+    let mut p = pool.lock().unwrap();
+    let mut t = table.lock().unwrap();
+    if let Some((lease, generation)) = t.join(&peer, now) {
+        return Some(Acquired { lease, generation, was_sticky: true, reclaimed: None });
+    }
+    let mut reclaimed = None;
+    let lease = match p.allocate() {
+        Some(l) => l,
+        None => {
+            let victim = t.reclaim_victim(&connected())?;
+            let old = t.remove_peer(&victim).expect("victim is in the table");
+            p.release(old);
+            reclaimed = Some((victim, old));
+            p.allocate().expect("a slot was just released")
+        }
+    };
+    let generation = t.insert_with_activity(peer, lease, now);
+    t.join(&peer, now);
+    Some(Acquired { lease, generation, was_sticky: false, reclaimed })
+}
+
+/// A live egress session's hold on its lease. Dropping it ends the session
+/// (refcount −1, `last_active` stamped) but keeps the lease sticky; call
+/// [`rollback`](Self::rollback) instead when the handshake never completed.
+/// The `Drop` path also covers a panicking / cancelled handshake task, so a
+/// lease can't be left marked "live" (and thus unreclaimable) forever.
+#[cfg_attr(not(any(feature = "tun", test)), allow(dead_code))]
+pub(crate) struct LeaseSession {
+    pool: SharedPool,
+    table: SharedTable,
+    peer: bifrost_core::PubKey,
+    generation: u64,
+    /// This session's handshake allocated the lease (vs. joined it).
+    allocated: bool,
+    done: bool,
+}
+
+/// What [`LeaseSession::rollback`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rollback {
+    /// Lease freed: this handshake allocated it and nobody else uses it.
+    Released(Lease),
+    /// Another session (or a sticky prior owner) still holds the lease.
+    Kept,
+    /// The entry was evicted / reclaimed / re-allocated meanwhile.
+    Stale,
+}
+
+#[cfg_attr(not(any(feature = "tun", test)), allow(dead_code))]
+impl LeaseSession {
+    pub(crate) fn new(pool: SharedPool, table: SharedTable, peer: bifrost_core::PubKey, acq: &Acquired) -> Self {
+        Self { pool, table, peer, generation: acq.generation, allocated: !acq.was_sticky, done: false }
+    }
+
+    /// Handshake failed before the client got its lease. Drop this
+    /// session's reference; free the lease only if this handshake created
+    /// it AND no other session joined it meanwhile (generation-checked).
+    pub(crate) fn rollback(mut self) -> Rollback {
+        self.done = true;
+        let mut p = self.pool.lock().unwrap();
+        let mut t = self.table.lock().unwrap();
+        let Some(e) = t.lease_by_peer.get_mut(&self.peer) else { return Rollback::Stale };
+        if e.generation != self.generation {
+            return Rollback::Stale;
+        }
+        e.sessions = e.sessions.saturating_sub(1);
+        if self.allocated && e.sessions == 0 {
+            let lease = t.remove_peer(&self.peer).expect("entry present");
+            p.release(lease);
+            Rollback::Released(lease)
+        } else {
+            Rollback::Kept
+        }
+    }
+
+    /// Normal session end (control stream closed): the lease stays sticky.
+    pub(crate) fn end(mut self) {
+        self.end_inner();
+    }
+
+    fn end_inner(&mut self) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        let mut t = self.table.lock().unwrap();
+        if let Some(e) = t.lease_by_peer.get_mut(&self.peer)
+            && e.generation == self.generation
+        {
+            e.sessions = e.sessions.saturating_sub(1);
+            e.last_active = e.last_active.max(unix_now());
+        }
+    }
+}
+
+impl Drop for LeaseSession {
+    fn drop(&mut self) {
+        self.end_inner();
+    }
+}
+
+/// Reseed pool + table from persisted `(peer, lease, last_active)` entries.
+/// Entries outside the configured pool are dropped (operator changed
+/// `pool_base`/`pool_prefix`), as are entries of peers the current admission
+/// policy refuses — otherwise a key removed from `allowed_clients` would keep
+/// its lease, and the datagram path forwards for any leased peer.
+/// Returns `(reseeded, dropped_out_of_range, dropped_not_admitted)`.
+#[cfg_attr(not(any(feature = "tun", test)), allow(dead_code))]
+fn reseed_leases(
+    pool: &SharedPool,
+    table: &SharedTable,
+    admission: &crate::admission::ExitAdmission,
+    loaded: Vec<(bifrost_core::PubKey, Lease, u64)>,
+) -> (usize, usize, usize) {
+    let (mut reseeded, mut dropped, mut refused) = (0, 0, 0);
+    let mut p = pool.lock().unwrap();
+    let mut t = table.lock().unwrap();
+    for (peer, lease, last_active) in loaded {
+        if let Err(why) = admission.check(&peer) {
+            warn!(
+                "lease store: dropping {} (peer {}): {why}",
+                lease.v4, hex::encode(&peer[..8])
+            );
+            refused += 1;
+            continue;
+        }
+        match p.reserve(lease) {
+            Ok(()) => {
+                t.insert_with_activity(peer, lease, last_active);
+                reseeded += 1;
+            }
+            Err(e) => {
+                warn!(
+                    "lease store: dropping {} (peer {}): {e}",
+                    lease.v4, hex::encode(&peer[..8])
+                );
+                dropped += 1;
+            }
+        }
+    }
+    (reseeded, dropped, refused)
+}
+
+/// Mirror the table into the lease store and flush it. The store lock is
+/// taken FIRST and held across the table snapshot so two concurrent savers
+/// can't write their snapshots out of order (a stale file). Nothing else
+/// nests these two locks in the opposite order.
+#[cfg_attr(not(any(feature = "tun", test)), allow(dead_code))]
+pub(crate) fn persist_leases(
+    table: &SharedTable,
+    store: &Mutex<crate::lease_store::LeaseStore>,
+) -> Result<()> {
+    let mut s = store.lock().unwrap();
+    let snap = table.lock().unwrap().persist_snapshot();
+    s.replace_all(snap);
+    s.save()
+}
+
+/// Wait for the control stream to end, discarding anything the peer sends
+/// on it. Reads through a fixed buffer — `read_to_end` into a `Vec` let a
+/// peer stream unbounded data into our memory. Returns the discarded count.
+async fn drain_to_eof<R: AsyncRead + Unpin>(r: &mut R) -> u64 {
+    let mut buf = [0u8; 4096];
+    let mut discarded = 0u64;
+    loop {
+        match r.read(&mut buf).await {
+            Ok(0) | Err(_) => return discarded,
+            Ok(n) => discarded += n as u64,
+        }
+    }
+}
+
+/// Per-packet TUN write failure: log and drop, never end the pump (one bad
+/// packet must not cut the tunnel for everyone). Warns on the 1st, 2nd, 4th,
+/// 8th, … failure so a persistently broken device stays visible without a
+/// log line per packet.
+fn note_tun_write_error(role: &str, failures: &mut u64, e: &std::io::Error) {
+    *failures += 1;
+    if failures.is_power_of_two() {
+        warn!("{role}: TUN write failed ({failures} so far), dropping packet: {e}");
+    } else {
+        trace!("{role}: TUN write failed, dropping packet: {e}");
+    }
 }
 
 /// Parse one TUN read, look up the destination peer in the egress
@@ -1633,6 +2070,7 @@ pub async fn start_exit(
     _lease_persistence_path: String,
     _admin_socket: String,
     _dst_filter: Arc<crate::dst_filter::DstFilter>,
+    _admission: Arc<crate::admission::ExitAdmission>,
 ) -> Result<()> {
     anyhow::bail!("egress exit requires the `tun` feature (rebuild with --features tun)")
 }
@@ -1644,6 +2082,7 @@ pub async fn start_client(
     _tun_name: String,
     _install_default_route: bool,
     _admin_socket: String,
+    _lease_policy: LeasePolicy,
 ) -> Result<()> {
     anyhow::bail!("egress client requires the `tun` feature (rebuild with --features tun)")
 }
@@ -1668,6 +2107,228 @@ mod tests {
     use tokio::io::duplex;
 
     fn v6(s: &str) -> Ipv6Addr { s.parse().unwrap() }
+
+    /// Concurrent `Open(Egress)` from one peer must share ONE lease: the old
+    /// check-then-allocate split let both handshakes allocate and leak a slot.
+    #[test]
+    fn lease_lookup_or_allocate_is_atomic_per_peer() {
+        let pool: SharedPool = Arc::new(Mutex::new(
+            AddressPool::new(Ipv4Addr::new(10, 55, 0, 0), 24, None, 0).unwrap(),
+        ));
+        let table: SharedTable = Arc::new(Mutex::new(EgressTable::default()));
+        let peer = [0x5a; 32];
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let (pool, table, barrier) = (pool.clone(), table.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let a = lease_lookup_or_allocate(&pool, &table, peer, 1, Default::default)
+                        .unwrap();
+                    (a.lease, a.was_sticky)
+                })
+            })
+            .collect();
+        let results: Vec<(Lease, bool)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let first = results[0].0;
+        assert!(results.iter().all(|(l, _)| *l == first), "every racer sees the same lease");
+        assert_eq!(results.iter().filter(|(_, sticky)| !sticky).count(), 1, "exactly one allocation");
+        // Exactly one pool slot consumed: the next allocation is the slot after it.
+        let next = pool.lock().unwrap().allocate().unwrap();
+        assert_eq!(u32::from(next.v4), u32::from(first.v4) + 1, "no leaked slot");
+        assert_eq!(table.lock().unwrap().sessions_of(&peer), 16, "every racer is a live session");
+    }
+
+    // ── Lease reclamation / session lifecycle ───────────────────────
+
+    type Connected = std::collections::HashSet<bifrost_core::PubKey>;
+
+    /// /29 → 5 usable client slots (.2–.6).
+    fn small_pool() -> (SharedPool, SharedTable) {
+        (
+            Arc::new(Mutex::new(AddressPool::new(Ipv4Addr::new(10, 55, 0, 0), 29, None, 0).unwrap())),
+            Arc::new(Mutex::new(EgressTable::default())),
+        )
+    }
+
+    fn key(b: u8) -> bifrost_core::PubKey { [b; 32] }
+
+    /// Fill the /29 with five peers whose sessions have ENDED at
+    /// last_active = 100 + i (so key(1) is the least recently active).
+    fn fill_idle(pool: &SharedPool, table: &SharedTable) {
+        for i in 1..=5u8 {
+            let a = lease_lookup_or_allocate(pool, table, key(i), 100 + i as u64, Connected::new)
+                .unwrap();
+            let mut t = table.lock().unwrap();
+            let e = t.lease_by_peer.get_mut(&key(i)).unwrap();
+            assert_eq!(e.generation, a.generation);
+            e.sessions = 0;
+        }
+    }
+
+    /// Regression (sybil pool exhaustion): `allocate()` returned None when
+    /// full, so ~253 throwaway keys locked out every future client. A full
+    /// pool must reclaim the least-recently-active idle lease.
+    #[test]
+    fn full_pool_reclaims_least_recently_active_idle_lease() {
+        let (pool, table) = small_pool();
+        fill_idle(&pool, &table);
+        let victim_lease = table.lock().unwrap().lease_of(&key(1)).unwrap();
+        let a = lease_lookup_or_allocate(&pool, &table, key(9), 500, Connected::new)
+            .expect("full pool of idle leases must reclaim, not refuse");
+        assert_eq!(a.reclaimed, Some((key(1), victim_lease)), "oldest idle lease reclaimed");
+        assert_eq!(a.lease, victim_lease, "newcomer gets the freed slot");
+        let t = table.lock().unwrap();
+        assert!(t.lease_of(&key(1)).is_none());
+        assert_eq!(t.peer_for_ip(&IpAddr::V4(victim_lease.v4)), Some(key(9)));
+    }
+
+    /// Never reclaim a lease with a live session or whose peer is currently
+    /// connected; with every lease in use the newcomer is refused.
+    #[test]
+    fn reclamation_never_takes_a_live_or_connected_lease() {
+        let (pool, table) = small_pool();
+        fill_idle(&pool, &table);
+        // key(1) (oldest) has a live session again; key(2) is connected at
+        // the transport layer → the victim must be key(3).
+        table.lock().unwrap().join(&key(1), 50);
+        // join() bumps last_active to max(old, now) = old, so key(1) stays oldest.
+        let connected = || Connected::from([key(2)]);
+        let a = lease_lookup_or_allocate(&pool, &table, key(9), 500, connected).unwrap();
+        assert_eq!(a.reclaimed.map(|(p, _)| p), Some(key(3)));
+
+        // Now make everything live: refuse rather than evict an active client.
+        for i in [2u8, 4, 5] {
+            table.lock().unwrap().join(&key(i), 600);
+        }
+        assert!(
+            lease_lookup_or_allocate(&pool, &table, key(10), 700, Connected::new).is_none(),
+            "all leases live → refuse the newcomer"
+        );
+        for i in [1u8, 2, 4, 5, 9] {
+            assert!(table.lock().unwrap().lease_of(&key(i)).is_some(), "live lease {i} kept");
+        }
+    }
+
+    /// Regression (rollback race): two handshakes from one peer overlap and
+    /// the first (the allocator) fails. Its rollback used to free the lease
+    /// the second handshake was still using.
+    #[test]
+    fn rollback_does_not_free_a_lease_another_session_uses() {
+        let (pool, table) = small_pool();
+        let peer = key(7);
+        let a = lease_lookup_or_allocate(&pool, &table, peer, 1, Connected::new).unwrap();
+        let b = lease_lookup_or_allocate(&pool, &table, peer, 1, Connected::new).unwrap();
+        assert!(!a.was_sticky && b.was_sticky && a.lease == b.lease);
+        let sa = LeaseSession::new(pool.clone(), table.clone(), peer, &a);
+        let sb = LeaseSession::new(pool.clone(), table.clone(), peer, &b);
+
+        assert_eq!(sa.rollback(), Rollback::Kept, "B still uses it");
+        assert_eq!(table.lock().unwrap().lease_of(&peer), Some(a.lease), "lease survives");
+        assert_eq!(table.lock().unwrap().sessions_of(&peer), 1);
+        // The slot is still taken: a different peer must not get it.
+        let other = lease_lookup_or_allocate(&pool, &table, key(8), 1, Connected::new).unwrap();
+        assert_ne!(other.lease, a.lease, "in-use slot must not be handed out again");
+
+        sb.end();
+        assert_eq!(table.lock().unwrap().sessions_of(&peer), 0);
+        assert_eq!(table.lock().unwrap().lease_of(&peer), Some(a.lease), "sticky after end");
+    }
+
+    /// A sole allocating handshake that fails does free its fresh lease.
+    #[test]
+    fn rollback_of_sole_new_session_releases_the_slot() {
+        let (pool, table) = small_pool();
+        let a = lease_lookup_or_allocate(&pool, &table, key(7), 1, Connected::new).unwrap();
+        let s = LeaseSession::new(pool.clone(), table.clone(), key(7), &a);
+        assert_eq!(s.rollback(), Rollback::Released(a.lease));
+        assert!(table.lock().unwrap().lease_of(&key(7)).is_none());
+        let next = pool.lock().unwrap().allocate().unwrap();
+        assert_eq!(next, a.lease, "slot returned to the pool");
+    }
+
+    /// A stale session (its entry was evicted and re-allocated meanwhile)
+    /// must not touch the new entry — generation check.
+    #[test]
+    fn stale_session_end_and_rollback_are_noops() {
+        let (pool, table) = small_pool();
+        let peer = key(7);
+        let a = lease_lookup_or_allocate(&pool, &table, peer, 1, Connected::new).unwrap();
+        let old = LeaseSession::new(pool.clone(), table.clone(), peer, &a);
+        // Operator evicts; the peer reconnects and gets a new entry.
+        {
+            let mut p = pool.lock().unwrap();
+            let l = table.lock().unwrap().remove_peer(&peer).unwrap();
+            p.release(l);
+        }
+        let b = lease_lookup_or_allocate(&pool, &table, peer, 2, Connected::new).unwrap();
+        assert_ne!(a.generation, b.generation);
+        assert_eq!(old.rollback(), Rollback::Stale);
+        assert_eq!(table.lock().unwrap().lease_of(&peer), Some(b.lease));
+        assert_eq!(table.lock().unwrap().sessions_of(&peer), 1, "new session untouched");
+    }
+
+    /// Dropping a session without end()/rollback() (task cancelled /
+    /// panicked) still releases its live-session count, so the lease can't
+    /// stay unreclaimable forever.
+    #[test]
+    fn dropped_session_ends_itself() {
+        let (pool, table) = small_pool();
+        let a = lease_lookup_or_allocate(&pool, &table, key(7), 1, Connected::new).unwrap();
+        drop(LeaseSession::new(pool.clone(), table.clone(), key(7), &a));
+        assert_eq!(table.lock().unwrap().sessions_of(&key(7)), 0);
+        assert!(table.lock().unwrap().last_active_of(&key(7)).unwrap() > 1, "stamped now");
+    }
+
+    /// last_active survives an exit restart via the lease store, so the
+    /// reclamation order is preserved; reseed also drops leases of peers
+    /// the (new) admission policy refuses.
+    #[test]
+    fn reclamation_order_and_admission_survive_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "bifrost-egress-reclaim-{}-{:?}", std::process::id(), std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("leases.json");
+        let store = Mutex::new(crate::lease_store::LeaseStore::new(&path));
+        {
+            let (pool, table) = small_pool();
+            fill_idle(&pool, &table);
+            persist_leases(&table, &store).unwrap();
+        }
+        // "Restart": fresh pool/table from disk. key(5) is no longer allowed.
+        let allowed: Vec<String> = (1..=4u8).chain([9]).map(|i| hex::encode(key(i))).collect();
+        let admission = crate::admission::ExitAdmission::new(&allowed, 0).unwrap();
+        let (pool, table) = small_pool();
+        let loaded = crate::lease_store::load_with_warn(&path);
+        assert_eq!(loaded.len(), 5);
+        let (reseeded, dropped, refused) = reseed_leases(&pool, &table, &admission, loaded);
+        assert_eq!((reseeded, dropped, refused), (4, 0, 1));
+        assert!(table.lock().unwrap().lease_of(&key(5)).is_none(), "non-admitted lease dropped");
+        assert_eq!(table.lock().unwrap().last_active_of(&key(1)), Some(101));
+        // key(5)'s slot is free again; take it, then the pool is full and the
+        // next newcomer must reclaim key(1) — the oldest by persisted stamp.
+        let a = lease_lookup_or_allocate(&pool, &table, key(9), 900, Connected::new).unwrap();
+        assert!(a.reclaimed.is_none());
+        let b = lease_lookup_or_allocate(&pool, &table, key(10), 901, Connected::new).unwrap();
+        assert_eq!(b.reclaimed.map(|(p, _)| p), Some(key(1)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The control-stream drain must not buffer what the peer sends.
+    #[tokio::test]
+    async fn drain_to_eof_discards_without_buffering() {
+        let (mut a, mut b) = duplex(1024);
+        let writer = tokio::spawn(async move {
+            let chunk = [0xabu8; 1000];
+            for _ in 0..4096 {
+                a.write_all(&chunk).await.unwrap();
+            }
+            // dropping `a` delivers EOF
+        });
+        assert_eq!(drain_to_eof(&mut b).await, 4096 * 1000);
+        writer.await.unwrap();
+    }
 
     #[test]
     fn antispoof_drops_vhdr_only_slot_without_panic() {
@@ -1849,19 +2510,92 @@ mod tests {
             mtu: 1392,
             capabilities: 0,
         };
-        assert!(good.validate().is_ok(), "a normal exit hello must validate");
+        let strict = LeasePolicy::default();
+        assert!(good.validate(&strict).is_ok(), "a normal exit hello must validate");
         // Out-of-range v4 prefix — the subnet_v4_cidr_str shift hazard.
         let mut bad = good;
         bad.v4_prefix = 200;
-        assert!(bad.validate().is_err(), "v4 prefix > 32 must be rejected");
+        assert!(bad.validate(&strict).is_err(), "v4 prefix > 32 must be rejected");
         // Bogus allocated address.
         let mut bad = good;
         bad.allocated_v4 = Ipv4Addr::UNSPECIFIED;
-        assert!(bad.validate().is_err(), "0.0.0.0 lease must be rejected");
+        assert!(bad.validate(&strict).is_err(), "0.0.0.0 lease must be rejected");
         // Degenerate MTU.
         let mut bad = good;
         bad.mtu = 0;
-        assert!(bad.validate().is_err(), "mtu 0 must be rejected");
+        assert!(bad.validate(&strict).is_err(), "mtu 0 must be rejected");
+    }
+
+    /// Regression (route hijack): a malicious exit could announce a lease in
+    /// public space and/or a gateway in another subnet, and the client would
+    /// `ip route replace <subnet>/16 dev tun`, capturing e.g. 8.8.0.0/16.
+    #[test]
+    fn egress_hello_validate_blocks_route_hijack() {
+        let good = EgressHello {
+            allocated_v4: Ipv4Addr::new(10, 55, 0, 2),
+            gateway_v4: Ipv4Addr::new(10, 55, 0, 1),
+            v4_prefix: 24,
+            allocated_v6: Some(v6("fd55:0:0:1::2")),
+            gateway_v6: Some(v6("fd55:0:0:1::1")),
+            v6_prefix: 64,
+            mtu: 1392,
+            capabilities: 0,
+        };
+        let strict = LeasePolicy::default();
+        assert!(good.validate(&strict).is_ok());
+
+        // Public lease subnet (8.8.0.0/16) — the hijack.
+        let mut bad = good;
+        bad.allocated_v4 = Ipv4Addr::new(8, 8, 4, 4);
+        bad.gateway_v4 = Ipv4Addr::new(8, 8, 0, 1);
+        bad.v4_prefix = 16;
+        assert!(bad.validate(&strict).is_err(), "public lease subnet must be refused");
+        // …unless the client explicitly allows that CIDR.
+        let allow = LeasePolicy::new(&["8.8.0.0/16".into()]).unwrap();
+        assert!(bad.validate(&allow).is_ok());
+        // An allowed CIDR must cover the WHOLE subnet, not just the address.
+        let narrow = LeasePolicy::new(&["8.8.4.0/24".into()]).unwrap();
+        assert!(bad.validate(&narrow).is_err());
+
+        // Gateway outside the lease subnet.
+        let mut bad = good;
+        bad.gateway_v4 = Ipv4Addr::new(10, 56, 0, 1);
+        assert!(bad.validate(&strict).is_err(), "gateway must share the lease subnet");
+        // A /16 that straddles out of 172.16/12 is refused; one inside is fine.
+        let mut bad = good;
+        bad.allocated_v4 = Ipv4Addr::new(172, 32, 0, 2);
+        bad.gateway_v4 = Ipv4Addr::new(172, 32, 0, 1);
+        bad.v4_prefix = 16;
+        assert!(bad.validate(&strict).is_err(), "172.32/16 is not RFC1918");
+        let mut ok = bad;
+        ok.allocated_v4 = Ipv4Addr::new(172, 31, 0, 2);
+        ok.gateway_v4 = Ipv4Addr::new(172, 31, 0, 1);
+        assert!(ok.validate(&strict).is_ok());
+        // CGNAT is allowed by default.
+        let mut ok = good;
+        ok.allocated_v4 = Ipv4Addr::new(100, 64, 7, 2);
+        ok.gateway_v4 = Ipv4Addr::new(100, 64, 7, 1);
+        assert!(ok.validate(&strict).is_ok());
+        // Gateway == lease, or lease on the network address.
+        let mut bad = good;
+        bad.gateway_v4 = bad.allocated_v4;
+        assert!(bad.validate(&strict).is_err());
+        let mut bad = good;
+        bad.allocated_v4 = Ipv4Addr::new(10, 55, 0, 0);
+        assert!(bad.validate(&strict).is_err());
+
+        // v6: non-ULA subnet, gateway in another subnet, missing gateway.
+        let mut bad = good;
+        bad.allocated_v6 = Some(v6("2001:db8::2"));
+        bad.gateway_v6 = Some(v6("2001:db8::1"));
+        assert!(bad.validate(&strict).is_err(), "global v6 lease must be refused");
+        let mut bad = good;
+        bad.gateway_v6 = Some(v6("fd55:0:0:2::1"));
+        assert!(bad.validate(&strict).is_err(), "v6 gateway must share the subnet");
+        let mut bad = good;
+        bad.gateway_v6 = None;
+        assert!(bad.validate(&strict).is_err());
+        assert!(LeasePolicy::new(&["not-a-cidr".into()]).is_err());
     }
 
     #[test]

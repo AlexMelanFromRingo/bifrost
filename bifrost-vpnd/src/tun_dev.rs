@@ -357,6 +357,15 @@ impl AsyncWrite for OffloadTun {
                 ),
             )));
         }
+        // The vhdr may have crossed the mesh from a remote peer. Refuse a
+        // header the kernel would EINVAL here, without the syscall, so the
+        // caller sees a clean per-packet InvalidInput it can drop.
+        if !crate::tun_offload::slot_vhdr_is_sane(buf) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TUN write: virtio_net_hdr rejected (invalid flags / gso / lengths)",
+            )));
+        }
         loop {
             let mut guard = match me.fd.poll_write_ready(cx) {
                 Poll::Pending => return Poll::Pending,

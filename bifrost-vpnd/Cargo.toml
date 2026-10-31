@@ -37,9 +37,10 @@ toml.workspace = true
 clap.workspace = true
 hex.workspace = true
 
-# `libc` is needed on every unix target, not just Linux: `admin.rs`
-# uses `libc::umask` unconditionally, and `bifrost-ffi` compiles this
-# crate for `*-linux-android` to drive the mobile client data plane.
+# `libc` is needed on every unix target, not just Linux: `bifrost-ffi`
+# compiles this crate for `*-linux-android` to drive the mobile client
+# data plane. (The admin socket no longer touches the process-global
+# umask; it chmods the socket inside a 0700 directory instead.)
 # The Linux-only bits (the `TUNSETOFFLOAD` ioctl in `tun_offload.rs`,
 # the whole of `tun_dev.rs`) stay gated with `#[cfg(target_os = "linux")]`
 # inside the source.

@@ -15,6 +15,13 @@
 //   * Receive window = remaining rx_buf capacity (256 KiB default).
 //     Sender's peer_window starts optimistically (matches
 //     DEFAULT_RX_BUF_CAP) and is updated by every inbound ACK.
+//   * Zero-window recovery: ACKs normally ride on inbound Data, so a
+//     receiver whose window hit 0 would never tell the (now idle) sender
+//     that the application drained rx_buf. The receiver therefore sends a
+//     window-update ACK once its window reopens (`window_update`), and the
+//     sender runs a TCP-style persist timer (`retransmit_due` → `probe`)
+//     that sends an empty Data frame to elicit an ACK in case that update
+//     was lost.
 //   * Close and Reset are NOT carried by ARQ themselves. Close has a
 //     parallel close-pending slot in the retransmit timer; Reset is
 //     intentionally single-shot (it's the "abort" sentinel, retries
@@ -68,6 +75,12 @@ pub const REORDER_BYTE_CAP: u32 = MAX_RX_BUF_CAP;
 /// a peer advertising a huge window could make us hold gigabytes of unacked data
 /// (one large upload's worth) in `unacked`. Mirrors `MAX_RX_BUF_CAP`.
 pub const MAX_SEND_BUF: u32 = MAX_RX_BUF_CAP;
+/// Reopening a ZERO window is announced once at least this much room (or
+/// half the buffer, if smaller) is free — receiver-side silly-window
+/// avoidance (RFC 1122 §4.2.3.3), sized to one full mesh Data chunk.
+/// Deadlock-free: while the window is below it, rx_buf still holds unread
+/// bytes, so the application's next read keeps growing the window.
+pub const WINDOW_UPDATE_MIN: u32 = 64 * 1024;
 
 // ── Serial-number arithmetic (RFC 1982) for the 32-bit byte sequence space ──
 //
@@ -102,6 +115,18 @@ struct UnackedClose {
     retries: u8,
 }
 
+/// Sender-side persist timer (RFC 9293 §3.8.6.1): armed while the peer
+/// advertises a zero window and nothing is in flight, so no retransmit
+/// would otherwise elicit the ACK that reopens it.
+#[derive(Debug)]
+struct PersistState {
+    last_sent: Instant,
+    interval: Duration,
+    /// Probes sent since the last ACK of any kind. Hitting MAX_RETRIES
+    /// means the peer is gone — the stream is reset like a data timeout.
+    unanswered: u8,
+}
+
 #[derive(Debug)]
 pub struct RetransmitJob {
     pub seq: u32,
@@ -114,6 +139,10 @@ pub struct RetransmitJob {
 pub struct RetransmitDue {
     pub data_jobs: Vec<RetransmitJob>,
     pub close_job: Option<RetransmitJob>,
+    /// Zero-window persist probe due: send an empty Data frame at this
+    /// seq. The receiver ACKs it (with its current window) and otherwise
+    /// ignores it.
+    pub probe: Option<u32>,
 }
 
 /// Outcome flag from `on_recv_data` — the caller (mux) uses it to decide
@@ -155,6 +184,8 @@ pub struct Reliability {
     /// `local_close_seq + 1`, ensuring EOF is delivered even if the
     /// first Close packet is dropped on the wire.
     close_pending: Option<UnackedClose>,
+    /// Zero-window persist timer; `None` while the peer's window is open.
+    persist: Option<PersistState>,
 
     // ── Receiver state ───────────────────────────────────────────────────
     /// Next in-order byte we expect.
@@ -169,6 +200,10 @@ pub struct Reliability {
     /// and rx_buf is drained.
     peer_close_seq: Option<u32>,
     eof_delivered: bool,
+    /// Window carried by the last ACK we handed out. `window_update`
+    /// compares against it to decide when a drained rx_buf is worth an
+    /// unsolicited window-update ACK.
+    last_advertised_win: u32,
 
     // ── Timing (RFC 6298 RTT estimator) ──────────────────────────────────
     rto: Duration,
@@ -221,6 +256,7 @@ impl Reliability {
             write_finished: false,
             local_close_seq: None,
             close_pending: None,
+            persist: None,
             expected_seq: 0,
             reorder: BTreeMap::new(),
             reorder_bytes: 0,
@@ -228,6 +264,8 @@ impl Reliability {
             rx_buf_cap: initial,
             peer_close_seq: None,
             eof_delivered: false,
+            // The peer starts out assuming our full initial buffer.
+            last_advertised_win: initial,
             rto: INITIAL_RTO,
             srtt: Duration::ZERO,
             rttvar: Duration::ZERO,
@@ -366,6 +404,14 @@ impl Reliability {
     /// `retries == 0`) into the SRTT/RTTVAR estimator.
     pub fn on_recv_ack(&mut self, ack: u32, win: u32, now: Instant) {
         self.peer_window = win;
+        // Any ACK proves the peer is alive. An open window disarms the
+        // persist timer; a still-zero one keeps its backoff but resets
+        // the unanswered-probe budget.
+        if win > 0 {
+            self.persist = None;
+        } else if let Some(p) = self.persist.as_mut() {
+            p.unanswered = 0;
+        }
         let mut sampled_rtt: Option<Duration> = None;
         while let Some(front) = self.unacked.front() {
             let end = front.seq.wrapping_add(front.data.len() as u32);
@@ -426,6 +472,27 @@ impl Reliability {
                 c.last_sent = now;
                 due.close_job = Some(RetransmitJob { seq: c.seq, data: Vec::new() });
             }
+        // Persist timer. Kept out of the RTO doubling below: it has its
+        // own exponential backoff, capped at MAX_RTO.
+        if self.zero_window_stalled() {
+            let rto = self.rto;
+            let p = self.persist.get_or_insert(PersistState {
+                last_sent: now,
+                interval: rto,
+                unanswered: 0,
+            });
+            if now.duration_since(p.last_sent) >= p.interval {
+                if p.unanswered >= MAX_RETRIES {
+                    return Err(self.next_seq);
+                }
+                p.unanswered += 1;
+                p.last_sent = now;
+                p.interval = (p.interval * 2).clamp(MIN_RTO, MAX_RTO);
+                due.probe = Some(self.next_seq);
+            }
+        } else {
+            self.persist = None;
+        }
         if !due.data_jobs.is_empty() || due.close_job.is_some() {
             // RFC 6298 §5.5: double RTO on retransmit. This is
             // independent of the SRTT estimate; the retransmit timer
@@ -446,6 +513,14 @@ impl Reliability {
 
     pub fn close_pending(&self) -> bool {
         self.close_pending.is_some()
+    }
+
+    /// True while the peer advertises a zero window and nothing is in
+    /// flight: no retransmit will elicit an ACK, so only the persist
+    /// probe can learn that the window reopened. The mux keeps such a
+    /// stream on its retransmit walk (see `StreamEntry::has_unacked`).
+    pub fn zero_window_stalled(&self) -> bool {
+        !self.write_finished && self.unacked.is_empty() && self.peer_window == 0
     }
 
     pub fn write_window_available(&self) -> u32 {
@@ -603,6 +678,36 @@ impl Reliability {
     /// received in-order, the ack advances PAST close_seq (by one
     /// virtual FIN byte) so the peer learns the Close has landed and
     /// can stop retransmitting it.
+    /// `ack_state` for an ACK that is about to be SENT: also records the
+    /// advertised window so `window_update` knows what the peer believes.
+    pub fn advertise_ack(&mut self) -> (u32, u32) {
+        let st = self.ack_state();
+        self.last_advertised_win = st.1;
+        st
+    }
+
+    /// Call after the application drained rx_buf. Returns the ACK to send
+    /// when the window has reopened enough that the peer must hear about it
+    /// — otherwise a sender stalled on a zero window waits for an ACK that,
+    /// with no inbound Data to trigger one, would never come. Fires when a
+    /// zero window regains `WINDOW_UPDATE_MIN` (or half the buffer, if
+    /// smaller), or when any window grows by at least half the buffer.
+    pub fn window_update(&mut self) -> Option<(u32, u32)> {
+        let (ack, win) = self.ack_state();
+        let last = self.last_advertised_win;
+        let threshold = if last == 0 {
+            (self.rx_buf_cap / 2).min(WINDOW_UPDATE_MIN)
+        } else {
+            self.rx_buf_cap / 2
+        };
+        if win > last && win - last >= threshold.max(1) {
+            self.last_advertised_win = win;
+            Some((ack, win))
+        } else {
+            None
+        }
+    }
+
     pub fn ack_state(&self) -> (u32, u32) {
         let win = self.rx_buf_cap.saturating_sub(self.rx_buf.len() as u32);
         let mut ack = self.expected_seq;
@@ -1038,6 +1143,79 @@ mod tests {
         );
         // The 0x40 far-future entry is still buffered (gap [0, 0x40) missing).
         assert!(r.reorder.contains_key(&0x0000_0040u32));
+    }
+
+    // ── Zero-window stall regression ─────────────────────────────────────
+
+    /// Drive a sender/receiver pair until the receiver's window is 0 and
+    /// every byte is ACKed: the state that used to wedge forever.
+    fn stall_at_zero_window() -> (Reliability, Reliability, Instant) {
+        let mut tx = Reliability::default();
+        let mut rx = Reliability::default();
+        let t0 = Instant::now();
+        let chunk = 16 * 1024u32;
+        while let Some(seq) = tx.allocate_seq(chunk) {
+            tx.record_sent(seq, vec![7u8; chunk as usize], t0);
+            assert!(rx.on_recv_data(seq, vec![7u8; chunk as usize]).send_ack);
+            let (ack, win) = rx.advertise_ack();
+            tx.on_recv_ack(ack, win, t0);
+        }
+        assert_eq!(rx.ack_state().1, 0, "receiver window exhausted");
+        assert!(tx.unacked_empty() && tx.write_window_available() == 0);
+        assert!(tx.zero_window_stalled());
+        (tx, rx, t0)
+    }
+
+    #[test]
+    fn drained_receiver_sends_window_update_that_reopens_sender() {
+        let (mut tx, mut rx, t0) = stall_at_zero_window();
+        // A tiny read is not worth an update (silly-window avoidance) ...
+        let mut small = vec![0u8; 1024];
+        rx.rx_drain(&mut small);
+        assert!(rx.window_update().is_none(), "1 KiB of room must not trigger an update");
+        // ... but draining the buffer is, and that ACK reopens the sender.
+        let mut all = vec![0u8; DEFAULT_RX_BUF_CAP as usize];
+        rx.rx_drain(&mut all);
+        let (ack, win) = rx.window_update().expect("drained receiver must announce its window");
+        assert_eq!(win, DEFAULT_RX_BUF_CAP);
+        assert!(rx.window_update().is_none(), "an announced window isn't re-announced");
+        tx.on_recv_ack(ack, win, t0);
+        assert!(!tx.zero_window_stalled());
+        assert!(tx.allocate_seq(1024).is_some(), "sender can write again");
+    }
+
+    #[test]
+    fn persist_probe_recovers_a_lost_window_update() {
+        let (mut tx, mut rx, t0) = stall_at_zero_window();
+        // Receiver drains, but its window-update ACK is lost on the wire.
+        let mut all = vec![0u8; DEFAULT_RX_BUF_CAP as usize];
+        rx.rx_drain(&mut all);
+        let _lost = rx.window_update();
+        // Nothing is due before the persist interval elapses ...
+        let due = tx.retransmit_due(t0).unwrap();
+        assert!(due.probe.is_none() && due.data_jobs.is_empty());
+        // ... then the sender probes with an empty Data frame.
+        let t1 = t0 + MAX_RTO;
+        let probe = tx.retransmit_due(t1).unwrap().probe.expect("persist probe due");
+        // The receiver ACKs the probe with its real window.
+        assert!(rx.on_recv_data(probe, Vec::new()).send_ack);
+        let (ack, win) = rx.advertise_ack();
+        tx.on_recv_ack(ack, win, t1);
+        assert!(tx.allocate_seq(1024).is_some(), "probe ACK reopened the window");
+        assert!(tx.retransmit_due(t1 + MAX_RTO * 4).unwrap().probe.is_none(), "timer disarmed");
+    }
+
+    #[test]
+    fn persist_probe_backs_off_and_gives_up_on_a_dead_peer() {
+        let (mut tx, _rx, t0) = stall_at_zero_window();
+        let mut t = t0;
+        let _ = tx.retransmit_due(t).unwrap(); // arms the timer
+        for _ in 0..MAX_RETRIES {
+            t += MAX_RTO;
+            assert!(tx.retransmit_due(t).unwrap().probe.is_some());
+        }
+        t += MAX_RTO;
+        assert!(tx.retransmit_due(t).is_err(), "unanswered probes must eventually reset");
     }
 
     #[test]

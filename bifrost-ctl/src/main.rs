@@ -24,7 +24,7 @@ use tokio::time::{timeout, Duration};
 )]
 struct Cli {
     /// Path to the daemon's admin socket.
-    #[arg(short, long, default_value = "/tmp/bifrost-socks5d-ctl.sock", env = "BIFROST_CTL_SOCKET")]
+    #[arg(short, long, default_value = "/run/bifrost/socks5d.sock", env = "BIFROST_CTL_SOCKET")]
     socket: PathBuf,
 
     /// Print raw JSON instead of formatted output.

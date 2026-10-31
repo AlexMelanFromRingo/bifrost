@@ -4,10 +4,11 @@
 // CONNECTs, routes each to an exit peer via a MeshStream, and pipes
 // bytes both ways with tokio::io::copy_bidirectional.
 //
-// `exit` mode: accepts MeshStream Opens from any peer, dials the real
-// target with tokio::net::TcpStream, and bridges the two. Reply codes
-// flow back as OpenAck frames so the client can mirror them on its
-// SOCKS5 socket.
+// `exit` mode: accepts MeshStream Opens from any peer, resolves the
+// target, vets every resolved address against the destination filter
+// (SSRF defence — see bifrost_core::dst_filter), dials a vetted address
+// with tokio::net::TcpStream, and bridges the two. Reply codes flow back
+// as OpenAck frames so the client can mirror them on its SOCKS5 socket.
 
 mod admin;
 mod config;
@@ -18,6 +19,7 @@ use admin::{AdminState, RaceConfig};
 use anyhow::{Context, Result};
 use bifrost_core::{
     discovery,
+    dst_filter::DstFilter,
     frame::OpenTarget,
     mux::{AcceptedStream, MeshMux},
     policy::{EgressPolicy, ExitRotator},
@@ -28,6 +30,7 @@ use bifrost_core::{
 use clap::{Parser, Subcommand};
 use config::{DaemonConfig, Mode};
 use norn_rs::node::Node;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
@@ -91,7 +94,14 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     let (mux, accept_rx) = MeshMux::new(conn);
 
     match cfg.mode {
-        Mode::Client => run_client(cfg, config_path, mux, started_at).await,
+        Mode::Client => {
+            // Client mode never serves inbound Opens. Drop the receiver so
+            // the mux refuses them with a Reset instead of queueing them
+            // into a channel nobody drains (64 queued Opens from any peer
+            // would otherwise wedge the mux read loop).
+            drop(accept_rx);
+            run_client(cfg, config_path, mux, started_at).await
+        }
         Mode::Exit => run_exit(cfg, config_path, mux, accept_rx, started_at).await,
     }
 }
@@ -176,8 +186,21 @@ async fn run_client(
                 }
             });
         }
-        if cfg.bifrost.mdns_discovery {
-            match discovery::browse_exits(pool.clone(), mux.conn().pub_key) {
+        let trust = cfg.bifrost.discovery_trust().context("[bifrost].trusted_exits")?;
+        if cfg.bifrost.mdns_discovery && !trust.admits_anything() {
+            info!(
+                "mDNS exit discovery not started: no [bifrost].trusted_exits and \
+                 mdns_trust_any = false (unauthenticated LAN adverts are never trusted)"
+            );
+        } else if cfg.bifrost.mdns_discovery {
+            if trust.trust_any {
+                warn!(
+                    "mDNS: mdns_trust_any = true — ANY LAN host advertising {} becomes an \
+                     exit candidate and can observe CONNECT targets",
+                    discovery::SERVICE_TYPE
+                );
+            }
+            match discovery::browse_exits(pool.clone(), mux.conn().pub_key, trust) {
                 Ok(daemon) => {
                     info!("mDNS exit discovery active ({})", discovery::SERVICE_TYPE);
                     // Stash the handle in a Box<dyn Any + Send + Sync>
@@ -483,7 +506,16 @@ async fn run_exit(
     mut accept_rx: tokio::sync::mpsc::Receiver<AcceptedStream>,
     started_at: Instant,
 ) -> Result<()> {
-    info!("exit mode: waiting for SOCKS5 CONNECTs over the mesh");
+    // Build the destination filter (SSRF defence) up front so a bad
+    // dst_allow/dst_deny CIDR fails the daemon at startup, not mid-traffic.
+    let dst_filter = Arc::new(
+        DstFilter::new(cfg.exit.block_private_dst, &cfg.exit.dst_allow, &cfg.exit.dst_deny)
+            .context("invalid exit destination filter (block_private_dst / dst_allow / dst_deny)")?,
+    );
+    info!(
+        "exit mode: waiting for SOCKS5 CONNECTs over the mesh (block_private_dst={})",
+        cfg.exit.block_private_dst
+    );
     // Exit mode has no per-CONNECT race knobs to manage, but RaceConfig
     // is still wired so a future Reload at least produces consistent
     // "no-op" responses (and so AdminState carries the same shape in
@@ -514,7 +546,7 @@ async fn run_exit(
         }
     }
     while let Some(acc) = accept_rx.recv().await {
-        tokio::spawn(handle_exit_stream(acc));
+        tokio::spawn(handle_exit_stream(acc, dst_filter.clone()));
     }
     warn!("accept channel closed — mux read loop ended");
     Ok(())
@@ -533,7 +565,7 @@ fn spawn_admin_if_configured(cfg: &DaemonConfig, state: AdminState) {
     });
 }
 
-async fn handle_exit_stream(acc: AcceptedStream) {
+async fn handle_exit_stream(acc: AcceptedStream, dst_filter: Arc<DstFilter>) {
     let target = acc.target.clone();
     let mut mesh = acc.stream;
     info!(
@@ -550,10 +582,20 @@ async fn handle_exit_stream(acc: AcceptedStream) {
         return;
     }
     let target_str = open_target_to_connect_str(&target);
-    let tcp = tokio::time::timeout(Duration::from_secs(15), TcpStream::connect(&target_str)).await;
+    // One 15 s budget covers resolution + dial.
+    let tcp = tokio::time::timeout(
+        Duration::from_secs(15),
+        dial_vetted(&target, &dst_filter),
+    )
+    .await;
     let mut tcp = match tcp {
         Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
+        Ok(Err(DialError::Refused(code))) => {
+            warn!("exit: refusing {target_str}: destination blocked by policy");
+            let _ = mesh.send_open_ack(code).await;
+            return;
+        }
+        Ok(Err(DialError::Io(e))) => {
             warn!("exit: dial {target_str} failed: {e}");
             let _ = mesh.send_open_ack(map_dial_err(&e)).await;
             return;
@@ -578,6 +620,60 @@ async fn handle_exit_stream(acc: AcceptedStream) {
     }
 }
 
+/// Why an exit-side dial didn't produce a socket.
+#[derive(Debug)]
+enum DialError {
+    /// Destination policy refused the target — carry the SOCKS5 REP code.
+    Refused(u8),
+    /// Resolution or connect failed at the OS level.
+    Io(std::io::Error),
+}
+
+/// Resolve `target` and vet EVERY resolved address against `filter`. A
+/// single blocked address refuses the whole target: a name that resolves
+/// to both a public and an internal address is either misconfigured or a
+/// rebinding attempt, and there is no safe way to pick. Returning concrete
+/// `SocketAddr`s (rather than letting `TcpStream::connect` re-resolve the
+/// name) closes the DNS-rebinding TOCTOU between check and dial.
+async fn resolve_vetted(
+    target: &OpenTarget,
+    filter: &DstFilter,
+) -> Result<Vec<SocketAddr>, DialError> {
+    let addrs: Vec<SocketAddr> = match target {
+        OpenTarget::V4(ip, port) => vec![SocketAddr::new((*ip).into(), *port)],
+        OpenTarget::V6(ip, port) => vec![SocketAddr::new((*ip).into(), *port)],
+        OpenTarget::Domain(host, port) => tokio::net::lookup_host((host.as_str(), *port))
+            .await
+            .map_err(DialError::Io)?
+            .collect(),
+        OpenTarget::Egress => return Err(DialError::Refused(reply::CMD_NOT_SUPPORTED)),
+    };
+    if addrs.is_empty() {
+        return Err(DialError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "target resolved to no addresses",
+        )));
+    }
+    if let Some(bad) = addrs.iter().find(|a| !filter.allows(a.ip())) {
+        tracing::debug!("exit: {} resolved to blocked address {bad}", target.display());
+        return Err(DialError::Refused(reply::NOT_ALLOWED));
+    }
+    Ok(addrs)
+}
+
+/// Dial the first reachable vetted address for `target`.
+async fn dial_vetted(target: &OpenTarget, filter: &DstFilter) -> Result<TcpStream, DialError> {
+    let addrs = resolve_vetted(target, filter).await?;
+    let mut last_err = None;
+    for addr in addrs {
+        match TcpStream::connect(addr).await {
+            Ok(s) => return Ok(s),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(DialError::Io(last_err.expect("resolve_vetted never returns an empty list")))
+}
+
 fn open_target_to_connect_str(t: &OpenTarget) -> String {
     match t {
         OpenTarget::V4(ip, port) => format!("{ip}:{port}"),
@@ -596,5 +692,54 @@ fn map_dial_err(e: &std::io::Error) -> u8 {
         TimedOut => reply::TTL_EXPIRED,
         NotFound | AddrNotAvailable => reply::HOST_UNREACHABLE,
         _ => reply::GENERAL_FAILURE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn default_filter() -> DstFilter {
+        DstFilter::new(true, &[], &[]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn exit_refuses_internal_literal_targets() {
+        let f = default_filter();
+        for t in [
+            OpenTarget::V4(Ipv4Addr::LOCALHOST, 22),
+            OpenTarget::V4(Ipv4Addr::new(169, 254, 169, 254), 80),
+            OpenTarget::V4(Ipv4Addr::new(10, 0, 0, 1), 80),
+            OpenTarget::V6(Ipv6Addr::LOCALHOST, 22),
+            OpenTarget::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped(), 22),
+        ] {
+            match resolve_vetted(&t, &f).await {
+                Err(DialError::Refused(code)) => assert_eq!(code, reply::NOT_ALLOWED),
+                other => panic!("{} must be refused, got {other:?}", t.display()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exit_refuses_domain_resolving_to_loopback() {
+        // `localhost` resolves via /etc/hosts — no network needed. The check
+        // must apply to the RESOLVED address, not the (innocuous) name.
+        let t = OpenTarget::Domain("localhost".into(), 22);
+        assert!(
+            matches!(resolve_vetted(&t, &default_filter()).await, Err(DialError::Refused(_))),
+            "a name resolving to loopback must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_allows_public_and_opted_in_private_targets() {
+        let t = OpenTarget::V4(Ipv4Addr::new(8, 8, 8, 8), 443);
+        let addrs = resolve_vetted(&t, &default_filter()).await.expect("public allowed");
+        assert_eq!(addrs, vec![SocketAddr::from(([8, 8, 8, 8], 443))]);
+        // block_private_dst = false opens RFC1918 but never loopback.
+        let open = DstFilter::new(false, &[], &[]).unwrap();
+        assert!(resolve_vetted(&OpenTarget::V4(Ipv4Addr::new(10, 0, 0, 1), 80), &open).await.is_ok());
+        assert!(resolve_vetted(&OpenTarget::V4(Ipv4Addr::LOCALHOST, 80), &open).await.is_err());
     }
 }

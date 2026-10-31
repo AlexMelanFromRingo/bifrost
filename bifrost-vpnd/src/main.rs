@@ -99,12 +99,19 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
 
     match cfg.mode {
         Mode::Mesh => {
+            // Only the exit serves inbound Opens. Dropping the receiver makes
+            // the mux refuse them with a Reset; holding it undrained would let
+            // 64 queued Opens from any peer wedge the mux read loop.
+            drop(accept_rx);
             info!("mesh mode: norn-rs TUN active, no egress");
             futures_park().await;
             Ok(())
         }
         Mode::Exit => run_exit(mux, accept_rx, &cfg).await,
-        Mode::Client => run_client(mux, &cfg).await,
+        Mode::Client => {
+            drop(accept_rx); // see Mesh above
+            run_client(mux, &cfg).await
+        }
     }
 }
 
@@ -123,6 +130,11 @@ async fn run_exit(
         )
         .context("invalid exit destination filter (block_private_dst / dst_allow / dst_deny)")?,
     );
+    let admission = Arc::new(
+        cfg.exit
+            .admission()
+            .context("invalid exit admission policy (allowed_clients / min_client_pow_bits)")?,
+    );
     egress::start_exit(
         mux,
         accept_rx,
@@ -135,6 +147,7 @@ async fn run_exit(
         cfg.exit.lease_persistence_path.clone(),
         cfg.exit.admin_socket.clone(),
         dst_filter,
+        admission,
     )
     .await
 }
@@ -157,6 +170,7 @@ async fn run_client(mux: Arc<MeshMux>, cfg: &VpnConfig) -> Result<()> {
         cfg.client.tun_name.clone(),
         cfg.client.install_default_route,
         cfg.client.admin_socket.clone(),
+        cfg.client.lease_policy().context("invalid [client].allowed_lease_cidrs")?,
     )
     .await?;
     futures_park().await;
