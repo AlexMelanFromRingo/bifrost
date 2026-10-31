@@ -837,6 +837,21 @@ pub(crate) async fn flush_conntrack(lease: &Lease) {
     }
 }
 
+/// Blocking twin of [`flush_conntrack`] for callers outside a tokio runtime.
+pub(crate) fn flush_conntrack_blocking(lease: &Lease) {
+    for args in conntrack_flush_argv(lease) {
+        let res = std::process::Command::new("conntrack")
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if let Err(e) = res {
+            debug!("conntrack unavailable ({e}); evicted lease state not flushed");
+            return;
+        }
+    }
+}
+
 /// Bring up the egress TUN with the v4 gateway (and v6 gateway if
 /// dual-stack), enable forwarding, and add the matching iptables /
 /// ip6tables MASQUERADE + FORWARD-ACCEPT rules.
