@@ -19,7 +19,15 @@
 //!
 //!   * **Always blocked** (never sensible to egress, not overridable):
 //!     loopback, link-local (incl. IPv4 cloud metadata 169.254.0.0/16),
-//!     multicast, broadcast, unspecified.
+//!     multicast, broadcast, "this network" 0.0.0.0/8, the IPv6 transition
+//!     prefixes that hide an IPv4 behind a v6 address (6to4 2002::/16, NAT64
+//!     64:ff9b::/96 and the local-use 64:ff9b:1::/48), and the exit host's
+//!     **own interface addresses** (public / LAN / TUN — see
+//!     [`DstFilter::refresh_local_addrs`]), so a client can't reach a service
+//!     bound on the exit via its public IP.
+//!   * IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`) and
+//!     IPv4-translated (`::ffff:0:a.b.c.d`) IPv6 are judged by the embedded
+//!     IPv4 (see [`normalize`]).
 //!   * **Blocked when `block_private`** (the default): RFC1918
 //!     (10/8, 172.16/12, 192.168/16), CGNAT 100.64.0.0/10, IPv6 ULA fc00::/7
 //!     (which covers the AWS IPv6 metadata `fd00:ec2::254`).
@@ -31,7 +39,10 @@
 //! range comparisons plus a scan of the (usually empty) allow/deny lists.
 
 use anyhow::{bail, Context, Result};
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 /// A parsed CIDR block, pre-masked so matching is a single bitwise-AND compare.
 /// Public so other policy checks (e.g. vpnd's client-side lease validation)
@@ -93,14 +104,32 @@ impl Cidr {
             }
         }
     }
+
+    /// True if the two blocks share any address. Aligned CIDRs either nest or
+    /// are disjoint, so this is "one contains the other" (family mismatch
+    /// never overlaps).
+    pub fn overlaps(&self, other: &Cidr) -> bool {
+        self.contains_cidr(other) || other.contains_cidr(self)
+    }
 }
 
-/// Egress destination policy. Cheap to clone-by-`Arc`; immutable after build.
+/// The exit host's own interface addresses, shared between a [`DstFilter`]
+/// (and its clones) and whatever refreshes it. Stored normalised.
+pub type LocalAddrs = Arc<RwLock<HashSet<IpAddr>>>;
+
+/// How often the exits re-enumerate their interface addresses (DHCP renewals,
+/// hot-plugged NICs, a late-assigned public IP).
+pub const LOCAL_ADDR_REFRESH: Duration = Duration::from_secs(60);
+
+/// Egress destination policy. Cheap to clone-by-`Arc`; the CIDR policy is
+/// immutable after build, only the shared local-address set is refreshed.
+/// Clones share that set.
 #[derive(Debug, Clone)]
 pub struct DstFilter {
     block_private: bool,
     allow: Vec<Cidr>,
     deny: Vec<Cidr>,
+    local: LocalAddrs,
 }
 
 impl DstFilter {
@@ -117,15 +146,66 @@ impl DstFilter {
             .map(|s| Cidr::parse(s))
             .collect::<Result<Vec<_>>>()
             .context("parsing exit dst_deny CIDRs")?;
-        Ok(Self { block_private, allow, deny })
+        Ok(Self { block_private, allow, deny, local: LocalAddrs::default() })
+    }
+
+    /// Seed the always-blocked local-address set (the exit's own IPs). The
+    /// daemons use [`refresh_local_addrs`](Self::refresh_local_addrs); this is
+    /// the injectable form for tests and non-`getifaddrs` platforms.
+    pub fn with_local_addrs(self, addrs: impl IntoIterator<Item = IpAddr>) -> Self {
+        self.set_local_addrs(addrs);
+        self
+    }
+
+    /// Replace the local-address set (visible to every clone of this filter).
+    pub fn set_local_addrs(&self, addrs: impl IntoIterator<Item = IpAddr>) {
+        let fresh: HashSet<IpAddr> = addrs.into_iter().map(normalize).collect();
+        *self.local.write().unwrap_or_else(|e| e.into_inner()) = fresh;
+    }
+
+    /// Handle on the shared local-address set.
+    pub fn local_addrs(&self) -> LocalAddrs {
+        self.local.clone()
+    }
+
+    /// Re-enumerate this host's interface addresses ([`local_interface_addrs`])
+    /// into the always-blocked set. Returns how many were found. On error the
+    /// previous set is kept.
+    pub fn refresh_local_addrs(&self) -> std::io::Result<usize> {
+        let addrs = local_interface_addrs()?;
+        let n = addrs.len();
+        self.set_local_addrs(addrs);
+        Ok(n)
+    }
+
+    /// Refresh the local-address set every `every` in a background task
+    /// (call [`refresh_local_addrs`](Self::refresh_local_addrs) once first so
+    /// startup fails fast). A failed refresh keeps the last good set.
+    pub fn spawn_local_addr_refresh(&self, every: Duration) -> tokio::task::JoinHandle<()> {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // first tick is immediate; the caller just refreshed
+            loop {
+                tick.tick().await;
+                match this.refresh_local_addrs() {
+                    Ok(n) => tracing::trace!("dst filter: {n} local address(es) blocked"),
+                    Err(e) => tracing::warn!(
+                        "dst filter: re-enumerating local addresses failed: {e} (keeping last set)"
+                    ),
+                }
+            }
+        })
     }
 
     /// True if a packet / connection destined to `ip` may be forwarded out the
-    /// egress. IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is judged by its embedded
-    /// IPv4 — a dialer handed `[::ffff:127.0.0.1]` reaches v4 loopback.
+    /// egress. IPv4-embedding IPv6 forms are judged by the embedded IPv4 (see
+    /// [`normalize`]) — a dialer handed `[::ffff:127.0.0.1]` reaches v4
+    /// loopback.
     pub fn allows(&self, ip: IpAddr) -> bool {
         let ip = normalize(ip);
-        if Self::always_blocked(ip) {
+        if Self::always_blocked(ip) || self.is_local(ip) {
             return false;
         }
         if self.allow.iter().any(|c| c.contains(ip)) {
@@ -158,7 +238,15 @@ impl DstFilter {
         }
     }
 
-    /// Never sensible to egress, regardless of policy.
+    /// One of the exit host's own addresses. A poisoned lock is read through
+    /// (the set is replaced wholesale, so it is never half-written).
+    fn is_local(&self, ip: IpAddr) -> bool {
+        self.local.read().unwrap_or_else(|e| e.into_inner()).contains(&ip)
+    }
+
+    /// Never sensible to egress, regardless of policy. `ip` is already
+    /// [`normalize`]d, so v4-mapped / -compatible / -translated v6 arrive here
+    /// as V4; the transition prefixes left in V6 are blocked outright.
     fn always_blocked(ip: IpAddr) -> bool {
         match ip {
             IpAddr::V4(a) => {
@@ -166,7 +254,7 @@ impl DstFilter {
                     || a.is_link_local()  // 169.254.0.0/16 (incl. cloud metadata)
                     || a.is_multicast()   // 224.0.0.0/4
                     || a.is_broadcast()   // 255.255.255.255
-                    || a.is_unspecified() // 0.0.0.0
+                    || a.octets()[0] == 0 // 0.0.0.0/8 "this network" (RFC 791/1122)
             }
             IpAddr::V6(a) => {
                 a.is_loopback()        // ::1
@@ -175,6 +263,8 @@ impl DstFilter {
                     || is_v6_link_local(a) // fe80::/10
                     || is_v6_6to4(a)      // 2002::/16 — embeds v4 (tunnel range)
                     || is_v6_nat64(a)     // 64:ff9b::/96 — embeds v4 (translation)
+                    || is_v6_nat64_local(a) // 64:ff9b:1::/48 — local-use NAT64
+                    || is_v6_teredo(a)    // 2001::/32 — Teredo, embeds v4
             }
         }
     }
@@ -188,18 +278,87 @@ impl DstFilter {
     }
 }
 
-/// Normalise IPv4-mapped (::ffff:a.b.c.d) to the embedded IPv4 so the v4
-/// always-blocked / private rules apply. Otherwise a client could reach
-/// 127.0.0.1 / 169.254.169.254 / 10.0.0.0/8 via an ::ffff: destination that the
-/// v6-only checks would miss (SSRF).
+/// Normalise the IPv6 forms that carry an IPv4 in their low 32 bits to that
+/// IPv4 so the v4 always-blocked / private rules apply. Otherwise a client
+/// could reach 127.0.0.1 / 169.254.169.254 / 10.0.0.0/8 via a v6 destination
+/// the v6-only checks would miss (SSRF):
+///
+///   * IPv4-mapped `::ffff:0:0/96` (RFC 4291) — what a dual-stack socket dials.
+///   * IPv4-compatible `::/96` (RFC 4291, deprecated) — `::` and `::1` are
+///     left as v6 (unspecified / loopback, both always blocked anyway).
+///   * IPv4-translated `::ffff:0:0:0/96` (RFC 2765 SIIT).
+///
+/// 6to4 and NAT64 also embed an IPv4 but are blocked outright in
+/// `always_blocked` instead (the exit runs neither, and the local-use NAT64
+/// /48's embedding offset is deployment-specific, RFC 8215).
 pub fn normalize(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+        IpAddr::V6(v6) => match embedded_v4(v6) {
             Some(v4) => IpAddr::V4(v4),
             None => IpAddr::V6(v6),
         },
         v4 => v4,
     }
+}
+
+/// The IPv4 inside an IPv4-mapped / -compatible / -translated IPv6 address.
+fn embedded_v4(a: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = a.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let o = a.octets();
+    let low = Ipv4Addr::new(o[12], o[13], o[14], o[15]);
+    let compatible = o[..12].iter().all(|&b| b == 0);
+    let translated = o[..8].iter().all(|&b| b == 0) && o[8..12] == [0xff, 0xff, 0, 0];
+    // `::` / `::1` stay v6 (still blocked) so their Display / v6 rules are kept.
+    if (compatible && u32::from(low) > 1) || translated {
+        Some(low)
+    } else {
+        None
+    }
+}
+
+/// This host's interface addresses (every family, every interface, up or
+/// not), for the always-blocked local set. `getifaddrs(3)` on unix; other
+/// platforms return an empty list — use [`DstFilter::with_local_addrs`] there.
+#[cfg(unix)]
+pub fn local_interface_addrs() -> std::io::Result<Vec<IpAddr>> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `head` with a list we free below.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut out = Vec::new();
+    let mut cur = head;
+    while !cur.is_null() {
+        // SAFETY: `cur` walks the getifaddrs list, valid until freeifaddrs;
+        // `ifa_addr` (nullable) points at a sockaddr of the family it names.
+        unsafe {
+            let sa = (*cur).ifa_addr;
+            if !sa.is_null() {
+                match i32::from((*sa).sa_family) {
+                    libc::AF_INET => {
+                        let sin = &*(sa as *const libc::sockaddr_in);
+                        out.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))));
+                    }
+                    libc::AF_INET6 => {
+                        let sin6 = &*(sa as *const libc::sockaddr_in6);
+                        out.push(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)));
+                    }
+                    _ => {}
+                }
+            }
+            cur = (*cur).ifa_next;
+        }
+    }
+    // SAFETY: `head` came from a successful getifaddrs and is freed once.
+    unsafe { libc::freeifaddrs(head) };
+    Ok(out)
+}
+
+#[cfg(not(unix))]
+pub fn local_interface_addrs() -> std::io::Result<Vec<IpAddr>> {
+    Ok(Vec::new())
 }
 
 /// 100.64.0.0/10 — RFC 6598 carrier-grade NAT space.
@@ -227,12 +386,29 @@ fn is_v6_6to4(a: Ipv6Addr) -> bool {
     o[0] == 0x20 && o[1] == 0x02
 }
 
+/// 2001::/32 — Teredo (RFC 4380). Embeds the server and (obfuscated) client
+/// IPv4; only reachable if the exit runs a Teredo client, but blocked
+/// outright like the other v4-embedding tunnel ranges.
+fn is_v6_teredo(a: Ipv6Addr) -> bool {
+    let o = a.octets();
+    o[..4] == [0x20, 0x01, 0x00, 0x00]
+}
+
 /// 64:ff9b::/96 — the well-known NAT64 prefix (RFC 6052). Embeds an IPv4 in the
 /// low 32 bits; block so it can't reach a private/loopback v4 via translation.
 fn is_v6_nat64(a: Ipv6Addr) -> bool {
     let o = a.octets();
     o[0] == 0x00 && o[1] == 0x64 && o[2] == 0xff && o[3] == 0x9b
         && o[4..12].iter().all(|&b| b == 0)
+}
+
+/// 64:ff9b:1::/48 — the local-use NAT64 prefix (RFC 8215). It may be used with
+/// any RFC 6052 prefix length (/48../96), so where the IPv4 sits is a
+/// per-deployment choice; rather than guess one embedding (and miss the
+/// others) block the whole /48.
+fn is_v6_nat64_local(a: Ipv6Addr) -> bool {
+    let o = a.octets();
+    o[..6] == [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01]
 }
 
 #[cfg(test)]
@@ -408,6 +584,13 @@ mod tests {
     }
 
     #[test]
+    fn ssrf_teredo_blocked_but_neighbouring_2001_space_allowed() {
+        let f = DstFilter::new(true, &[], &[]).unwrap();
+        assert!(!f.allows("2001:0:4136:e378:8000:63bf:3fff:fdd2".parse().unwrap()), "Teredo");
+        assert!(f.allows("2001:4860:4860::8888".parse().unwrap()), "regular 2001:4860::/32 stays reachable");
+    }
+
+    #[test]
     fn ssrf_6to4_and_nat64_ranges_blocked() {
         let f = default_filter();
         // 6to4 (2002::/16) embedding loopback, and the NAT64 well-known prefix
@@ -417,5 +600,76 @@ mod tests {
         assert!(!f.allows(v6("64:ff9b::a00:1")), "NAT64 embedding 10.0.0.1 must be blocked");
         // A normal public v6 in a neighbouring range is unaffected.
         assert!(f.allows(v6("2001:4860:4860::8888")), "public v6 still allowed");
+    }
+
+    /// Regression (SSRF via transition prefixes): only 64:ff9b::/96 was
+    /// caught, so the local-use NAT64 /48 and IPv4-compatible / -translated
+    /// v6 smuggled loopback / RFC1918 / metadata past the v6-only checks.
+    #[test]
+    fn ssrf_local_use_nat64_and_v4_compatible_blocked() {
+        let f = default_filter();
+        // 64:ff9b:1::/48 — blocked whatever the embedding offset.
+        for s in ["64:ff9b:1::7f00:1", "64:ff9b:1::a9fe:a9fe", "64:ff9b:1:7f00:1::",
+                  "64:ff9b:1:ffff::808:808"] {
+            assert!(!f.allows(v6(s)), "local-use NAT64 {s} must be blocked");
+        }
+        // IPv4-compatible ::a.b.c.d and IPv4-translated ::ffff:0:a.b.c.d are
+        // judged by the embedded v4.
+        for s in ["::127.0.0.1", "::169.254.169.254", "::10.0.0.1", "::192.168.1.1",
+                  "::ffff:0:127.0.0.1", "::ffff:0:10.0.0.1"] {
+            assert!(!f.allows(v6(s)), "{s} must be blocked via its embedded v4");
+        }
+        assert_eq!(normalize(v6("::10.0.0.1")), v4("10.0.0.1"));
+        assert!(f.allows(v6("::8.8.8.8")), "compatible public v4 follows v4 rules");
+        assert!(f.allows(v6("::ffff:0:8.8.8.8")), "translated public v4 follows v4 rules");
+        // An allowlist written in v4 applies to the compatible form too, and
+        // `::` / `::1` keep their v6 meaning (still blocked).
+        let allow = DstFilter::new(true, &["192.168.10.0/24".into()], &[]).unwrap();
+        assert!(allow.allows(v6("::192.168.10.5")));
+        assert_eq!(normalize(v6("::1")), v6("::1"));
+        assert!(!f.allows(v6("::1")) && !f.allows(v6("::")));
+        // Just outside 64:ff9b:1::/48 is ordinary (public) v6.
+        assert!(f.allows(v6("64:ff9b:2::808:808")));
+    }
+
+    #[test]
+    fn this_network_0_0_0_0_slash_8_blocked() {
+        let f = DstFilter::new(false, &["0.0.0.0/0".into()], &[]).unwrap();
+        for s in ["0.0.0.0", "0.0.0.1", "0.1.2.3", "0.255.255.255"] {
+            assert!(!f.allows(v4(s)), "{s} (0.0.0.0/8) must always be blocked");
+        }
+        assert!(!f.allows(v6("::ffff:0.1.2.3")), "mapped 0/8 blocked too");
+        assert!(f.allows(v4("1.0.0.1")), "1.0.0.0/8 is outside");
+    }
+
+    /// Regression (exit reachable via its own IPs): the exit's public / LAN
+    /// addresses weren't blocked, so a client could hit services bound on the
+    /// exit host itself. They're always blocked, even past `allow`.
+    #[test]
+    fn exit_own_addresses_always_blocked() {
+        let f = DstFilter::new(false, &["0.0.0.0/0".into(), "::/0".into()], &[])
+            .unwrap()
+            .with_local_addrs([v4("203.0.113.7"), v4("192.168.1.20"), v6("2001:db8::7")]);
+        assert!(!f.allows(v4("203.0.113.7")), "exit's public v4");
+        assert!(!f.allows(v4("192.168.1.20")), "exit's LAN v4 (even with block_private off)");
+        assert!(!f.allows(v6("2001:db8::7")), "exit's public v6");
+        assert!(!f.allows(v6("::ffff:203.0.113.7")), "mapped form of a local v4");
+        assert!(f.allows(v4("203.0.113.8")), "neighbouring public host still reachable");
+
+        // Clones share the set: a refresh after a DHCP change is seen by all.
+        let clone = f.clone();
+        f.set_local_addrs([v4("203.0.113.8")]);
+        assert!(clone.allows(v4("203.0.113.7")), "old address released");
+        assert!(!clone.allows(v4("203.0.113.8")), "new address blocked via the shared set");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refresh_local_addrs_enumerates_this_host() {
+        let f = DstFilter::new(false, &[], &[]).unwrap();
+        let n = f.refresh_local_addrs().expect("getifaddrs");
+        assert!(n >= 1, "at least loopback is enumerated");
+        let set = f.local_addrs();
+        assert!(set.read().unwrap().contains(&v4("127.0.0.1")), "lo's 127.0.0.1 is found");
     }
 }

@@ -2,6 +2,46 @@
 
 All notable changes to bifrost are documented here.
 
+## v0.2.1 — 2026-10-31
+
+Fixes from an automated security review of v0.2.0. No wire changes; one new
+config key (`[exit] reclaim_min_idle_secs`, vpnd).
+
+### Security
+- **Exit destination filter — IPv6 transition prefixes (SSRF):** only the
+  well-known NAT64 prefix `64:ff9b::/96` was caught. The local-use NAT64
+  prefix `64:ff9b:1::/48` (RFC 8215; its IPv4 embedding offset is
+  deployment-specific) is now blocked outright, and IPv4-compatible
+  `::a.b.c.d` / IPv4-translated `::ffff:0:a.b.c.d` are judged by their
+  embedded IPv4 like IPv4-mapped already was. The whole "this network"
+  `0.0.0.0/8` is always blocked (was only `0.0.0.0`). Shared by both exits.
+- **Exit destination filter — the exit's own addresses:** a client could
+  reach services bound on the exit host via its public / LAN IPs. Both exits
+  (`bifrost-socks5d`, `bifrost-vpnd`) now enumerate their interface addresses
+  (`getifaddrs`) at startup — failing fast if they can't — and every 60 s
+  after, and always block them (not overridable by `dst_allow`). vpnd also
+  re-enumerates right after configuring the egress TUN. New injectable API:
+  `DstFilter::with_local_addrs` / `set_local_addrs` / `refresh_local_addrs` /
+  `spawn_local_addr_refresh` (clones share the set).
+- **vpnd client route install:** the lease route was installed with `ip route
+  replace`, silently overwriting e.g. the client's own LAN or docker route
+  when an exit handed out an overlapping (private) subnet. The client now
+  refuses a lease subnet overlapping any existing route or interface address
+  not on its TUN (default routes ignored; checked via `ip -j`, fails closed),
+  and uses `ip route add` — EEXIST is accepted only when every route for that
+  exact subnet is already on the bifrost TUN.
+- **vpnd lease reclamation reuse:** a reclaimed address went straight to the
+  next client, which inherited the previous owner's conntrack / NAT state and
+  in-flight replies. A full pool now only reclaims leases idle for at least
+  `[exit] reclaim_min_idle_secs` (default 600; otherwise the newcomer is
+  refused), and flushes the old address's conntrack entries on reclaim
+  (`conntrack -D -s/-d`, best-effort; skipped at debug level if the tool is
+  missing).
+- Teredo `2001::/32` (embeds an IPv4) is now blocked like 6to4 / NAT64.
+- Operator `EvictLease` flushes the evicted lease's conntrack state too.
+- Dependencies updated (`cargo update`): quinn-proto, rustls, rustls-webpki,
+  tokio and others carrying RUSTSEC advisories; norn-rs 0.13.1.
+
 ## v0.2.0 — 2026-10-31
 
 Two hardening passes, built on **norn-rs v0.13.0** (a flag-day wire change in

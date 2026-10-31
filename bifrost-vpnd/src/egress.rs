@@ -709,19 +709,37 @@ impl EgressTable {
     }
 
     /// The reclamation victim when the pool is full: the least-recently-
-    /// active lease with no live session whose peer isn't connected. Never
-    /// a lease in use. Ties break on the lower v4 address (deterministic).
+    /// active lease with no live session whose peer isn't connected and
+    /// that has been idle for at least `min_idle` seconds. Never a lease in
+    /// use. Ties break on the lower v4 address (deterministic).
+    ///
+    /// The idle floor keeps a just-disconnected lease out of reach: a
+    /// reclaimed address is handed out again at once, and the new owner
+    /// would otherwise land on the old owner's live conntrack / NAT state
+    /// and in-flight replies. A clock that stepped back (`now <
+    /// last_active`) counts as not idle.
     fn reclaim_victim(
         &self,
         connected: &std::collections::HashSet<bifrost_core::PubKey>,
+        now: u64,
+        min_idle: u64,
     ) -> Option<bifrost_core::PubKey> {
         self.lease_by_peer
             .iter()
-            .filter(|(p, e)| e.sessions == 0 && !connected.contains(*p))
+            .filter(|(p, e)| {
+                e.sessions == 0
+                    && !connected.contains(*p)
+                    && now >= e.last_active
+                    && now - e.last_active >= min_idle
+            })
             .min_by_key(|(_, e)| (e.last_active, u32::from(e.lease.v4)))
             .map(|(p, _)| *p)
     }
 }
+
+/// Default for `[exit].reclaim_min_idle_secs`: a lease must have been idle
+/// (no live session) this long before a full pool may reclaim it.
+pub const RECLAIM_MIN_IDLE_SECS_DEFAULT: u64 = 10 * 60;
 
 /// Unix seconds now (0 if the clock is before the epoch).
 fn unix_now() -> u64 {
@@ -776,6 +794,47 @@ fn ensure_rule(prog: &str, args: &[&str]) -> Result<()> {
         run_cmd(prog, args)?;
     }
     Ok(())
+}
+
+/// `conntrack` invocations that drop every tracked flow to or from a
+/// reclaimed lease's addresses (original-direction src and dst, per family).
+fn conntrack_flush_argv(lease: &Lease) -> Vec<Vec<String>> {
+    let mut ips = vec![("ipv4", IpAddr::V4(lease.v4))];
+    if let Some(v6) = lease.v6 {
+        ips.push(("ipv6", IpAddr::V6(v6)));
+    }
+    ips.into_iter()
+        .flat_map(|(family, ip)| {
+            ["-s", "-d"].map(|dir| {
+                ["-D", "-f", family, dir, &ip.to_string()].map(String::from).to_vec()
+            })
+        })
+        .collect()
+}
+
+/// Best-effort: flush the kernel conntrack entries of a reclaimed (or
+/// operator-evicted) lease before its address goes to a new client, so the
+/// newcomer doesn't inherit the previous owner's NAT mappings and in-flight
+/// replies. A missing `conntrack` tool or "0 flow entries" (exit 1) is logged
+/// at debug only.
+#[cfg_attr(not(feature = "tun"), allow(dead_code))]
+pub(crate) async fn flush_conntrack(lease: &Lease) {
+    for args in conntrack_flush_argv(lease) {
+        let res = tokio::process::Command::new("conntrack")
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        match res {
+            Ok(st) if st.success() => debug!("conntrack {}: flushed", args.join(" ")),
+            Ok(st) => debug!("conntrack {}: exited {:?} (no entries?)", args.join(" "), st.code()),
+            Err(e) => {
+                debug!("conntrack unavailable ({e}); reclaimed lease state not flushed");
+                return;
+            }
+        }
+    }
 }
 
 /// Bring up the egress TUN with the v4 gateway (and v6 gateway if
@@ -893,18 +952,31 @@ pub fn configure_client_kernel(
     // Routes are derived from the LEASED address; `EgressHello::validate`
     // has already pinned the gateway into that same (private or
     // explicitly allowed) subnet, so the exit can't steer this route.
+    //
+    // Even a private lease subnet may collide with the client's own LAN /
+    // docker bridge / another VPN: refuse one that overlaps any existing
+    // route or interface address off our TUN (checked BEFORE `addr add`,
+    // whose kernel prefix route would mask the conflict), and `route add`
+    // rather than `replace` so an existing route is never overwritten.
     let v4_cidr = format!("{}/{}", v4_addr, v4_prefix);
     let v4_subnet = subnet_v4_cidr_str(v4_addr, v4_prefix);
+    let v6_subnet = match (v6_addr, gateway_v6) {
+        (Some(v6), Some(_)) => Some(subnet_v6_cidr_str(v6, v6_prefix)),
+        _ => None,
+    };
+    check_lease_subnet_free(tun_name, &v4_subnet, "-4")?;
+    if let Some(v6_subnet) = &v6_subnet {
+        check_lease_subnet_free(tun_name, v6_subnet, "-6")?;
+    }
     run_cmd("ip", &["link", "set", tun_name, "up"])?;
     let _ = Command::new("ip").args(["addr", "add", &v4_cidr, "dev", tun_name]).status();
-    let _ = Command::new("ip").args(["route", "replace", &v4_subnet, "dev", tun_name]).status();
+    add_tun_route(tun_name, &v4_subnet, "-4")?;
 
     // The v6 gateway is on-link inside `v6_subnet` (validated).
-    if let (Some(v6), Some(_)) = (v6_addr, gateway_v6) {
+    if let (Some(v6), Some(v6_subnet)) = (v6_addr, &v6_subnet) {
         let v6_cidr = format!("{}/{}", v6, v6_prefix);
-        let v6_subnet = subnet_v6_cidr_str(v6, v6_prefix);
         let _ = Command::new("ip").args(["-6", "addr", "add", &v6_cidr, "dev", tun_name]).status();
-        let _ = Command::new("ip").args(["-6", "route", "replace", &v6_subnet, "dev", tun_name]).status();
+        add_tun_route(tun_name, v6_subnet, "-6")?;
     }
 
     if install_default_route {
@@ -921,6 +993,140 @@ pub fn configure_client_kernel(
         }
     }
     Ok(())
+}
+
+/// Run `ip -j <args>` and return its JSON stdout. Fails closed: without the
+/// listing the lease-overlap check can't run (needs iproute2 ≥ 4.17).
+fn ip_json(args: &[&str]) -> Result<String> {
+    let out = Command::new("ip")
+        .arg("-j")
+        .args(args)
+        .output()
+        .with_context(|| format!("spawning `ip -j {}`", args.join(" ")))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`ip -j {}` exited with {:?}: {}",
+            args.join(" "), out.status.code(), String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    String::from_utf8(out.stdout).context("`ip -j` output is not UTF-8")
+}
+
+/// Refuse a lease subnet that overlaps the client's existing routes or
+/// interface addresses (other than on `tun_name`). See [`lease_conflict`].
+fn check_lease_subnet_free(tun_name: &str, subnet: &str, family: &str) -> Result<()> {
+    let lease = Cidr::parse(subnet)?;
+    let routes = ip_json(&[family, "route", "show"])
+        .context("listing routes to check the lease subnet for overlap")?;
+    let addrs = ip_json(&[family, "addr", "show"])
+        .context("listing addresses to check the lease subnet for overlap")?;
+    if let Some(what) = lease_conflict(&lease, tun_name, &routes, &addrs)? {
+        anyhow::bail!(
+            "egress client: lease subnet {subnet} overlaps existing {what} — refusing to \
+             route it into {tun_name} (it would shadow local traffic; the exit's pool must \
+             use a subnet this client doesn't)"
+        );
+    }
+    Ok(())
+}
+
+/// `ip route add <subnet> dev <tun>`. `addr add` has usually created the same
+/// kernel prefix route already, so EEXIST is fine — but only if every route
+/// for exactly `subnet` is on our TUN; one elsewhere is never replaced.
+fn add_tun_route(tun_name: &str, subnet: &str, family: &str) -> Result<()> {
+    let added = Command::new("ip")
+        .args([family, "route", "add", subnet, "dev", tun_name])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("spawning `ip {family} route add {subnet}`"))?;
+    if added.success() {
+        return Ok(());
+    }
+    let existing = ip_json(&[family, "route", "show", "exact", subnet])?;
+    if routes_all_on_dev(&existing, tun_name)? {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "egress client: `ip {family} route add {subnet} dev {tun_name}` failed and the \
+         existing route for {subnet} is not on {tun_name} — refusing to overwrite it"
+    )
+}
+
+/// Parse a route `dst` from `ip -j route`: `default` → `None` (a /0 overlaps
+/// everything and is never the shadowing risk — a more specific lease route
+/// beats it anyway); a bare host → /32 or /128.
+fn route_dst_cidr(dst: &str) -> Option<Cidr> {
+    if dst == "default" {
+        return None;
+    }
+    let c = if dst.contains('/') {
+        Cidr::parse(dst).ok()?
+    } else {
+        match dst.parse::<IpAddr>().ok()? {
+            IpAddr::V4(_) => Cidr::parse(&format!("{dst}/32")).ok()?,
+            IpAddr::V6(_) => Cidr::parse(&format!("{dst}/128")).ok()?,
+        }
+    };
+    match c {
+        Cidr::V4 { mask: 0, .. } | Cidr::V6 { mask: 0, .. } => None,
+        c => Some(c),
+    }
+}
+
+/// Pure half of [`check_lease_subnet_free`]: given `ip -j route show` and
+/// `ip -j addr show` output, describe the first route or interface subnet
+/// (not on `tun_name`) that overlaps `lease`, or `None` if the lease is free.
+/// Default routes are ignored; unparseable entries are skipped.
+fn lease_conflict(
+    lease: &Cidr,
+    tun_name: &str,
+    routes_json: &str,
+    addrs_json: &str,
+) -> Result<Option<String>> {
+    let routes: Vec<serde_json::Value> =
+        serde_json::from_str(routes_json).context("parsing `ip -j route` output")?;
+    for r in &routes {
+        let dev = r.get("dev").and_then(|d| d.as_str()).unwrap_or("");
+        if dev == tun_name {
+            continue;
+        }
+        let Some(dst) = r.get("dst").and_then(|d| d.as_str()) else { continue };
+        if route_dst_cidr(dst).is_some_and(|c| c.overlaps(lease)) {
+            let dev = if dev.is_empty() { String::new() } else { format!(" dev {dev}") };
+            return Ok(Some(format!("route {dst}{dev}")));
+        }
+    }
+    let ifaces: Vec<serde_json::Value> =
+        serde_json::from_str(addrs_json).context("parsing `ip -j addr` output")?;
+    for i in &ifaces {
+        let ifname = i.get("ifname").and_then(|n| n.as_str()).unwrap_or("");
+        if ifname == tun_name {
+            continue;
+        }
+        let infos = i.get("addr_info").and_then(|a| a.as_array());
+        for a in infos.into_iter().flatten() {
+            let Some(plen) = a.get("prefixlen").and_then(|p| p.as_u64()) else { continue };
+            // `local` is ours; `address` is a point-to-point peer.
+            for key in ["local", "address"] {
+                let Some(ip) = a.get(key).and_then(|v| v.as_str()) else { continue };
+                if let Ok(c) = Cidr::parse(&format!("{ip}/{plen}"))
+                    && c.overlaps(lease)
+                {
+                    return Ok(Some(format!("address {ip}/{plen} on {ifname}")));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// True if `ip -j route show exact …` lists at least one route and all of
+/// them are on `dev`.
+fn routes_all_on_dev(routes_json: &str, dev: &str) -> Result<bool> {
+    let routes: Vec<serde_json::Value> =
+        serde_json::from_str(routes_json).context("parsing `ip -j route` output")?;
+    Ok(!routes.is_empty()
+        && routes.iter().all(|r| r.get("dev").and_then(|d| d.as_str()) == Some(dev)))
 }
 
 fn subnet_v4_cidr_str(any_in_subnet: Ipv4Addr, prefix_len: u8) -> String {
@@ -963,6 +1169,7 @@ pub async fn start_exit(
     admin_socket: String,
     dst_filter: Arc<crate::dst_filter::DstFilter>,
     admission: Arc<crate::admission::ExitAdmission>,
+    reclaim_min_idle_secs: u64,
 ) -> Result<()> {
     if admission.is_open() {
         warn!(
@@ -1069,6 +1276,11 @@ pub async fn start_exit(
     )
     .with_context(|| format!("creating egress TUN {tun_name}"))?;
     configure_exit_kernel(&tun_name, gw4, prefix4, gw6, prefix6, &egress_iface)?;
+    // Pick up the gateway address(es) just put on the egress TUN now rather
+    // than at the next periodic refresh: they're the exit's own addresses.
+    if let Err(e) = dst_filter.refresh_local_addrs() {
+        warn!("egress exit: re-enumerating local addresses failed: {e} (keeping startup set)");
+    }
     info!(
         "egress exit: tun={tun_name} v4_gw={gw4}/{prefix4} v6_gw={} \
          egress_iface={egress_iface} offload_active={}",
@@ -1257,7 +1469,7 @@ pub async fn start_exit(
         tokio::spawn(async move {
             handle_egress_handshake(
                 acc, mux, admission, pool, table, lease_store,
-                gw4, prefix4, gw6, prefix6,
+                gw4, prefix4, gw6, prefix6, reclaim_min_idle_secs,
             ).await;
         });
     }
@@ -1288,6 +1500,7 @@ async fn handle_egress_handshake(
     v4_prefix: u8,
     gateway_v6: Option<Ipv6Addr>,
     v6_prefix: u8,
+    reclaim_min_idle_secs: u64,
 ) {
     let mut mesh = acc.stream;
     let peer = acc.from;
@@ -1304,13 +1517,16 @@ async fn handle_egress_handshake(
     // Sticky-lease lookup / allocation / reclamation, atomically, and
     // register this handshake as a live session on the lease. `None` means
     // the pool is full of leases that are all in use.
-    let acquired = lease_lookup_or_allocate(&pool, &table, peer, unix_now(), || {
-        mux.conn().get_peer_stats().into_iter().map(|s| s.key).collect()
-    });
+    let now = unix_now();
+    let acquired = lease_lookup_or_allocate(
+        &pool, &table, peer, now, reclaim_min_idle_secs,
+        || mux.conn().get_peer_stats().into_iter().map(|s| s.key).collect(),
+    );
     let Some(acq) = acquired else {
         warn!(
             "egress exit: address pool exhausted for peer {peer_short} \
-             (every lease has a live session or connected owner)"
+             (every lease has a live session, a connected owner, or has been idle \
+             < reclaim_min_idle_secs = {reclaim_min_idle_secs})"
         );
         let _ = mesh.send_open_ack(bifrost_core::stream::reply::GENERAL_FAILURE).await;
         return;
@@ -1327,6 +1543,9 @@ async fn handle_egress_handshake(
             "egress exit: pool full — reclaimed idle lease {} from peer {}",
             old.v4, hex::encode(&victim[..8])
         );
+        // Before the new owner learns the address (and starts sending):
+        // drop the old owner's conntrack / NAT state for it.
+        flush_conntrack(&old).await;
     }
     if acq.was_sticky {
         info!("egress exit: sticky-resume {alloc_desc} for peer {peer_short}");
@@ -1755,8 +1974,9 @@ pub(crate) struct Acquired {
 /// slot then leaked forever.
 ///
 /// Pool exhausted → reclaim the least-recently-active lease that has no live
-/// session and whose peer is not in `connected()` (computed lazily, only when
-/// needed). If every lease is in use the caller gets `None` and refuses.
+/// session, whose peer is not in `connected()` (computed lazily, only when
+/// needed) and that has been idle for at least `min_idle` seconds. If no
+/// lease qualifies the caller gets `None` and refuses.
 ///
 /// Lock order is pool → table, matching the startup reseed; no await while
 /// held. The lease store is NOT touched here — the caller persists a table
@@ -1767,6 +1987,7 @@ fn lease_lookup_or_allocate(
     table: &SharedTable,
     peer: bifrost_core::PubKey,
     now: u64,
+    min_idle: u64,
     connected: impl FnOnce() -> std::collections::HashSet<bifrost_core::PubKey>,
 ) -> Option<Acquired> {
     let mut p = pool.lock().unwrap();
@@ -1778,7 +1999,7 @@ fn lease_lookup_or_allocate(
     let lease = match p.allocate() {
         Some(l) => l,
         None => {
-            let victim = t.reclaim_victim(&connected())?;
+            let victim = t.reclaim_victim(&connected(), now, min_idle)?;
             let old = t.remove_peer(&victim).expect("victim is in the table");
             p.release(old);
             reclaimed = Some((victim, old));
@@ -2071,6 +2292,7 @@ pub async fn start_exit(
     _admin_socket: String,
     _dst_filter: Arc<crate::dst_filter::DstFilter>,
     _admission: Arc<crate::admission::ExitAdmission>,
+    _reclaim_min_idle_secs: u64,
 ) -> Result<()> {
     anyhow::bail!("egress exit requires the `tun` feature (rebuild with --features tun)")
 }
@@ -2123,7 +2345,7 @@ mod tests {
                 let (pool, table, barrier) = (pool.clone(), table.clone(), barrier.clone());
                 std::thread::spawn(move || {
                     barrier.wait();
-                    let a = lease_lookup_or_allocate(&pool, &table, peer, 1, Default::default)
+                    let a = lease_lookup_or_allocate(&pool, &table, peer, 1, IDLE, Default::default)
                         .unwrap();
                     (a.lease, a.was_sticky)
                 })
@@ -2142,6 +2364,8 @@ mod tests {
     // ── Lease reclamation / session lifecycle ───────────────────────
 
     type Connected = std::collections::HashSet<bifrost_core::PubKey>;
+    /// Reclamation idle floor used by the tests (the production default).
+    const IDLE: u64 = RECLAIM_MIN_IDLE_SECS_DEFAULT;
 
     /// /29 → 5 usable client slots (.2–.6).
     fn small_pool() -> (SharedPool, SharedTable) {
@@ -2157,8 +2381,10 @@ mod tests {
     /// last_active = 100 + i (so key(1) is the least recently active).
     fn fill_idle(pool: &SharedPool, table: &SharedTable) {
         for i in 1..=5u8 {
-            let a = lease_lookup_or_allocate(pool, table, key(i), 100 + i as u64, Connected::new)
-                .unwrap();
+            let a = lease_lookup_or_allocate(
+                pool, table, key(i), 100 + i as u64, IDLE, Connected::new,
+            )
+            .unwrap();
             let mut t = table.lock().unwrap();
             let e = t.lease_by_peer.get_mut(&key(i)).unwrap();
             assert_eq!(e.generation, a.generation);
@@ -2174,7 +2400,7 @@ mod tests {
         let (pool, table) = small_pool();
         fill_idle(&pool, &table);
         let victim_lease = table.lock().unwrap().lease_of(&key(1)).unwrap();
-        let a = lease_lookup_or_allocate(&pool, &table, key(9), 500, Connected::new)
+        let a = lease_lookup_or_allocate(&pool, &table, key(9), 500 + IDLE, IDLE, Connected::new)
             .expect("full pool of idle leases must reclaim, not refuse");
         assert_eq!(a.reclaimed, Some((key(1), victim_lease)), "oldest idle lease reclaimed");
         assert_eq!(a.lease, victim_lease, "newcomer gets the freed slot");
@@ -2194,20 +2420,64 @@ mod tests {
         table.lock().unwrap().join(&key(1), 50);
         // join() bumps last_active to max(old, now) = old, so key(1) stays oldest.
         let connected = || Connected::from([key(2)]);
-        let a = lease_lookup_or_allocate(&pool, &table, key(9), 500, connected).unwrap();
+        let a = lease_lookup_or_allocate(&pool, &table, key(9), 500 + IDLE, IDLE, connected).unwrap();
         assert_eq!(a.reclaimed.map(|(p, _)| p), Some(key(3)));
 
         // Now make everything live: refuse rather than evict an active client.
         for i in [2u8, 4, 5] {
-            table.lock().unwrap().join(&key(i), 600);
+            table.lock().unwrap().join(&key(i), 600 + IDLE);
         }
         assert!(
-            lease_lookup_or_allocate(&pool, &table, key(10), 700, Connected::new).is_none(),
+            lease_lookup_or_allocate(&pool, &table, key(10), 700 + IDLE, IDLE, Connected::new).is_none(),
             "all leases live → refuse the newcomer"
         );
         for i in [1u8, 2, 4, 5, 9] {
             assert!(table.lock().unwrap().lease_of(&key(i)).is_some(), "live lease {i} kept");
         }
+    }
+
+    /// Regression (reclaimed address inherits conntrack state): a lease freed
+    /// moments ago was handed straight to a newcomer, who then received the
+    /// previous owner's in-flight replies through the still-live NAT
+    /// mappings. Only a lease idle for `min_idle` may be reclaimed.
+    #[test]
+    fn reclamation_requires_min_idle() {
+        let (pool, table) = small_pool();
+        fill_idle(&pool, &table); // last_active 101..=105
+        // 101 + IDLE - 1: key(1) is one second short of the floor → refuse.
+        assert!(
+            lease_lookup_or_allocate(&pool, &table, key(9), 100 + IDLE, IDLE, Connected::new)
+                .is_none(),
+            "no lease idle long enough → refuse rather than reuse a fresh address"
+        );
+        for i in 1..=5u8 {
+            assert!(table.lock().unwrap().lease_of(&key(i)).is_some(), "lease {i} kept");
+        }
+        // Exactly at the floor: key(1) qualifies, key(2..) don't yet.
+        let a = lease_lookup_or_allocate(&pool, &table, key(9), 101 + IDLE, IDLE, Connected::new)
+            .unwrap();
+        assert_eq!(a.reclaimed.map(|(p, _)| p), Some(key(1)));
+        // A clock that stepped back never makes a lease look idle.
+        let t = table.lock().unwrap();
+        assert_eq!(t.reclaim_victim(&Connected::new(), 50, 0), None, "now < last_active");
+    }
+
+    #[test]
+    fn conntrack_flush_covers_both_directions_and_families() {
+        let lease = Lease { v4: Ipv4Addr::new(10, 55, 0, 7), v6: Some(v6("fd55::7")) };
+        let argv = conntrack_flush_argv(&lease);
+        let want: Vec<Vec<String>> = [
+            ["-D", "-f", "ipv4", "-s", "10.55.0.7"],
+            ["-D", "-f", "ipv4", "-d", "10.55.0.7"],
+            ["-D", "-f", "ipv6", "-s", "fd55::7"],
+            ["-D", "-f", "ipv6", "-d", "fd55::7"],
+        ]
+        .iter()
+        .map(|a| a.iter().map(|s| s.to_string()).collect())
+        .collect();
+        assert_eq!(argv, want);
+        let v4_only = Lease { v4: Ipv4Addr::new(10, 55, 0, 7), v6: None };
+        assert_eq!(conntrack_flush_argv(&v4_only).len(), 2);
     }
 
     /// Regression (rollback race): two handshakes from one peer overlap and
@@ -2217,8 +2487,8 @@ mod tests {
     fn rollback_does_not_free_a_lease_another_session_uses() {
         let (pool, table) = small_pool();
         let peer = key(7);
-        let a = lease_lookup_or_allocate(&pool, &table, peer, 1, Connected::new).unwrap();
-        let b = lease_lookup_or_allocate(&pool, &table, peer, 1, Connected::new).unwrap();
+        let a = lease_lookup_or_allocate(&pool, &table, peer, 1, IDLE, Connected::new).unwrap();
+        let b = lease_lookup_or_allocate(&pool, &table, peer, 1, IDLE, Connected::new).unwrap();
         assert!(!a.was_sticky && b.was_sticky && a.lease == b.lease);
         let sa = LeaseSession::new(pool.clone(), table.clone(), peer, &a);
         let sb = LeaseSession::new(pool.clone(), table.clone(), peer, &b);
@@ -2227,7 +2497,7 @@ mod tests {
         assert_eq!(table.lock().unwrap().lease_of(&peer), Some(a.lease), "lease survives");
         assert_eq!(table.lock().unwrap().sessions_of(&peer), 1);
         // The slot is still taken: a different peer must not get it.
-        let other = lease_lookup_or_allocate(&pool, &table, key(8), 1, Connected::new).unwrap();
+        let other = lease_lookup_or_allocate(&pool, &table, key(8), 1, IDLE, Connected::new).unwrap();
         assert_ne!(other.lease, a.lease, "in-use slot must not be handed out again");
 
         sb.end();
@@ -2239,7 +2509,7 @@ mod tests {
     #[test]
     fn rollback_of_sole_new_session_releases_the_slot() {
         let (pool, table) = small_pool();
-        let a = lease_lookup_or_allocate(&pool, &table, key(7), 1, Connected::new).unwrap();
+        let a = lease_lookup_or_allocate(&pool, &table, key(7), 1, IDLE, Connected::new).unwrap();
         let s = LeaseSession::new(pool.clone(), table.clone(), key(7), &a);
         assert_eq!(s.rollback(), Rollback::Released(a.lease));
         assert!(table.lock().unwrap().lease_of(&key(7)).is_none());
@@ -2253,7 +2523,7 @@ mod tests {
     fn stale_session_end_and_rollback_are_noops() {
         let (pool, table) = small_pool();
         let peer = key(7);
-        let a = lease_lookup_or_allocate(&pool, &table, peer, 1, Connected::new).unwrap();
+        let a = lease_lookup_or_allocate(&pool, &table, peer, 1, IDLE, Connected::new).unwrap();
         let old = LeaseSession::new(pool.clone(), table.clone(), peer, &a);
         // Operator evicts; the peer reconnects and gets a new entry.
         {
@@ -2261,7 +2531,7 @@ mod tests {
             let l = table.lock().unwrap().remove_peer(&peer).unwrap();
             p.release(l);
         }
-        let b = lease_lookup_or_allocate(&pool, &table, peer, 2, Connected::new).unwrap();
+        let b = lease_lookup_or_allocate(&pool, &table, peer, 2, IDLE, Connected::new).unwrap();
         assert_ne!(a.generation, b.generation);
         assert_eq!(old.rollback(), Rollback::Stale);
         assert_eq!(table.lock().unwrap().lease_of(&peer), Some(b.lease));
@@ -2274,7 +2544,7 @@ mod tests {
     #[test]
     fn dropped_session_ends_itself() {
         let (pool, table) = small_pool();
-        let a = lease_lookup_or_allocate(&pool, &table, key(7), 1, Connected::new).unwrap();
+        let a = lease_lookup_or_allocate(&pool, &table, key(7), 1, IDLE, Connected::new).unwrap();
         drop(LeaseSession::new(pool.clone(), table.clone(), key(7), &a));
         assert_eq!(table.lock().unwrap().sessions_of(&key(7)), 0);
         assert!(table.lock().unwrap().last_active_of(&key(7)).unwrap() > 1, "stamped now");
@@ -2308,9 +2578,9 @@ mod tests {
         assert_eq!(table.lock().unwrap().last_active_of(&key(1)), Some(101));
         // key(5)'s slot is free again; take it, then the pool is full and the
         // next newcomer must reclaim key(1) — the oldest by persisted stamp.
-        let a = lease_lookup_or_allocate(&pool, &table, key(9), 900, Connected::new).unwrap();
+        let a = lease_lookup_or_allocate(&pool, &table, key(9), 900 + IDLE, IDLE, Connected::new).unwrap();
         assert!(a.reclaimed.is_none());
-        let b = lease_lookup_or_allocate(&pool, &table, key(10), 901, Connected::new).unwrap();
+        let b = lease_lookup_or_allocate(&pool, &table, key(10), 901 + IDLE, IDLE, Connected::new).unwrap();
         assert_eq!(b.reclaimed.map(|(p, _)| p), Some(key(1)));
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -2647,6 +2917,79 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 0), 24,
             Some(v6("fd55::")), 32
         ).is_err());
+    }
+
+    // ── Client route install: lease-subnet overlap ───────────────────
+
+    const ROUTES: &str = r#"[
+        {"dst":"default","gateway":"192.168.1.1","dev":"eth0","protocol":"dhcp","flags":[]},
+        {"dst":"172.17.0.0/16","dev":"docker0","protocol":"kernel","scope":"link","flags":[]},
+        {"dst":"192.168.1.0/24","dev":"eth0","protocol":"kernel","scope":"link","flags":[]},
+        {"dst":"10.8.0.1","dev":"tun9","scope":"link","flags":[]},
+        {"type":"blackhole","dst":"10.99.0.0/16","flags":[]},
+        {"dst":"10.55.0.0/24","dev":"bifrost-eg0","protocol":"kernel","scope":"link","flags":[]}
+    ]"#;
+    const ADDRS: &str = r#"[
+        {"ifindex":1,"ifname":"lo","address":"00:00:00:00:00:00","addr_info":[
+            {"family":"inet","local":"127.0.0.1","prefixlen":8},
+            {"family":"inet6","local":"::1","prefixlen":128}]},
+        {"ifindex":2,"ifname":"eth0","address":"00:15:5d:4a:6a:48","addr_info":[
+            {"family":"inet","local":"192.168.1.20","prefixlen":24},
+            {"family":"inet6","local":"fd12:3456::20","prefixlen":64}]},
+        {"ifindex":3,"ifname":"wg0","addr_info":[
+            {"family":"inet","local":"10.200.0.2","address":"10.201.0.1","prefixlen":32}]},
+        {"ifindex":4,"ifname":"bifrost-eg0","addr_info":[
+            {"family":"inet","local":"10.55.0.2","prefixlen":24}]}
+    ]"#;
+
+    fn conflict(lease: &str) -> Option<String> {
+        lease_conflict(&Cidr::parse(lease).unwrap(), "bifrost-eg0", ROUTES, ADDRS).unwrap()
+    }
+
+    /// Regression (route hijack on the client): `ip route replace <lease
+    /// subnet> dev <tun>` silently overwrote the client's own LAN / docker
+    /// route when an exit handed out an overlapping private subnet.
+    #[test]
+    fn lease_subnet_overlapping_local_routes_is_refused() {
+        // Same as / inside / covering an existing route.
+        assert_eq!(conflict("192.168.1.0/24").as_deref(), Some("route 192.168.1.0/24 dev eth0"));
+        assert!(conflict("192.168.1.128/25").is_some(), "more specific → would hijack half the LAN");
+        assert!(conflict("192.168.0.0/16").is_some(), "covering the LAN route");
+        assert!(conflict("172.17.5.0/24").unwrap().contains("docker0"));
+        assert!(conflict("10.8.0.0/24").unwrap().contains("10.8.0.1"), "bare host route = /32");
+        assert_eq!(conflict("10.99.1.0/24").as_deref(), Some("route 10.99.0.0/16"), "devless route");
+        // Interface subnets with no matching main-table route, incl. p2p peers.
+        assert!(conflict("10.200.0.0/24").unwrap().contains("wg0"));
+        assert!(conflict("10.201.0.0/30").unwrap().contains("10.201.0.1"), "p2p peer address");
+        assert!(lease_conflict(&Cidr::parse("fd12:3456::/64").unwrap(), "bifrost-eg0", "[]", ADDRS)
+            .unwrap()
+            .is_some(), "v6 interface subnet");
+    }
+
+    #[test]
+    fn lease_subnet_free_or_only_on_our_tun_is_accepted() {
+        // Our own TUN's route + address (reconnect) don't count; the default
+        // route overlaps everything and is ignored.
+        assert_eq!(conflict("10.55.0.0/24"), None);
+        assert_eq!(conflict("10.56.0.0/24"), None);
+        assert_eq!(conflict("100.64.0.0/24"), None);
+        assert_eq!(
+            lease_conflict(&Cidr::parse("fd55::/64").unwrap(), "bifrost-eg0", "[]", ADDRS).unwrap(),
+            None
+        );
+        assert!(lease_conflict(&Cidr::parse("10.0.0.0/24").unwrap(), "t", "not json", "[]").is_err());
+    }
+
+    #[test]
+    fn existing_route_eexist_ok_only_on_our_tun() {
+        let ours = r#"[{"dst":"10.55.0.0/24","dev":"bifrost-eg0","protocol":"kernel"}]"#;
+        let theirs = r#"[{"dst":"10.55.0.0/24","dev":"eth0"}]"#;
+        let both = r#"[{"dst":"10.55.0.0/24","dev":"bifrost-eg0"},
+                       {"dst":"10.55.0.0/24","dev":"eth0","metric":50}]"#;
+        assert!(routes_all_on_dev(ours, "bifrost-eg0").unwrap());
+        assert!(!routes_all_on_dev(theirs, "bifrost-eg0").unwrap());
+        assert!(!routes_all_on_dev(both, "bifrost-eg0").unwrap());
+        assert!(!routes_all_on_dev("[]", "bifrost-eg0").unwrap(), "no route → add failed otherwise");
     }
 
     #[test]

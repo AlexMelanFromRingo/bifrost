@@ -512,8 +512,16 @@ async fn run_exit(
         DstFilter::new(cfg.exit.block_private_dst, &cfg.exit.dst_allow, &cfg.exit.dst_deny)
             .context("invalid exit destination filter (block_private_dst / dst_allow / dst_deny)")?,
     );
+    // The exit host's own addresses (public / LAN) are always blocked so a
+    // CONNECT can't reach a service bound on the exit itself; re-enumerated
+    // periodically to follow DHCP / NIC changes.
+    let n_local = dst_filter
+        .refresh_local_addrs()
+        .context("enumerating local interface addresses for the destination filter")?;
+    dst_filter.spawn_local_addr_refresh(bifrost_core::dst_filter::LOCAL_ADDR_REFRESH);
     info!(
-        "exit mode: waiting for SOCKS5 CONNECTs over the mesh (block_private_dst={})",
+        "exit mode: waiting for SOCKS5 CONNECTs over the mesh (block_private_dst={}, \
+         {n_local} local address(es) blocked)",
         cfg.exit.block_private_dst
     );
     // Exit mode has no per-CONNECT race knobs to manage, but RaceConfig

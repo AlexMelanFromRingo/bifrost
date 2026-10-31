@@ -44,7 +44,8 @@ pub struct DaemonConfig {
 pub struct ExitSettings {
     /// SSRF defence: refuse CONNECTs whose target resolves to the exit's own
     /// internal/private ranges. Loopback, link-local (incl. 169.254.169.254
-    /// cloud metadata), multicast, broadcast and unspecified are ALWAYS
+    /// cloud metadata), multicast, broadcast, 0.0.0.0/8, the 6to4 / NAT64
+    /// ranges and the exit host's own interface addresses are ALWAYS
     /// refused. With this enabled (the default) RFC1918 (10/8, 172.16/12,
     /// 192.168/16), CGNAT 100.64/10 and IPv6 ULA fc00::/7 are refused too.
     /// Set false for an exit that is *meant* to reach a private LAN (then
@@ -243,8 +244,8 @@ admin_socket  = "/run/bifrost/socks5d.sock"
 mode = "exit"
 
 [exit]
-# SSRF defence: loopback / link-local (incl. 169.254.169.254) / multicast are
-# always refused; private ranges (RFC1918, CGNAT, ULA) too unless false.
+# SSRF defence: loopback / link-local (incl. 169.254.169.254) / multicast /
+# the exit host's own addresses are always refused; private ranges (RFC1918, CGNAT, ULA) too unless false.
 block_private_dst = true
 # dst_allow = ["192.168.10.0/24"]
 # dst_deny  = ["203.0.113.0/24"]

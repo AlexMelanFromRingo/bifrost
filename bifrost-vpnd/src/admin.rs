@@ -338,6 +338,11 @@ fn evict_lease(state: &AdminState, hex_key: &str) -> AdminResponse {
         removed
     };
     if let Some(lease) = removed {
+        // The address can go to the next client right away: drop the evicted
+        // owner's conntrack/NAT state first (same as automatic reclamation).
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move { crate::egress::flush_conntrack(&lease).await });
+        }
         if let Some(store) = &state.lease_store
             && let Err(e) = crate::egress::persist_leases(table, store)
         {
